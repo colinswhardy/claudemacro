@@ -1499,6 +1499,26 @@ actions.logWeight = function() {
 
 actions.clickRenphoImport = function() { const el = document.getElementById("renphoFileInput"); if (el) el.click(); };
 
+function parseCsvLine(line) {
+  const result = [];
+  let cur = "", inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i+1] === '"') { cur += '"'; i++; }
+        else { inQuotes = false; }
+      } else { cur += c; }
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { result.push(cur); cur = ""; }
+      else cur += c;
+    }
+  }
+  result.push(cur);
+  return result;
+}
+
 changeActions.renphoImport = function(el) {
   const file = el.files[0];
   if (!file) return;
@@ -1507,14 +1527,13 @@ changeActions.renphoImport = function(el) {
     try {
       const text = ev.target.result;
       const lines = text.split("\n").filter(function(l){ return l.trim(); });
-      const header = lines[0].toLowerCase();
-      const cols0 = header.split(",");
+      const cols0 = parseCsvLine(lines[0]).map(function(h){ return h.toLowerCase(); });
       const dateIdx = cols0.findIndex(function(h){ return h.indexOf("time") >= 0 || h.indexOf("date") >= 0; });
       const weightIdx = cols0.findIndex(function(h){ return h.indexOf("weight") >= 0; });
       if (dateIdx < 0 || weightIdx < 0) { weightUi().importMsg = "Could not detect date/weight columns"; rerender(); return; }
       let count = 0;
       for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(",");
+        const cols = parseCsvLine(lines[i]);
         if (cols.length <= Math.max(dateIdx, weightIdx)) continue;
         const dateStr = cols[dateIdx].trim().replace(/"/g, "");
         const w = parseFloat(cols[weightIdx].trim().replace(/"/g, ""));
