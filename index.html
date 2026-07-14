@@ -25,7 +25,7 @@ input[type="range"]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;c
 button{cursor:pointer;}
 a{color:inherit;}
 .hidden{display:none !important;}
-#app{max-width:500px;margin:0 auto;position:relative;padding-bottom:76px;min-height:100vh;}
+#app{max-width:500px;margin:0 auto;position:relative;padding-bottom:132px;min-height:100vh;}
 .header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;position:sticky;top:0;z-index:100;background:rgba(11,14,24,0.92);backdrop-filter:blur(12px);}
 .brand{font-size:18px;font-weight:700;color:#3B82F6;}
 .dateNav{display:flex;align-items:center;gap:8px;}
@@ -35,6 +35,7 @@ a{color:inherit;}
 .settingsBtn{background:none;border:none;color:#64748B;font-size:20px;cursor:pointer;}
 .content{padding:0 16px;}
 .bottomNav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:500px;background:rgba(20,24,40,0.94);border-top:1px solid #1E2640;display:flex;backdrop-filter:blur(12px);z-index:100;}
+.quickActions{position:fixed;bottom:76px;left:50%;transform:translateX(-50%);width:100%;max-width:500px;box-sizing:border-box;display:flex;gap:8px;padding:10px 16px;background:rgba(20,24,40,0.94);border-top:1px solid #1E2640;backdrop-filter:blur(12px);z-index:99;}
 .tabBtn{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;background:none;border:none;padding:10px 4px;color:#64748B;cursor:pointer;font-size:11px;}
 .tabBtn.active{color:#3B82F6;font-weight:600;}
 .tabIcon{font-size:20px;}
@@ -158,6 +159,7 @@ const DEFAULT_SETTINGS = {
   startWeight: null, startDate: null,
   aiProvider: "claude-sonnet", aiEnabled: true, geminiApiKey: "", claudeApiKey: "", compareWithGemini: false,
   macroPreset: "Custom",
+  macroLocks: { protein: false, carbs: false, fat: false },
 };
 
 // ============================================================
@@ -196,6 +198,7 @@ const state = {
   favorites: db.get("favorites", []),
   recentFoods: db.get("recentFoods", []),
   foodCache: db.get("foodCache", {}),
+  recipes: db.get("recipes", []),
   ui: {}
 };
 
@@ -205,6 +208,7 @@ function saveWeights() { db.set("weights", state.weights); }
 function saveFavorites() { db.set("favorites", state.favorites); }
 function saveRecentFoods() { db.set("recentFoods", state.recentFoods); }
 function saveFoodCache() { db.set("foodCache", state.foodCache); }
+function saveRecipes() { db.set("recipes", state.recipes); }
 
 function cleanExpiredPhotos() {
   const now = new Date().toISOString();
@@ -385,6 +389,8 @@ function calcMacrosForWeight(food, grams) {
 // ============================================================
 const root = document.getElementById("app");
 let pendingFocusId = null; // element id to focus after next render
+let barcodeStream = null; // live camera MediaStream while the barcode scanner is open
+let barcodeDetectionRAF = null; // requestAnimationFrame handle for the scan loop
 
 function render() {
   root.innerHTML = renderApp();
@@ -392,6 +398,12 @@ function render() {
     const el = document.getElementById(pendingFocusId);
     if (el) { el.focus(); if (el.select) { try { el.select(); } catch(e){} } }
     pendingFocusId = null;
+  }
+  // A full innerHTML re-render tears down any live <video> element, which would otherwise
+  // silently disconnect the camera feed if something re-renders while scanning is active.
+  if (barcodeStream && state.ui.food && state.ui.food.scanningBarcode) {
+    const v = document.getElementById("barcodeVideo");
+    if (v) v.srcObject = barcodeStream;
   }
 }
 
@@ -524,6 +536,10 @@ function renderApp() {
       '<button class="settingsBtn" data-action="setTab" data-arg="strategy">\u2699</button>' +
     '</div>' +
     '<div class="content">' + renderTabContent() + '</div>' +
+    '<div class="quickActions">' +
+      btn({ label: "\u{1F4F7} Scan Barcode", action: "openBarcodeScan", outline: true, full: true }) +
+      btn({ label: "➕ Add Food", action: "quickAddFood", full: true }) +
+    '</div>' +
     '<div class="bottomNav">' +
       tabBtn("dashboard", "\u{1F4CA}", "Dashboard") +
       tabBtn("food", "\u{1F37D}", "Food") +
@@ -546,11 +562,19 @@ function renderTabContent() {
 }
 
 actions.setTab = function(tabName) {
+  stopBarcodeCamera();
   state.tab = tabName;
   state.ui = {}; // reset transient UI state on tab switch
   rerender();
 };
+actions.quickAddFood = function() {
+  stopBarcodeCamera();
+  state.tab = "food";
+  state.ui = {};
+  rerender();
+};
 actions.shiftDate = function(dirStr) {
+  stopBarcodeCamera();
   const dir = parseInt(dirStr, 10);
   const d = parseDateStr(state.date);
   d.setDate(d.getDate() + dir);
@@ -559,6 +583,7 @@ actions.shiftDate = function(dirStr) {
   rerender();
 };
 actions.goToday = function() {
+  stopBarcodeCamera();
   state.date = todayStr();
   state.ui = {};
   rerender();
@@ -786,7 +811,7 @@ actions.saveEditMacros = function(entryId) {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100" };
   return state.ui.food;
 }
 
@@ -803,13 +828,16 @@ function detectWizard(q) {
 
 function renderFoodTab() {
   const fu = foodUi();
+  if (fu.scanningBarcode) return renderBarcodeScanScreen(fu);
+  if (fu.loggingRecipe) return renderLogRecipeScreen(fu);
+  if (fu.recipeBuilder) return renderRecipeBuilderScreen(fu);
   if (fu.wizardType) return renderWizardScreen(fu);
   if (fu.showAI) return renderAIScreen(fu);
   if (fu.manualEntry) return renderManualEntryScreen(fu);
   if (fu.addingFood) return renderAddingFoodScreen(fu);
 
   let html = '<div class="subTabs">' +
-    subTabBtn("search", "Search") + subTabBtn("history", "History") + subTabBtn("favorites", "Favorites") +
+    subTabBtn("search", "Search") + subTabBtn("history", "History") + subTabBtn("favorites", "Favorites") + subTabBtn("recipes", "Recipes") +
     '</div>';
 
   if (fu.subTab === "search") {
@@ -818,6 +846,7 @@ function renderFoodTab() {
       btn({ label: fu.searching ? "..." : "\u{1F50D}", action: "doFoodSearch", disabled: fu.searching }) +
       '</div>';
     html += '<div class="row" style="margin-bottom:16px">';
+    html += btn({ label: "\u{1F4F7} Scan Barcode", action: "openBarcodeScan", small: true, outline: true });
     if (state.settings.aiEnabled) html += btn({ label: "\u2728 AI Estimate", action: "openAIScreen", small: true, outline: true });
     html += btn({ label: "\u270F\uFE0F Manual", action: "openManualEntry", small: true, outline: true });
     html += '</div>';
@@ -890,6 +919,33 @@ function renderFoodTab() {
     }
   }
 
+  if (fu.subTab === "recipes") {
+    html += '<div class="row" style="margin-bottom:16px">' + btn({ label: "\u2795 New Recipe", action: "newRecipe", full: true }) + '</div>';
+    if (state.recipes.length === 0) {
+      html += card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No recipes yet. Build one from a set of ingredients and reuse it any time.</div>');
+    } else {
+      state.recipes.forEach(function(recipe) {
+        const totals = sumRecipeIngredients(recipe.ingredients);
+        html += '<div class="foodEntry">' +
+          '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+            '<div style="flex:1;min-width:0"><div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(recipe.name) + '</div>' +
+            '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">' + recipe.ingredients.length + ' ingredient' + (recipe.ingredients.length === 1 ? "" : "s") + ' \u2022 ' + round1(totals.weight) + 'g</div></div>' +
+            '<div style="text-align:right"><span style="color:' + C.calories + ';font-weight:700">' + Math.round(totals.calories) + '</span><span style="color:' + C.textMut + ';font-size:11px"> kcal</span></div>' +
+          '</div>' +
+          '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
+            '<span style="color:' + C.protein + '">P: ' + round1(totals.protein) + 'g</span>' +
+            '<span style="color:' + C.carbs + '">C: ' + round1(totals.carbs) + 'g</span>' +
+            '<span style="color:' + C.fat + '">F: ' + round1(totals.fat) + 'g</span>' +
+          '</div>' +
+          '<div class="row" style="margin-top:10px">' +
+            btn({ label: "Log", action: "logRecipe", arg: recipe.id, small: true }) +
+            btn({ label: "Edit", action: "editRecipe", arg: recipe.id, small: true, outline: true }) +
+            btn({ label: "\u{1F5D1}", action: "deleteRecipe", arg: recipe.id, small: true, outline: true, color: "danger" }) +
+          '</div></div>';
+      });
+    }
+  }
+
   return html;
 }
 
@@ -926,6 +982,425 @@ actions.openAIScreen = function() { foodUi().showAI = true; rerender(); };
 actions.closeAIScreen = function() { const fu = foodUi(); fu.showAI = false; fu.aiResults = null; fu.aiError = null; fu.aiCompareResults = null; fu.aiCompareError = null; rerender(); };
 actions.openManualEntry = function() { foodUi().manualEntry = true; rerender(); };
 actions.closeManualEntry = function() { foodUi().manualEntry = false; rerender(); };
+
+// ---- Barcode scanning ----
+function renderBarcodeScanScreen(fu) {
+  let html = '<button class="backBtn" data-action="closeBarcodeScan">← Back</button>';
+  let inner = '<h3 class="cardTitle" style="margin-bottom:12px">Scan Barcode</h3>';
+  inner += '<div style="position:relative;background:#000;border-radius:12px;overflow:hidden;margin-bottom:12px;aspect-ratio:4/3">' +
+    '<video id="barcodeVideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;display:block"></video>' +
+    '<div style="position:absolute;inset:15%;border:2px solid ' + C.primary + '88;border-radius:8px;pointer-events:none"></div>' +
+  '</div>';
+  if (fu.scanLoading) inner += '<div style="text-align:center;color:' + C.textMut + ';font-size:13px;margin-bottom:12px">Looking up product…</div>';
+  if (fu.scanError) inner += '<div style="padding:10px 12px;background:' + C.warning + '15;border-radius:8px;color:' + C.warning + ';font-size:13px;margin-bottom:12px">' + esc(fu.scanError) + '</div>';
+  inner += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:16px">Point your camera at a barcode — it scans automatically. Or type the number in below.</div>';
+  inner += '<div class="row" style="align-items:center">' +
+    textInput({ value: fu.scanManualCode, type: "text", placeholder: "Enter barcode number", bind: "scanManualCode", style: "flex:1" }) +
+    btn({ label: "Look Up", action: "lookupManualBarcode", disabled: fu.scanLoading }) +
+  '</div>';
+  html += card(inner);
+  return html;
+}
+
+function stopBarcodeCamera() {
+  if (barcodeDetectionRAF) { cancelAnimationFrame(barcodeDetectionRAF); barcodeDetectionRAF = null; }
+  if (barcodeStream) { barcodeStream.getTracks().forEach(function(t){ t.stop(); }); barcodeStream = null; }
+}
+
+async function startBarcodeCamera() {
+  const fu = foodUi();
+  if (!("BarcodeDetector" in window)) {
+    fu.scanError = "Live camera scanning isn't supported in this browser — use manual entry below.";
+    rerender();
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+    if (!foodUi().scanningBarcode) { stream.getTracks().forEach(function(t){ t.stop(); }); return; } // closed while awaiting permission
+    barcodeStream = stream;
+    const video = document.getElementById("barcodeVideo");
+    if (!video) { stopBarcodeCamera(); return; }
+    video.srcObject = stream;
+    await video.play();
+    const detector = new BarcodeDetector({ formats: ["ean_13", "ean_8", "upc_a", "upc_e", "code_128"] });
+    const tick = async function() {
+      if (!foodUi().scanningBarcode) return;
+      try {
+        const codes = await detector.detect(video);
+        if (codes.length > 0) {
+          stopBarcodeCamera();
+          handleBarcodeDetected(codes[0].rawValue);
+          return;
+        }
+      } catch (e) { /* keep trying next frame */ }
+      barcodeDetectionRAF = requestAnimationFrame(tick);
+    };
+    barcodeDetectionRAF = requestAnimationFrame(tick);
+  } catch (e) {
+    foodUi().scanError = "Couldn't access camera (" + e.message + ") — use manual entry below.";
+    rerender();
+  }
+}
+
+async function handleBarcodeDetected(code) {
+  const fu = foodUi();
+  fu.scanLoading = true; fu.scanError = null;
+  rerender();
+  const food = await searchBarcode(code);
+  fu.scanLoading = false;
+  if (!food) {
+    fu.scanError = "No product found for barcode " + code + ". Try again, search by name, or use manual entry.";
+    rerender();
+    return;
+  }
+  fu.scanningBarcode = false;
+  fu.addingFood = food;
+  fu.addWeight = String((food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams) || 100);
+  rerender();
+}
+
+actions.openBarcodeScan = function() {
+  stopBarcodeCamera(); // safety: in case one was already running
+  state.tab = "food";
+  state.ui = {};
+  foodUi().scanningBarcode = true;
+  rerender();
+  startBarcodeCamera();
+};
+actions.closeBarcodeScan = function() {
+  stopBarcodeCamera();
+  const fu = foodUi();
+  fu.scanningBarcode = false; fu.scanError = null; fu.scanManualCode = ""; fu.scanLoading = false;
+  rerender();
+};
+inputActions.scanManualCode = function(val) { foodUi().scanManualCode = val; };
+actions.lookupManualBarcode = async function() {
+  const fu = foodUi();
+  const code = (fu.scanManualCode || "").trim();
+  if (!code) return;
+  stopBarcodeCamera();
+  await handleBarcodeDetected(code);
+};
+
+// ---- Recipes ----
+function sumRecipeIngredients(ingredients) {
+  return (ingredients || []).reduce(function(acc, i) {
+    return {
+      weight: acc.weight + (i.weight || 0),
+      calories: acc.calories + (i.calories || 0),
+      protein: acc.protein + (i.protein || 0),
+      carbs: acc.carbs + (i.carbs || 0),
+      fat: acc.fat + (i.fat || 0),
+      fiber: acc.fiber + (i.fiber || 0),
+    };
+  }, { weight: 0, calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 });
+}
+
+actions.newRecipe = function() {
+  foodUi().recipeBuilder = { editingId: null, name: "", ingredients: [], picker: null };
+  rerender();
+};
+actions.editRecipe = function(id) {
+  const recipe = state.recipes.find(function(r){ return r.id === id; });
+  if (!recipe) return;
+  foodUi().recipeBuilder = { editingId: id, name: recipe.name, ingredients: recipe.ingredients.map(function(i){ return Object.assign({}, i); }), picker: null };
+  rerender();
+};
+actions.cancelRecipeBuilder = function() { foodUi().recipeBuilder = null; rerender(); };
+actions.deleteRecipe = function(id) {
+  state.recipes = state.recipes.filter(function(r){ return r.id !== id; });
+  saveRecipes();
+  rerender();
+};
+actions.deleteRecipeFromBuilder = function() {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.editingId) return;
+  state.recipes = state.recipes.filter(function(r){ return r.id !== rb.editingId; });
+  saveRecipes();
+  foodUi().recipeBuilder = null;
+  rerender();
+};
+inputActions.recipeName = function(val) {
+  const rb = foodUi().recipeBuilder;
+  if (!rb) return;
+  rb.name = val;
+  const btnEl = document.getElementById("saveRecipeBtn");
+  if (btnEl) btnEl.disabled = !rb.name.trim() || rb.ingredients.length === 0;
+};
+actions.saveRecipe = function() {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.name.trim() || rb.ingredients.length === 0) return;
+  if (rb.editingId) {
+    state.recipes = state.recipes.map(function(r) {
+      return r.id === rb.editingId ? Object.assign({}, r, { name: rb.name.trim(), ingredients: rb.ingredients }) : r;
+    });
+  } else {
+    state.recipes.push({ id: "recipe_" + Date.now(), name: rb.name.trim(), ingredients: rb.ingredients, createdAt: new Date().toISOString() });
+  }
+  saveRecipes();
+  foodUi().recipeBuilder = null;
+  rerender();
+};
+actions.removeRecipeIngredient = function(idxStr) {
+  const rb = foodUi().recipeBuilder;
+  if (!rb) return;
+  rb.ingredients.splice(parseInt(idxStr, 10), 1);
+  rerender();
+};
+
+function renderRecipeBuilderScreen(fu) {
+  const rb = fu.recipeBuilder;
+  if (rb.picker) return renderIngredientPickerScreen(fu, rb);
+  const totals = sumRecipeIngredients(rb.ingredients);
+  let html = '<button class="backBtn" data-action="cancelRecipeBuilder">← Back</button>';
+  let inner = '<h3 class="cardTitle" style="margin-bottom:12px">' + (rb.editingId ? "Edit Recipe" : "New Recipe") + '</h3>';
+  inner += '<div style="margin-bottom:16px"><label class="label">Recipe Name</label>' + textInput({ value: rb.name, placeholder: "e.g. Daily Shake", bind: "recipeName" }) + '</div>';
+
+  if (rb.ingredients.length === 0) {
+    inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + ';font-size:13px">No ingredients yet. Add some below.</div>';
+  } else {
+    rb.ingredients.forEach(function(ing, i) {
+      inner += '<div class="foodEntry">' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+          '<div style="flex:1;min-width:0"><div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(ing.name) + '</div>' +
+          '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">' + ing.weight + 'g</div></div>' +
+          '<div style="text-align:right;display:flex;align-items:center;gap:8px">' +
+            '<span style="color:' + C.calories + ';font-weight:700">' + ing.calories + '</span>' +
+            '<button data-action="removeRecipeIngredient" data-arg="' + i + '" style="background:none;border:none;color:' + C.textMut + ';cursor:pointer;font-size:16px;padding:2px">\u{1F5D1}</button>' +
+          '</div>' +
+        '</div>' +
+        '<div style="display:flex;gap:10px;margin-top:6px;font-size:12px">' +
+          '<span style="color:' + C.protein + '">P: ' + ing.protein + 'g</span>' +
+          '<span style="color:' + C.carbs + '">C: ' + ing.carbs + 'g</span>' +
+          '<span style="color:' + C.fat + '">F: ' + ing.fat + 'g</span>' +
+        '</div></div>';
+    });
+  }
+
+  inner += btn({ label: "➕ Add Ingredient", action: "openIngredientPicker", outline: true, full: true, extraStyle: "margin-top:8px;margin-bottom:16px" });
+
+  if (rb.ingredients.length > 0) {
+    inner += '<div style="padding:12px 14px;background:' + C.inputBg + ';border-radius:10px;margin-bottom:16px">' +
+      '<div style="color:' + C.textMut + ';font-size:11px;text-transform:uppercase;margin-bottom:6px">Total (' + round1(totals.weight) + 'g)</div>' +
+      '<div style="display:flex;gap:12px;font-size:13px;flex-wrap:wrap">' +
+        '<span style="color:' + C.calories + '">' + Math.round(totals.calories) + ' kcal</span>' +
+        '<span style="color:' + C.protein + '">P: ' + round1(totals.protein) + 'g</span>' +
+        '<span style="color:' + C.carbs + '">C: ' + round1(totals.carbs) + 'g</span>' +
+        '<span style="color:' + C.fat + '">F: ' + round1(totals.fat) + 'g</span>' +
+      '</div></div>';
+  }
+
+  inner += '<div class="row">';
+  if (rb.editingId) inner += btn({ label: "Delete", action: "deleteRecipeFromBuilder", outline: true, color: "danger" });
+  inner += btn({ id: "saveRecipeBtn", label: "Save Recipe", action: "saveRecipe", full: true, disabled: !rb.name.trim() || rb.ingredients.length === 0 });
+  inner += '</div>';
+
+  html += card(inner);
+  return html;
+}
+
+// ---- Ingredient picker (used while building a recipe) ----
+actions.openIngredientPicker = function() {
+  const rb = foodUi().recipeBuilder;
+  if (!rb) return;
+  rb.picker = { mode: "search", query: "", results: [], searching: false, selecting: null, weight: "100", manual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" } };
+  rerender();
+};
+actions.closeIngredientPicker = function() {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker) return;
+  if (rb.picker.selecting) { rb.picker.selecting = null; rerender(); return; }
+  rb.picker = null;
+  rerender();
+};
+actions.setPickerMode = function(mode) {
+  const rb = foodUi().recipeBuilder;
+  if (rb && rb.picker) { rb.picker.mode = mode; rerender(); }
+};
+inputActions.ingredientQuery = function(val) { const rb = foodUi().recipeBuilder; if (rb && rb.picker) rb.picker.query = val; };
+actions.doIngredientSearch = async function() {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker || !rb.picker.query.trim()) return;
+  const pk = rb.picker;
+  pk.searching = true;
+  rerender();
+  const usda = await searchUSDA(pk.query);
+  const off = await searchOpenFoodFacts(pk.query);
+  pk.results = deduplicateFoods(usda.concat(off));
+  pk.searching = false;
+  rerender();
+};
+actions.selectIngredientFood = function(foodId, srcTab) {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker) return;
+  const pk = rb.picker;
+  let food = pk.results.find(function(f){ return f.id === foodId; });
+  if (!food && srcTab === "favorites") food = state.favorites.find(function(f){ return f.id === foodId; });
+  if (!food) return;
+  pk.selecting = food;
+  pk.weight = String((food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams) || 100);
+  rerender();
+};
+inputActions.ingredientWeight = function(val) { const rb = foodUi().recipeBuilder; if (rb && rb.picker) rb.picker.weight = val; };
+actions.setIngredientWeight = function(grams) {
+  const rb = foodUi().recipeBuilder;
+  if (rb && rb.picker) { rb.picker.weight = grams; rerender(); }
+};
+actions.confirmAddIngredient = function() {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker || !rb.picker.selecting) return;
+  const food = rb.picker.selecting;
+  const w = parseFloat(rb.picker.weight) || 0;
+  const m = calcMacrosForWeight(food, w);
+  rb.ingredients.push({ id: "ing_" + Date.now() + "_" + Math.random().toString(36).slice(2,7), name: food.name, weight: w, calories: m.calories, protein: m.protein, carbs: m.carbs, fat: m.fat, fiber: m.fiber || 0 });
+  rb.picker = null;
+  rerender();
+};
+["Name","Weight","Calories","Protein","Carbs","Fat"].forEach(function(f) {
+  inputActions["ingManual" + f] = function(val) {
+    const rb = foodUi().recipeBuilder;
+    if (rb && rb.picker) rb.picker.manual[f.toLowerCase()] = val;
+  };
+});
+actions.confirmAddManualIngredient = function() {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker) return;
+  const m = rb.picker.manual;
+  if (!m.name.trim()) return;
+  rb.ingredients.push({
+    id: "ing_" + Date.now() + "_" + Math.random().toString(36).slice(2,7),
+    name: m.name, weight: parseFloat(m.weight) || 0,
+    calories: parseFloat(m.calories) || 0, protein: parseFloat(m.protein) || 0,
+    carbs: parseFloat(m.carbs) || 0, fat: parseFloat(m.fat) || 0, fiber: parseFloat(m.fiber) || 0,
+  });
+  rb.picker = null;
+  rerender();
+};
+
+function renderIngredientPickerScreen(fu, rb) {
+  const pk = rb.picker;
+  let html = '<button class="backBtn" data-action="closeIngredientPicker">← Back</button>';
+
+  if (pk.selecting) {
+    const food = pk.selecting;
+    const w = parseFloat(pk.weight) || 0;
+    const m = calcMacrosForWeight(food, w);
+    let inner = '<h3 class="cardTitle" style="margin-bottom:12px">' + esc(food.name) + '</h3>';
+    inner += '<div class="rowWrap" style="margin-bottom:16px">' +
+      (food.servingSizes || []).map(function(s) {
+        return '<button class="chip' + (parseFloat(pk.weight) === s.grams ? ' active' : '') + '" data-action="setIngredientWeight" data-arg="' + s.grams + '">' + esc(s.label) + '</button>';
+      }).join('') +
+    '</div>';
+    inner += '<div class="row" style="align-items:center;margin-bottom:20px">' +
+      textInput({ value: pk.weight, type: "number", bind: "ingredientWeight", style: "flex:1" }) +
+      '<span style="color:' + C.textMut + '">grams</span></div>';
+    inner += '<div style="text-align:center;margin-bottom:16px"><div style="font-size:28px;font-weight:800;color:' + C.calories + '">' + m.calories + ' kcal</div></div>';
+    inner += '<div style="display:flex;justify-content:space-around;margin-bottom:20px">' + macroStat("Protein", m.protein, C.protein) + macroStat("Carbs", m.carbs, C.carbs) + macroStat("Fat", m.fat, C.fat) + '</div>';
+    inner += btn({ label: "Add Ingredient", action: "confirmAddIngredient", full: true });
+    html += card(inner);
+    return html;
+  }
+
+  let inner = '<h3 class="cardTitle" style="margin-bottom:12px">Add Ingredient</h3>';
+  inner += '<div class="subTabs">' +
+    [["search","Search"],["favorites","Favorites"],["manual","Manual"]].map(function(m) {
+      return '<button class="subTabBtn' + (pk.mode === m[0] ? ' active' : '') + '" data-action="setPickerMode" data-arg="' + m[0] + '">' + m[1] + '</button>';
+    }).join('') +
+  '</div>';
+
+  if (pk.mode === "search") {
+    inner += '<div class="row" style="margin-bottom:12px">' +
+      textInput({ value: pk.query, placeholder: "Search foods...", bind: "ingredientQuery", style: "flex:1" }) +
+      btn({ label: pk.searching ? "..." : "\u{1F50D}", action: "doIngredientSearch", disabled: pk.searching }) +
+    '</div>';
+    pk.results.forEach(function(food) {
+      inner += '<div class="foodResult" data-action="selectIngredientFood" data-arg="' + esc_attr(food.id) + '">' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+          '<div style="flex:1;min-width:0"><div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(food.name) + '</div>' +
+          (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px">' + esc(food.brand) + '</div>' : '') + '</div>' +
+          '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + food.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">kcal/100g</div></div>' +
+        '</div></div>';
+    });
+    if (pk.searching) inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">Searching databases...</div>';
+    else if (pk.results.length === 0 && pk.query) inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No results. Try Manual instead.</div>';
+  } else if (pk.mode === "favorites") {
+    if (state.favorites.length === 0) {
+      inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No favorites yet.</div>';
+    } else {
+      state.favorites.forEach(function(food) {
+        inner += '<div class="foodResult" data-action="selectIngredientFood" data-arg="' + esc_attr(food.id) + '" data-arg2="favorites">' +
+          '<div style="display:flex;justify-content:space-between">' +
+            '<div style="color:' + C.text + ';font-weight:500;font-size:14px">' + esc(food.name) + '</div>' +
+            '<span style="color:' + C.calories + ';font-weight:600">' + food.calories + ' kcal</span>' +
+          '</div></div>';
+      });
+    }
+  } else {
+    const m = pk.manual;
+    inner += '<div style="display:flex;flex-direction:column;gap:10px">' +
+      '<div><label class="label">Ingredient Name</label>' + textInput({ value: m.name, placeholder: "e.g. Olive Oil", bind: "ingManualName" }) + '</div>' +
+      '<div><label class="label">Weight (g)</label>' + textInput({ value: m.weight, type: "number", bind: "ingManualWeight" }) + '</div>' +
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
+        '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' + textInput({ value: m.calories, type: "number", bind: "ingManualCalories" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.protein + '">Protein (g)</label>' + textInput({ value: m.protein, type: "number", bind: "ingManualProtein" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.carbs + '">Carbs (g)</label>' + textInput({ value: m.carbs, type: "number", bind: "ingManualCarbs" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.fat + '">Fat (g)</label>' + textInput({ value: m.fat, type: "number", bind: "ingManualFat" }) + '</div>' +
+      '</div>' +
+    '</div>';
+    inner += btn({ label: "Add Ingredient", action: "confirmAddManualIngredient", full: true, extraStyle: "margin-top:16px" });
+  }
+
+  html += card(inner);
+  return html;
+}
+
+// ---- Logging a recipe to today's log ----
+actions.logRecipe = function(id) {
+  const recipe = state.recipes.find(function(r){ return r.id === id; });
+  if (!recipe) return;
+  const totals = sumRecipeIngredients(recipe.ingredients);
+  const fu = foodUi();
+  fu.loggingRecipe = recipe;
+  fu.loggingWeight = String(round1(totals.weight) || 100);
+  rerender();
+};
+actions.cancelLogRecipe = function() { foodUi().loggingRecipe = null; rerender(); };
+inputActions.loggingRecipeWeight = function(val) { foodUi().loggingWeight = val; };
+actions.confirmLogRecipe = function() {
+  const fu = foodUi();
+  const recipe = fu.loggingRecipe;
+  if (!recipe) return;
+  const totals = sumRecipeIngredients(recipe.ingredients);
+  const w = parseFloat(fu.loggingWeight) || 0;
+  const ratio = totals.weight > 0 ? w / totals.weight : 0;
+  const m = { calories: Math.round(totals.calories * ratio), protein: round1(totals.protein * ratio), carbs: round1(totals.carbs * ratio), fat: round1(totals.fat * ratio), fiber: round1(totals.fiber * ratio) };
+  addFoodToLog({
+    id: "recipe_food_" + recipe.id, name: recipe.name, source: "Recipe",
+    calories: m.calories, protein: m.protein, carbs: m.carbs, fat: m.fat, fiber: m.fiber,
+    state: "—", loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString(),
+  });
+  fu.loggingRecipe = null;
+  rerender();
+};
+
+function renderLogRecipeScreen(fu) {
+  const recipe = fu.loggingRecipe;
+  const totals = sumRecipeIngredients(recipe.ingredients);
+  const w = parseFloat(fu.loggingWeight) || 0;
+  const ratio = totals.weight > 0 ? w / totals.weight : 0;
+  const m = { calories: Math.round(totals.calories * ratio), protein: round1(totals.protein * ratio), carbs: round1(totals.carbs * ratio), fat: round1(totals.fat * ratio), fiber: round1(totals.fiber * ratio) };
+  let html = '<button class="backBtn" data-action="cancelLogRecipe">← Back</button>';
+  let inner = '<h3 class="cardTitle" style="margin-bottom:16px">' + esc(recipe.name) + '</h3>';
+  inner += '<div class="row" style="align-items:center;margin-bottom:8px">' +
+    textInput({ value: fu.loggingWeight, type: "number", bind: "loggingRecipeWeight", style: "flex:1" }) +
+    '<span style="color:' + C.textMut + ';font-size:13px">grams</span></div>';
+  inner += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:20px">Full recipe is ' + round1(totals.weight) + 'g</div>';
+  inner += '<div style="text-align:center;margin-bottom:16px"><div style="font-size:32px;font-weight:800;color:' + C.calories + '">' + m.calories + ' <span style="font-size:16px;font-weight:400">kcal</span></div></div>';
+  inner += '<div style="display:flex;justify-content:space-around;margin-bottom:20px">' + macroStat("Protein", m.protein, C.protein) + macroStat("Carbs", m.carbs, C.carbs) + macroStat("Fat", m.fat, C.fat) + '</div>';
+  inner += btn({ label: "Add to Log", action: "confirmLogRecipe", full: true });
+  html += card(inner);
+  return html;
+}
 
 actions.selectFoodForAdd = function(foodId, srcTab) {
   const fu = foodUi();
@@ -1764,11 +2239,17 @@ function renderStrategyTab() {
 
 actions.setStrategySection = function(s) { strategyUi().section = s; rerender(); };
 
+function macroLockBtn(key) {
+  const locks = state.settings.macroLocks || {};
+  const locked = !!locks[key];
+  return '<button data-action="toggleMacroLock" data-arg="' + key + '" title="' + (locked ? "Locked — won’t change when calorie target changes" : "Lock this macro") + '" style="background:none;border:none;cursor:pointer;font-size:15px;padding:2px 4px;line-height:1;color:' + (locked ? C.warning : C.textMut) + '">' + (locked ? "\u{1F512}" : "\u{1F513}") + '</button>';
+}
+
 function renderTargetsSection() {
   const set = state.settings;
   const su = strategyUi();
   let html = '<h3 class="cardTitle">Daily Targets</h3>' +
-    '<div style="margin-bottom:20px"><label class="label">Calorie Target (kcal)</label>' + textInput({ value: set.calorieTarget, type: "number", bind: "calorieTarget" }) + '</div>' +
+    '<div style="margin-bottom:20px"><label class="label">Calorie Target (kcal)</label>' + textInput({ id: "calorieTargetInput", value: set.calorieTarget, type: "number", bind: "calorieTarget" }) + '</div>' +
     '<div style="margin-bottom:16px"><label class="label" style="margin-bottom:8px">Macro Split Presets</label><div class="rowWrap">';
   MACRO_PRESETS.forEach(function(p) {
     html += '<button class="chip' + (set.macroPreset === p.name ? ' active' : '') + '" data-action="applyPreset" data-arg="' + esc_attr(p.name) + '">' + esc(p.name) + '</button>';
@@ -1781,10 +2262,10 @@ function renderTargetsSection() {
 
   if (su.inputMode === "grams") {
     html += '<div style="display:flex;flex-direction:column;gap:12px">' +
-      '<div><label class="label" style="color:' + C.protein + '">Protein (g)</label>' + textInput({ value: set.proteinTarget, type: "number", bind: "proteinTarget" }) + '</div>' +
-      '<div><label class="label" style="color:' + C.carbs + '">Carbs (g)</label>' + textInput({ value: set.carbsTarget, type: "number", bind: "carbsTarget" }) + '</div>' +
-      '<div><label class="label" style="color:' + C.fat + '">Fat (g)</label>' + textInput({ value: set.fatTarget, type: "number", bind: "fatTarget" }) + '</div>' +
-      '<div style="color:' + C.textMut + ';font-size:12px;margin-top:4px">Calculated: ' + Math.round(set.proteinTarget*4 + set.carbsTarget*4 + set.fatTarget*9) + ' kcal from macros</div>' +
+      '<div><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><label class="label" style="margin:0;color:' + C.protein + '">Protein (g)</label>' + macroLockBtn("protein") + '</div>' + textInput({ id: "proteinTargetInput", value: set.proteinTarget, type: "number", bind: "proteinTarget" }) + '</div>' +
+      '<div><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><label class="label" style="margin:0;color:' + C.carbs + '">Carbs (g)</label>' + macroLockBtn("carbs") + '</div>' + textInput({ id: "carbsTargetInput", value: set.carbsTarget, type: "number", bind: "carbsTarget" }) + '</div>' +
+      '<div><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><label class="label" style="margin:0;color:' + C.fat + '">Fat (g)</label>' + macroLockBtn("fat") + '</div>' + textInput({ id: "fatTargetInput", value: set.fatTarget, type: "number", bind: "fatTarget" }) + '</div>' +
+      '<div style="color:' + C.textMut + ';font-size:11px;margin-top:2px">Calories stay in sync with these grams automatically. Lock up to 2 macros (\u{1F512}) to protect them when you edit the calorie target instead — the unlocked one(s) absorb the change.</div>' +
     '</div>';
   } else {
     const combos = [
@@ -1818,10 +2299,58 @@ actions.applyPreset = function(name) {
 };
 actions.setInputMode = function(m) { strategyUi().inputMode = m; rerender(); };
 
-inputActions.calorieTarget = function(v) { state.settings.calorieTarget = parseInt(v,10) || 0; saveSettings(); };
-inputActions.proteinTarget = function(v) { state.settings.proteinTarget = parseInt(v,10) || 0; state.settings.macroPreset = "Custom"; saveSettings(); };
-inputActions.carbsTarget = function(v) { state.settings.carbsTarget = parseInt(v,10) || 0; state.settings.macroPreset = "Custom"; saveSettings(); };
-inputActions.fatTarget = function(v) { state.settings.fatTarget = parseInt(v,10) || 0; state.settings.macroPreset = "Custom"; saveSettings(); };
+const MACRO_CAL_PER_G = { protein: 4, carbs: 4, fat: 9 };
+
+// Editing a macro gram field directly always recomputes calories from the (now current) grams —
+// locks don't apply in this direction, they only protect grams when *calories* change (below).
+function syncCalorieFromMacros() {
+  const set = state.settings;
+  set.calorieTarget = Math.round(set.proteinTarget * 4 + set.carbsTarget * 4 + set.fatTarget * 9);
+  saveSettings();
+  const el = document.getElementById("calorieTargetInput");
+  if (el) el.value = set.calorieTarget;
+}
+inputActions.proteinTarget = function(v) { state.settings.proteinTarget = parseInt(v,10) || 0; state.settings.macroPreset = "Custom"; syncCalorieFromMacros(); };
+inputActions.carbsTarget = function(v) { state.settings.carbsTarget = parseInt(v,10) || 0; state.settings.macroPreset = "Custom"; syncCalorieFromMacros(); };
+inputActions.fatTarget = function(v) { state.settings.fatTarget = parseInt(v,10) || 0; state.settings.macroPreset = "Custom"; syncCalorieFromMacros(); };
+
+// Editing calories redistributes the change across unlocked macros only, preserving their
+// relative proportion to each other; locked macros' grams are left untouched.
+inputActions.calorieTarget = function(v) {
+  const set = state.settings;
+  const newCal = parseInt(v, 10) || 0;
+  set.calorieTarget = newCal;
+  const locks = set.macroLocks || {};
+  const keys = ["protein", "carbs", "fat"];
+  const lockedKeys = keys.filter(function(k){ return locks[k]; });
+  const unlockedKeys = keys.filter(function(k){ return !locks[k]; });
+  const lockedCal = lockedKeys.reduce(function(sum, k){ return sum + set[k + "Target"] * MACRO_CAL_PER_G[k]; }, 0);
+  const remaining = Math.max(0, newCal - lockedCal);
+  if (unlockedKeys.length > 0) {
+    const unlockedCalTotal = unlockedKeys.reduce(function(sum, k){ return sum + set[k + "Target"] * MACRO_CAL_PER_G[k]; }, 0);
+    unlockedKeys.forEach(function(k) {
+      const share = unlockedCalTotal > 0 ? (set[k + "Target"] * MACRO_CAL_PER_G[k]) / unlockedCalTotal : 1 / unlockedKeys.length;
+      set[k + "Target"] = Math.round((remaining * share) / MACRO_CAL_PER_G[k]);
+    });
+  }
+  set.macroPreset = "Custom";
+  saveSettings();
+  keys.forEach(function(k) {
+    const el = document.getElementById(k + "TargetInput");
+    if (el) el.value = set[k + "Target"];
+  });
+};
+
+actions.toggleMacroLock = function(key) {
+  const set = state.settings;
+  const locks = Object.assign({ protein: false, carbs: false, fat: false }, set.macroLocks);
+  const lockedCount = ["protein", "carbs", "fat"].filter(function(k){ return locks[k]; }).length;
+  if (!locks[key] && lockedCount >= 2) return; // max 2 locks at once
+  locks[key] = !locks[key];
+  set.macroLocks = locks;
+  saveSettings();
+  rerender();
+};
 
 root.addEventListener("input", function(e) {
   const el = e.target;
@@ -1972,7 +2501,7 @@ function renderDataSection() {
 }
 
 actions.exportData = function() {
-  const exportObj = { settings: state.settings, foodLogs: state.foodLogs, weights: state.weights, favorites: state.favorites, recentFoods: state.recentFoods, exportDate: new Date().toISOString(), version: "1.0" };
+  const exportObj = { settings: state.settings, foodLogs: state.foodLogs, weights: state.weights, favorites: state.favorites, recentFoods: state.recentFoods, recipes: state.recipes, exportDate: new Date().toISOString(), version: "1.0" };
   const blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -1992,6 +2521,7 @@ changeActions.importData = function(el) {
       if (data.weights) { state.weights = data.weights; saveWeights(); }
       if (data.favorites) { state.favorites = data.favorites; saveFavorites(); }
       if (data.recentFoods) { state.recentFoods = data.recentFoods; saveRecentFoods(); }
+      if (data.recipes) { state.recipes = data.recipes; saveRecipes(); }
       alert("Data imported successfully!");
       rerender();
     } catch (e) { alert("Error importing data. Check file format."); }
@@ -2003,8 +2533,8 @@ actions.askConfirmClear = function() { strategyUi().confirmClear = true; rerende
 actions.cancelConfirmClear = function() { strategyUi().confirmClear = false; rerender(); };
 actions.clearAllData = function() {
   state.settings = Object.assign({}, DEFAULT_SETTINGS);
-  state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {};
-  saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache();
+  state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {}; state.recipes = [];
+  saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache(); saveRecipes();
   strategyUi().confirmClear = false;
   rerender();
 };
