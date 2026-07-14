@@ -2,7 +2,7 @@
 
 A self-contained calorie and macro tracking PWA. No build step, no frameworks — a single `index.html` with vanilla JS, storing everything locally in the browser (`localStorage`).
 
-Live app: https://REPLACE_WITH_USERNAME.github.io/macrolog/
+Live app: https://colinswhardy.github.io/claudemacro/
 
 ## Features
 - Dashboard with calorie/macro progress bars and a food log grouped by time of day
