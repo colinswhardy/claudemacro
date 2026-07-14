@@ -156,7 +156,7 @@ const DEFAULT_SETTINGS = {
   weightUnit: "lbs", carbsDisplay: "total",
   goalWeight: 150, goalDate: "2026-09-14",
   startWeight: null, startDate: null,
-  aiProvider: "claude-haiku", aiEnabled: true, geminiApiKey: "", claudeApiKey: "",
+  aiProvider: "claude-sonnet", aiEnabled: true, geminiApiKey: "", claudeApiKey: "", compareWithGemini: false,
   macroPreset: "Custom",
 };
 
@@ -786,7 +786,7 @@ actions.saveEditMacros = function(entryId) {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, addingFood: null, addWeight: "100", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null };
   return state.ui.food;
 }
 
@@ -923,7 +923,7 @@ actions.openWizard = function(type) { foodUi().wizardType = type; foodUi().wizar
 actions.closeWizard = function() { foodUi().wizardType = null; rerender(); };
 
 actions.openAIScreen = function() { foodUi().showAI = true; rerender(); };
-actions.closeAIScreen = function() { const fu = foodUi(); fu.showAI = false; fu.aiResults = null; fu.aiError = null; rerender(); };
+actions.closeAIScreen = function() { const fu = foodUi(); fu.showAI = false; fu.aiResults = null; fu.aiError = null; fu.aiCompareResults = null; fu.aiCompareError = null; rerender(); };
 actions.openManualEntry = function() { foodUi().manualEntry = true; rerender(); };
 actions.closeManualEntry = function() { foodUi().manualEntry = false; rerender(); };
 
@@ -1098,10 +1098,49 @@ function renderAIForm(fu) {
     html += '</div>';
   }
 
+  html += renderAiComparison(fu);
+
   html += '<div class="row">' +
     btn({ label: "Cancel", action: "closeAIScreen", outline: true, full: true }) +
     btn({ id: "aiEstimateBtn", label: fu.aiLoading ? "Estimating..." : "\u2728 Estimate", action: "runAIEstimate", full: true, disabled: fu.aiLoading || (!fu.aiDesc.trim() && !fu.aiPhoto) }) +
   '</div>';
+  return html;
+}
+
+function renderAiComparison(fu) {
+  if (!fu.aiCompareError && !fu.aiCompareResults) return '';
+  let html = '<div style="margin-top:4px;margin-bottom:16px">';
+  html += '<div style="color:' + C.textSec + ';font-size:13px;font-weight:600;margin-bottom:8px">Gemini Comparison</div>';
+  if (fu.aiCompareError) {
+    html += '<div style="padding:10px 12px;background:' + C.warning + '15;border-radius:8px;color:' + C.warning + ';font-size:13px">' + esc(fu.aiCompareError) + '</div></div>';
+    return html;
+  }
+  const primaryLabel = state.settings.aiProvider === "claude-sonnet" ? "Sonnet" : "Haiku";
+  const a = sumAiItems(fu.aiResults);
+  const b = sumAiItems(fu.aiCompareResults);
+  const metrics = [["Calories", "calories", C.calories, ""], ["Protein", "protein", C.protein, "g"], ["Carbs", "carbs", C.carbs, "g"], ["Fat", "fat", C.fat, "g"]];
+
+  html += '<div style="background:' + C.inputBg + ';border:1px solid ' + C.border + ';border-radius:10px;padding:12px 14px">';
+  html += '<div style="display:flex;font-size:11px;color:' + C.textMut + ';margin-bottom:8px"><div style="flex:1"></div><div style="width:64px;text-align:right">' + esc(primaryLabel) + '</div><div style="width:64px;text-align:right">Gemini</div></div>';
+  metrics.forEach(function(m) {
+    const va = a[m[1]], vb = b[m[1]];
+    const denom = Math.max(va, vb, 1);
+    const pctDiff = Math.abs(va - vb) / denom * 100;
+    const notable = pctDiff >= 15;
+    html += '<div style="display:flex;align-items:center;padding:4px 0' + (notable ? ';background:' + C.warning + '11;border-radius:6px' : '') + '">' +
+      '<div style="flex:1;font-size:13px;color:' + m[2] + '">' + m[0] + '</div>' +
+      '<div style="width:64px;text-align:right;font-size:13px;color:' + C.text + '">' + (Math.round(va * 10) / 10) + m[3] + '</div>' +
+      '<div style="width:64px;text-align:right;font-size:13px;color:' + C.text + '">' + (Math.round(vb * 10) / 10) + m[3] + '</div>' +
+    '</div>';
+    if (notable) {
+      html += '<div style="text-align:right;font-size:11px;color:' + C.warning + ';margin-bottom:2px">⚠ differs by ' + Math.round(pctDiff) + '%</div>';
+    }
+  });
+  html += '</div>';
+  if (fu.aiPhoto) {
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px">Gemini’s estimate is text-only — it doesn’t see the attached photo.</div>';
+  }
+  html += '</div>';
   return html;
 }
 
@@ -1128,22 +1167,51 @@ changeActions.aiPhoto = function(el) {
   reader.readAsDataURL(file);
 };
 
+function sumAiItems(items) {
+  return (items || []).reduce(function(acc, item) {
+    return {
+      weight: acc.weight + (item.quantity_grams || 0),
+      calories: acc.calories + (item.calories || 0),
+      protein: acc.protein + (item.protein || 0),
+      carbs: acc.carbs + (item.carbs || 0),
+      fat: acc.fat + (item.fat || 0),
+      fiber: acc.fiber + (item.fiber || 0),
+    };
+  }, { weight: 0, calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 });
+}
+
 actions.runAIEstimate = async function() {
   const fu = foodUi();
   if (!fu.aiDesc.trim() && !fu.aiPhoto) return;
-  fu.aiLoading = true; fu.aiError = null;
+  fu.aiLoading = true; fu.aiError = null; fu.aiCompareResults = null; fu.aiCompareError = null;
   rerender();
-  let result;
-  if (state.settings.aiProvider === "gemini" && state.settings.geminiApiKey) {
-    result = await estimateWithGemini(fu.aiDesc, state.settings.geminiApiKey);
-  } else if (!state.settings.claudeApiKey) {
-    result = { error: "No Claude API key set. Add one in Strategy \u2192 AI Settings, or switch provider to Gemini." };
+
+  const set = state.settings;
+  const isClaudePrimary = set.aiProvider === "claude-haiku" || set.aiProvider === "claude-sonnet";
+  const doCompare = isClaudePrimary && set.compareWithGemini;
+
+  let primaryP;
+  if (set.aiProvider === "gemini" && set.geminiApiKey) {
+    primaryP = estimateWithGemini(fu.aiDesc, set.geminiApiKey);
+  } else if (!set.claudeApiKey) {
+    primaryP = Promise.resolve({ error: "No Claude API key set. Add one in Strategy \u2192 AI Settings, or switch provider to Gemini." });
   } else {
-    result = await estimateWithClaude(fu.aiDesc, fu.aiPhoto, state.settings.aiProvider, state.settings.claudeApiKey);
+    primaryP = estimateWithClaude(fu.aiDesc, fu.aiPhoto, set.aiProvider, set.claudeApiKey);
   }
+  const comparePromise = doCompare
+    ? (set.geminiApiKey ? estimateWithGemini(fu.aiDesc, set.geminiApiKey) : Promise.resolve({ error: "No Gemini API key set. Add one in Strategy \u2192 AI Settings to enable comparison." }))
+    : Promise.resolve(null);
+
+  const results = await Promise.all([primaryP, comparePromise]);
+  const result = results[0];
+  const compareResult = results[1];
   fu.aiLoading = false;
   if (result.error) { fu.aiError = result.error; }
   else { fu.aiResults = result.data; fu.aiError = null; }
+  if (compareResult) {
+    if (compareResult.error) { fu.aiCompareError = compareResult.error; }
+    else { fu.aiCompareResults = compareResult.data; fu.aiCompareError = null; }
+  }
   rerender();
 };
 
@@ -1165,16 +1233,7 @@ actions.addAiResultsCombined = function() {
   const fu = foodUi();
   const items = fu.aiResults || [];
   if (items.length === 0) return;
-  const totals = items.reduce(function(acc, item) {
-    return {
-      weight: acc.weight + (item.quantity_grams || 0),
-      calories: acc.calories + (item.calories || 0),
-      protein: acc.protein + (item.protein || 0),
-      carbs: acc.carbs + (item.carbs || 0),
-      fat: acc.fat + (item.fat || 0),
-      fiber: acc.fiber + (item.fiber || 0),
-    };
-  }, { weight: 0, calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 });
+  const totals = sumAiItems(items);
   const name = fu.aiDesc.trim() || items.map(function(i){ return i.name; }).join(", ");
   addFoodToLog({
     id: "ai_" + Date.now() + "_combined", name: name, source: "AI Estimate",
@@ -1864,18 +1923,28 @@ function renderAISection() {
     });
     html += '</div></div>';
 
-    if (set.aiProvider === "claude-haiku" || set.aiProvider === "claude-sonnet") {
-      html += '<div><label class="label">Claude API Key</label>' + textInput({ value: set.claudeApiKey || "", type: "password", bind: "claudeApiKey", placeholder: "sk-ant-..." }) +
+    const isClaudePrimary = set.aiProvider === "claude-haiku" || set.aiProvider === "claude-sonnet";
+
+    if (isClaudePrimary) {
+      html += '<div style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:' + C.inputBg + ';border-radius:10px;border:1px solid ' + C.border + '">' +
+        '<div><div style="font-size:14px">Compare with Gemini</div><div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">Also query Gemini on every estimate and flag where the two disagree</div></div>' +
+        toggleSwitch(set.compareWithGemini, "toggleCompareGemini") +
+      '</div>';
+    }
+
+    if (isClaudePrimary) {
+      html += '<div style="margin-bottom:16px"><label class="label">Claude API Key</label>' + textInput({ value: set.claudeApiKey || "", type: "password", bind: "claudeApiKey", placeholder: "sk-ant-..." }) +
         '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">Get a key at console.anthropic.com. Stored only on this device.</div></div>';
     }
-    if (set.aiProvider === "gemini") {
+    if (set.aiProvider === "gemini" || (isClaudePrimary && set.compareWithGemini)) {
       html += '<div><label class="label">Gemini API Key</label>' + textInput({ value: set.geminiApiKey || "", type: "password", bind: "geminiApiKey", placeholder: "Enter your Google AI Studio API key" }) +
-        '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">Get a free key at ai.google.dev</div></div>';
+        '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">Get a free key at ai.google.dev' + (isClaudePrimary && set.compareWithGemini ? " — needed for the Gemini comparison" : "") + '</div></div>';
     }
   }
   return card(html);
 }
 actions.toggleAiEnabled = function() { state.settings.aiEnabled = !state.settings.aiEnabled; saveSettings(); rerender(); };
+actions.toggleCompareGemini = function() { state.settings.compareWithGemini = !state.settings.compareWithGemini; saveSettings(); rerender(); };
 actions.setAiProvider = function(p) { state.settings.aiProvider = p; saveSettings(); rerender(); };
 inputActions.claudeApiKey = function(v) { state.settings.claudeApiKey = v; saveSettings(); };
 inputActions.geminiApiKey = function(v) { state.settings.geminiApiKey = v; saveSettings(); };
