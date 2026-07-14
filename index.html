@@ -155,6 +155,7 @@ const DEFAULT_SETTINGS = {
   calorieTarget: 1876, proteinTarget: 163, carbsTarget: 153, fatTarget: 68,
   weightUnit: "lbs", carbsDisplay: "total",
   goalWeight: 150, goalDate: "2026-09-14",
+  startWeight: null, startDate: null,
   aiProvider: "claude-haiku", aiEnabled: true, geminiApiKey: "", claudeApiKey: "",
   macroPreset: "Custom",
 };
@@ -1346,7 +1347,7 @@ actions.wizardConfirmAdd = function() {
 // WEIGHT TAB
 // ============================================================
 function weightUi() {
-  if (!state.ui.weight) state.ui.weight = { input: "", timeRange: "30d", importMsg: "" };
+  if (!state.ui.weight) state.ui.weight = { input: "", timeRange: "30d", importMsg: "", editingStart: false, startInputDate: "", startInputWeight: "", selectedPoint: null };
   return state.ui.weight;
 }
 
@@ -1369,23 +1370,42 @@ function renderWeightTab() {
 
   const allWeights = Object.keys(state.weights).sort().map(function(d){ return [d, state.weights[d]]; });
   const latestWeight = allWeights.length > 0 ? allWeights[allWeights.length-1][1].weight : null;
-  const firstWeight = allWeights.length > 0 ? allWeights[0][1].weight : null;
-  const totalChange = (latestWeight != null && firstWeight != null) ? round1(latestWeight - firstWeight) : null;
-  const sevenDaysAgo = Date.now() - 7*86400000;
-  const last7 = allWeights.filter(function(w){ return parseDateStr(w[0]).getTime() >= sevenDaysAgo; });
-  const avgDaily7 = last7.length >= 2 ? Math.round(((last7[last7.length-1][1].weight - last7[0][1].weight) / (last7.length-1)) * 100) / 100 : null;
-  const weeklyChange = last7.length >= 2 ? round1(last7[last7.length-1][1].weight - last7[0][1].weight) : null;
+  const latestDateStr = allWeights.length > 0 ? allWeights[allWeights.length-1][0] : null;
+  const effStartDate = set.startDate || (allWeights.length > 0 ? allWeights[0][0] : null);
+  const effStartWeight = (set.startWeight != null && set.startWeight !== "") ? set.startWeight : (allWeights.length > 0 ? allWeights[0][1].weight : null);
+  const totalChange = (latestWeight != null && effStartWeight != null) ? round1(latestWeight - effStartWeight) : null;
+  const daysSinceStart = (effStartDate && latestDateStr) ? Math.max(1, (parseDateStr(latestDateStr) - parseDateStr(effStartDate)) / 86400000) : null;
+  const avgDailySinceStart = (daysSinceStart != null && totalChange != null) ? Math.round((totalChange / daysSinceStart) * 100) / 100 : null;
+  const weeklyChangeSinceStart = (daysSinceStart != null && totalChange != null) ? round1(totalChange / (daysSinceStart / 7)) : null;
 
   if (latestWeight != null) {
     html += '<div class="row" style="margin-bottom:16px">' +
       statCard("Current Weight", latestWeight + " " + unit, C.text) +
-      statCard("Total Change", totalChange != null ? (totalChange > 0 ? "+" : "") + totalChange + " " + unit : "\u2014", totalChange != null ? (totalChange <= 0 ? C.success : C.danger) : C.text) +
+      '<div class="statCard" style="cursor:pointer;min-width:0" data-action="toggleStartEdit">' +
+        '<div class="statLabel">Total Change</div>' +
+        '<div class="statValue" style="color:' + (totalChange != null ? (totalChange <= 0 ? C.success : C.danger) : C.text) + '">' + (totalChange != null ? (totalChange > 0 ? "+" : "") + totalChange + " " + unit : "\u2014") + '</div>' +
+        '<div style="color:' + C.textMut + ';font-size:10px;margin-top:4px">' + (effStartDate ? "since " + esc(dayLabel(effStartDate)) + " \u2022 tap to edit" : "tap to set start") + '</div>' +
+      '</div>' +
     '</div>';
   }
-  if (avgDaily7 != null) {
+
+  if (wu.editingStart) {
+    html += card(
+      '<h3 class="cardTitle" style="margin-bottom:12px">Starting Point</h3>' +
+      '<div style="margin-bottom:12px"><label class="label">Starting Date</label>' + textInput({ value: wu.startInputDate, type: "date", bind: "startInputDate" }) + '</div>' +
+      '<div style="margin-bottom:16px"><label class="label">Starting Weight (' + unit + ')</label>' + textInput({ value: wu.startInputWeight, type: "number", bind: "startInputWeight" }) + '</div>' +
+      '<div class="row">' +
+        btn({ label: "Reset to Auto", action: "clearStartPoint", outline: true, small: true }) +
+        btn({ label: "Cancel", action: "toggleStartEdit", outline: true, small: true }) +
+        btn({ label: "Save", action: "saveStartPoint", small: true }) +
+      '</div>'
+    );
+  }
+
+  if (avgDailySinceStart != null) {
     html += '<div class="row" style="margin-bottom:16px">' +
-      statCard("Avg Daily (7d)", (avgDaily7 > 0 ? "+" : "") + avgDaily7 + " " + unit + "/day", avgDaily7 <= 0 ? C.success : C.danger) +
-      statCard("Weekly Change", weeklyChange != null ? (weeklyChange > 0 ? "+" : "") + weeklyChange + " " + unit : "\u2014", weeklyChange != null ? (weeklyChange <= 0 ? C.success : C.danger) : C.text) +
+      statCard("Avg Daily", (avgDailySinceStart > 0 ? "+" : "") + avgDailySinceStart + " " + unit + "/day", avgDailySinceStart <= 0 ? C.success : C.danger) +
+      statCard("Weekly Change", weeklyChangeSinceStart != null ? (weeklyChangeSinceStart > 0 ? "+" : "") + weeklyChangeSinceStart + " " + unit : "\u2014", weeklyChangeSinceStart != null ? (weeklyChangeSinceStart <= 0 ? C.success : C.danger) : C.text) +
     '</div>';
   }
 
@@ -1401,15 +1421,22 @@ function renderWeightTab() {
     .map(function(w){ return { date: w[0], weight: w[1].weight }; });
 
   if (chartData.length > 1) {
-    html += card(
-      '<h3 class="cardTitle" style="margin-bottom:4px">Weight History</h3>' +
+    let histInner = '<h3 class="cardTitle" style="margin-bottom:4px">Weight History</h3>' +
       '<div class="row" style="margin-bottom:16px">' +
         ["7d","30d","90d","6m","all"].map(function(r) {
           return '<button class="chip' + (wu.timeRange === r ? ' active' : '') + '" data-action="setWeightRange" data-arg="' + r + '" style="flex:1;text-align:center">' + (r === "all" ? "All" : r) + '</button>';
         }).join('') +
       '</div>' +
-      renderWeightChart(chartData, set.goalWeight)
-    );
+      renderWeightChart(chartData, set.goalWeight, wu.selectedPoint);
+    const selPoint = wu.selectedPoint ? chartData.find(function(d){ return d.date === wu.selectedPoint; }) : null;
+    if (selPoint) {
+      histInner += '<div style="margin-top:12px;padding:12px 14px;background:' + C.inputBg + ';border:1px solid ' + C.border + ';border-radius:12px;display:flex;justify-content:space-between;align-items:center">' +
+        '<div><div style="color:' + C.textMut + ';font-size:12px">' + esc(dayLabel(selPoint.date)) + '</div>' +
+        '<div style="font-size:18px;font-weight:700;margin-top:2px;color:' + C.text + '">' + selPoint.weight + ' ' + unit + '</div></div>' +
+        '<button data-action="selectWeightPoint" data-arg="" style="background:none;border:none;color:' + C.textMut + ';font-size:18px;cursor:pointer;padding:4px">✕</button>' +
+      '</div>';
+    }
+    html += card(histInner);
   } else {
     html += card('<div style="text-align:center;padding:30px"><div style="font-size:28px;margin-bottom:8px">\u{1F4C8}</div><div style="color:' + C.textMut + ';font-size:14px">Log at least 2 days of weight to see your chart</div></div>');
   }
@@ -1425,7 +1452,7 @@ function renderWeightTab() {
   return html;
 }
 
-function renderWeightChart(data, goalWeight) {
+function renderWeightChart(data, goalWeight, selectedDate) {
   const w = 460, h = 200, padL = 36, padR = 10, padT = 10, padB = 24;
   const weights = data.map(function(d){ return d.weight; });
   let minW = Math.min.apply(null, weights), maxW = Math.max.apply(null, weights);
@@ -1444,7 +1471,11 @@ function renderWeightChart(data, goalWeight) {
 
   let dots = "";
   data.forEach(function(d, i) {
-    dots += '<circle cx="' + xScale(i).toFixed(1) + '" cy="' + yScale(d.weight).toFixed(1) + '" r="3" fill="' + C.primary + '"></circle>';
+    const cx = xScale(i).toFixed(1), cy = yScale(d.weight).toFixed(1);
+    const isSel = d.date === selectedDate;
+    // Larger invisible circle first so small dots stay easy to tap on mobile.
+    dots += '<circle cx="' + cx + '" cy="' + cy + '" r="12" fill="transparent" data-action="selectWeightPoint" data-arg="' + d.date + '" style="cursor:pointer"></circle>';
+    dots += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (isSel ? 6 : 3) + '" fill="' + (isSel ? C.warning : C.primary) + '"' + (isSel ? ' stroke="#fff" stroke-width="2"' : '') + ' data-action="selectWeightPoint" data-arg="' + d.date + '" style="cursor:pointer;pointer-events:none"></circle>';
   });
 
   let gridLines = "";
@@ -1486,6 +1517,40 @@ function renderWeightChart(data, goalWeight) {
 
 inputActions.weightInput = function(val) { weightUi().input = val; };
 actions.setWeightRange = function(r) { weightUi().timeRange = r; rerender(); };
+
+actions.selectWeightPoint = function(date) {
+  const wu = weightUi();
+  wu.selectedPoint = (!date || wu.selectedPoint === date) ? null : date;
+  rerender();
+};
+
+actions.toggleStartEdit = function() {
+  const wu = weightUi();
+  wu.editingStart = !wu.editingStart;
+  if (wu.editingStart) {
+    const allDates = Object.keys(state.weights).sort();
+    wu.startInputDate = state.settings.startDate || allDates[0] || "";
+    wu.startInputWeight = state.settings.startWeight != null ? String(state.settings.startWeight) : (allDates[0] ? String(state.weights[allDates[0]].weight) : "");
+  }
+  rerender();
+};
+inputActions.startInputDate = function(val) { weightUi().startInputDate = val; };
+inputActions.startInputWeight = function(val) { weightUi().startInputWeight = val; };
+actions.saveStartPoint = function() {
+  const wu = weightUi();
+  state.settings.startDate = wu.startInputDate || null;
+  state.settings.startWeight = wu.startInputWeight ? parseFloat(wu.startInputWeight) : null;
+  saveSettings();
+  wu.editingStart = false;
+  rerender();
+};
+actions.clearStartPoint = function() {
+  state.settings.startDate = null;
+  state.settings.startWeight = null;
+  saveSettings();
+  weightUi().editingStart = false;
+  rerender();
+};
 
 actions.logWeight = function() {
   const wu = weightUi();
@@ -1683,6 +1748,10 @@ function renderWeightGoalsSection() {
   const weeksToGoal = (weeklyRate && remaining) ? Math.abs(remaining / weeklyRate) : null;
   const estGoalDate = weeksToGoal ? new Date(Date.now() + weeksToGoal*7*86400000) : null;
 
+  const effStartDate = set.startDate || (allWeights.length > 0 ? allWeights[0][0] : null);
+  const effStartWeight = (set.startWeight != null && set.startWeight !== "") ? set.startWeight : (allWeights.length > 0 ? allWeights[0][1].weight : null);
+  const totalChangeSinceStart = (latestWeight != null && effStartWeight != null) ? round1(latestWeight - effStartWeight) : null;
+
   let html = '<h3 class="cardTitle">Weight Goals</h3>';
   if (latestWeight != null) html += statCard("Current Weight", latestWeight + " " + set.weightUnit, C.text);
   html += '<div style="margin-top:16px"><label class="label">Goal Weight (' + set.weightUnit + ')</label>' + textInput({ value: set.goalWeight, type: "number", bind: "goalWeight" }) + '</div>';
@@ -1696,11 +1765,23 @@ function renderWeightGoalsSection() {
   if (estGoalDate) {
     html += '<div style="margin-top:10px">' + statCard("Estimated Goal Date", estGoalDate.toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"}), C.success) + '</div>';
   }
+
+  html += '<div style="border-top:1px solid ' + C.border + ';margin:20px 0 16px"></div>';
+  html += '<div class="label" style="margin-bottom:12px;text-transform:uppercase;font-weight:600;letter-spacing:0.5px">Starting Point</div>';
+  html += '<div><label class="label">Starting Date</label>' + textInput({ value: set.startDate || "", type: "date", bind: "goalsStartDate" }) + '</div>';
+  html += '<div style="margin-top:12px"><label class="label">Starting Weight (' + set.weightUnit + ')</label>' + textInput({ value: set.startWeight != null ? set.startWeight : "", type: "number", placeholder: effStartWeight != null ? String(effStartWeight) : "", bind: "goalsStartWeight" }) + '</div>';
+  if (totalChangeSinceStart != null) {
+    html += '<div style="margin-top:12px">' + statCard("Total Change Since Start", (totalChangeSinceStart > 0 ? "+" : "") + totalChangeSinceStart + " " + set.weightUnit, totalChangeSinceStart <= 0 ? C.success : C.danger) + '</div>';
+  }
+  html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:8px">Leave blank to auto-use your earliest logged weight. This also drives the "Total Change" and "Weekly Change" stats on the Weight tab.</div>';
+
   return card(html);
 }
 
 inputActions.goalWeight = function(v) { state.settings.goalWeight = v; saveSettings(); };
 inputActions.goalDate = function(v) { state.settings.goalDate = v; saveSettings(); };
+inputActions.goalsStartDate = function(v) { state.settings.startDate = v || null; saveSettings(); };
+inputActions.goalsStartWeight = function(v) { state.settings.startWeight = v ? parseFloat(v) : null; saveSettings(); };
 
 function renderDisplaySection() {
   const set = state.settings;
