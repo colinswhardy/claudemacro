@@ -303,7 +303,13 @@ async function searchBarcode(code) {
 async function estimateWithClaude(description, photoBase64, model, apiKey) {
   const content = [];
   if (photoBase64) content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: photoBase64 } });
-  content.push({ type: "text", text: 'Estimate the macronutrients for this food: "' + description + '". ' + (photoBase64 ? "A photo is attached for context." : "") + ' Return ONLY valid JSON (no markdown fences) as an array: [{"name":"food name","quantity_grams":number,"calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number}]. Estimate realistic portion sizes. Be as accurate as possible.' });
+  const desc = (description || "").trim();
+  let promptText;
+  if (desc && photoBase64) promptText = 'Estimate the macronutrients for this food: "' + desc + '". A photo is attached for additional context.';
+  else if (photoBase64) promptText = 'Estimate the macronutrients for the food shown in this photo.';
+  else promptText = 'Estimate the macronutrients for this food: "' + desc + '".';
+  promptText += ' Return ONLY valid JSON (no markdown fences) as an array: [{"name":"food name","quantity_grams":number,"calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number}]. Estimate realistic portion sizes. Be as accurate as possible.';
+  content.push({ type: "text", text: promptText });
   try {
     const modelId = model === "claude-sonnet" ? "claude-sonnet-4-6" : "claude-haiku-4-5-20251001";
     const r = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1086,17 +1092,27 @@ function renderAIForm(fu) {
         btn({ label: "Add to Log", action: "addAiResult", arg: String(i), small: true, extraStyle: "margin-top:8px" }) +
       '</div>';
     });
+    if (fu.aiResults.length > 1) {
+      html += btn({ label: "\u2795 Add All as One Meal", action: "addAiResultsCombined", outline: true, full: true });
+    }
     html += '</div>';
   }
 
   html += '<div class="row">' +
     btn({ label: "Cancel", action: "closeAIScreen", outline: true, full: true }) +
-    btn({ label: fu.aiLoading ? "Estimating..." : "\u2728 Estimate", action: "runAIEstimate", full: true, disabled: fu.aiLoading || (!fu.aiDesc.trim() && !fu.aiPhoto) }) +
+    btn({ id: "aiEstimateBtn", label: fu.aiLoading ? "Estimating..." : "\u2728 Estimate", action: "runAIEstimate", full: true, disabled: fu.aiLoading || (!fu.aiDesc.trim() && !fu.aiPhoto) }) +
   '</div>';
   return html;
 }
 
-inputActions.aiDesc = function(val) { foodUi().aiDesc = val; };
+inputActions.aiDesc = function(val) {
+  const fu = foodUi();
+  fu.aiDesc = val;
+  // Text input doesn't trigger a full rerender (would steal focus mid-type), so the
+  // Estimate button's disabled state has to be patched directly here to stay in sync.
+  const btnEl = document.getElementById("aiEstimateBtn");
+  if (btnEl) btnEl.disabled = fu.aiLoading || (!fu.aiDesc.trim() && !fu.aiPhoto);
+};
 actions.switchToManual = function() { foodUi().showAI = false; foodUi().manualEntry = true; rerender(); };
 actions.clickPhotoInput = function() { const el = document.getElementById("aiPhotoInput"); if (el) el.click(); };
 actions.removeAiPhoto = function() { foodUi().aiPhoto = null; rerender(); };
@@ -1140,6 +1156,31 @@ actions.addAiResult = function(idxStr) {
     calories: item.calories, protein: item.protein, carbs: item.carbs, fat: item.fat, fiber: item.fiber || 0,
     state: "\u2014", loggedWeight: item.quantity_grams,
     loggedMacros: { calories: item.calories, protein: item.protein, carbs: item.carbs, fat: item.fat, fiber: item.fiber || 0 },
+    timestamp: new Date().toISOString(), photo: fu.aiPhoto || null,
+  });
+  rerender();
+};
+
+actions.addAiResultsCombined = function() {
+  const fu = foodUi();
+  const items = fu.aiResults || [];
+  if (items.length === 0) return;
+  const totals = items.reduce(function(acc, item) {
+    return {
+      weight: acc.weight + (item.quantity_grams || 0),
+      calories: acc.calories + (item.calories || 0),
+      protein: acc.protein + (item.protein || 0),
+      carbs: acc.carbs + (item.carbs || 0),
+      fat: acc.fat + (item.fat || 0),
+      fiber: acc.fiber + (item.fiber || 0),
+    };
+  }, { weight: 0, calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 });
+  const name = fu.aiDesc.trim() || items.map(function(i){ return i.name; }).join(", ");
+  addFoodToLog({
+    id: "ai_" + Date.now() + "_combined", name: name, source: "AI Estimate",
+    calories: Math.round(totals.calories), protein: round1(totals.protein), carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber),
+    state: "\u2014", loggedWeight: round1(totals.weight),
+    loggedMacros: { calories: Math.round(totals.calories), protein: round1(totals.protein), carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber) },
     timestamp: new Date().toISOString(), photo: fu.aiPhoto || null,
   });
   rerender();
@@ -1194,7 +1235,7 @@ function renderWizardAI(config, wiz) {
   if (wiz.aiError) html += '<div style="padding:10px;background:' + C.danger + '15;border-radius:8px;color:' + C.danger + ';font-size:13px;margin-bottom:12px">' + esc(wiz.aiError) + '</div>';
   html += '<div class="row">' +
     btn({ label: "Back", action: "wizardAiBack", outline: true, full: true }) +
-    btn({ label: wiz.aiLoading ? "Estimating..." : "Estimate", action: "wizardAiEstimate", full: true, disabled: wiz.aiLoading || !wiz.aiDesc.trim() }) +
+    btn({ id: "wizardAiEstimateBtn", label: wiz.aiLoading ? "Estimating..." : "Estimate", action: "wizardAiEstimate", full: true, disabled: wiz.aiLoading || !wiz.aiDesc.trim() }) +
   '</div>';
   return html;
 }
@@ -1283,7 +1324,12 @@ actions.wizardSelect = async function(option) {
 
 actions.wizardBack = function() { foodUi().wizard.step -= 1; rerender(); };
 actions.wizardAiBack = function() { foodUi().wizard.showAI = false; rerender(); };
-inputActions.wizardAiDesc = function(val) { foodUi().wizard.aiDesc = val; };
+inputActions.wizardAiDesc = function(val) {
+  const wiz = foodUi().wizard;
+  wiz.aiDesc = val;
+  const btnEl = document.getElementById("wizardAiEstimateBtn");
+  if (btnEl) btnEl.disabled = wiz.aiLoading || !wiz.aiDesc.trim();
+};
 inputActions.wizardWeight = function(val) { foodUi().wizard.weight = val; };
 actions.wizardSetWeight = function(grams) { foodUi().wizard.weight = grams; rerender(); };
 actions.wizardSelectFood = function(foodId) {
