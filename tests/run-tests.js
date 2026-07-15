@@ -58,6 +58,14 @@ const documentStub = {
   removeEventListener: function () {},
 };
 
+const historyStub = {
+  state: null,
+  pushState: function () {},
+  replaceState: function () {},
+  back: function () {},
+  go: function () {},
+};
+
 const sandbox = {
   document: documentStub,
   localStorage: localStorageStub,
@@ -68,6 +76,9 @@ const sandbox = {
   URL: { createObjectURL: function () { return "blob:test"; }, revokeObjectURL: function () {} },
   Blob: function () {},
   FileReader: function () { this.onload = null; this.readAsText = function () {}; this.readAsDataURL = function () {}; },
+  history: historyStub,
+  addEventListener: function () {},
+  removeEventListener: function () {},
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
@@ -80,7 +91,8 @@ const exportLine =
   "\n;globalThis.__t = { calcMacrosForWeight: calcMacrosForWeight, round1: round1, parseCsvLine: parseCsvLine, " +
   "mergeFoodLogsFromCloud: mergeFoodLogsFromCloud, mergeWeightsFromCloud: mergeWeightsFromCloud, mergeRecipesFromCloud: mergeRecipesFromCloud, " +
   "wasRecentlyDeleted: wasRecentlyDeleted, markRecentlyDeleted: markRecentlyDeleted, recentlyDeletedIds: recentlyDeletedIds, " +
-  "inputActions: inputActions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
+  "computeNavDepth: computeNavDepth, collapseOneNavLevel: collapseOneNavLevel, showToast: showToast, " +
+  "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
   vm.runInContext(mainScript + exportLine, sandbox, { filename: "index.html<script>" });
@@ -247,6 +259,85 @@ test("calorieTarget: all-locked leaves nothing to redistribute into (no crash)",
   assertEqual(M.state.settings.proteinTarget, 150, "locked protein unchanged");
   assertEqual(M.state.settings.carbsTarget, 150, "locked carbs unchanged");
   assertEqual(M.state.settings.fatTarget, 50, "locked fat unchanged");
+});
+
+// ==== navigation depth (back-button model) ====
+test("computeNavDepth: dashboard tab is depth 0", function () {
+  M.state.tab = "dashboard";
+  M.state.ui = {};
+  assertEqual(M.computeNavDepth(), 0, "dashboard is the base level");
+});
+test("computeNavDepth: a non-dashboard tab with no sub-screen is depth 1", function () {
+  M.state.tab = "weight";
+  M.state.ui = {};
+  assertEqual(M.computeNavDepth(), 1, "weight tab base is depth 1");
+});
+test("computeNavDepth: a Food sub-screen is depth 2", function () {
+  M.state.tab = "food";
+  M.state.ui = { food: { showAI: true } };
+  assertEqual(M.computeNavDepth(), 2, "AI screen open is depth 2");
+});
+test("computeNavDepth: Food tab with no sub-screen open is depth 1", function () {
+  M.state.tab = "food";
+  M.state.ui = { food: {} };
+  assertEqual(M.computeNavDepth(), 1, "food search base is depth 1");
+});
+
+test("collapseOneNavLevel: closes an open Food sub-screen back to depth 1", function () {
+  M.state.tab = "food";
+  M.state.ui = { food: { manualEntry: true } };
+  const collapsed = M.collapseOneNavLevel();
+  assertEqual(collapsed, true, "returns true when something was collapsed");
+  assertEqual(M.state.ui.food.manualEntry, false, "manualEntry cleared");
+  assertEqual(M.computeNavDepth(), 1, "now at depth 1");
+});
+test("collapseOneNavLevel: from a non-dashboard tab base, goes to dashboard", function () {
+  M.state.tab = "strategy";
+  M.state.ui = {};
+  const collapsed = M.collapseOneNavLevel();
+  assertEqual(collapsed, true, "returns true when something was collapsed");
+  assertEqual(M.state.tab, "dashboard", "tab reset to dashboard");
+});
+test("collapseOneNavLevel: at the base level, there's nothing left to collapse", function () {
+  M.state.tab = "dashboard";
+  M.state.ui = {};
+  const collapsed = M.collapseOneNavLevel();
+  assertEqual(collapsed, false, "returns false at the base level -- this is where the browser should exit instead");
+});
+test("collapseOneNavLevel: closing the AI screen also clears its stale result state", function () {
+  M.state.tab = "food";
+  M.state.ui = { food: { showAI: true, aiResults: [{ name: "x" }], aiError: "oops" } };
+  M.collapseOneNavLevel();
+  assertEqual(M.state.ui.food.showAI, false, "showAI cleared");
+  assertEqual(M.state.ui.food.aiResults, null, "stale AI results cleared");
+  assertEqual(M.state.ui.food.aiError, null, "stale AI error cleared");
+});
+test("collapseOneNavLevel: closing the AI screen also clears aiDesc/aiPhoto so a cancelled attempt can't silently resurface next time", function () {
+  M.state.tab = "food";
+  M.state.ui = { food: { showAI: true, aiDesc: "leftover description", aiPhoto: "base64data" } };
+  M.collapseOneNavLevel();
+  assertEqual(M.state.ui.food.aiDesc, "", "aiDesc reset on close");
+  assertEqual(M.state.ui.food.aiPhoto, null, "aiPhoto reset on close");
+});
+
+// ==== toast ====
+test("showToast: sets state.toast immediately (synchronously, before its auto-hide timer)", function () {
+  M.state.toast = null;
+  M.showToast("Food Added");
+  assertEqual(M.state.toast, "Food Added", "toast message is set right away");
+});
+
+// ==== confirm-lock debounce (shared by addManualEntry/confirmAddFood/confirmLogRecipe/
+// wizardConfirmAdd/saveRecipe/deleteRecipeFromBuilder -- addManualEntry is the simplest to
+// set up and exercises the exact pattern the others share) ====
+test("addManualEntry: a rapid double-tap only logs one entry", function () {
+  M.state.date = "2026-07-15";
+  M.state.foodLogs = {};
+  M.state.ui = { food: { manual: { name: "Test Food", calories: "100", protein: "10", carbs: "10", fat: "5", fiber: "0", weight: "100" }, manualEntry: true } };
+  M.actions.addManualEntry();
+  M.actions.addManualEntry(); // rapid second tap, well within the 600ms debounce window
+  const entries = M.state.foodLogs["2026-07-15"] || [];
+  assertEqual(entries.length, 1, "only one entry logged despite two rapid calls");
 });
 
 console.log("\n" + pass + " passed, " + fail + " failed");

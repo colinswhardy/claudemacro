@@ -86,6 +86,8 @@ a{color:inherit;}
 .backBtn{background:none;border:none;color:#94A3B8;font-size:14px;cursor:pointer;margin-bottom:12px;}
 .loading{display:flex;align-items:center;justify-content:center;height:100vh;color:#3B82F6;font-size:18px;font-weight:600;}
 .presetGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+.toast{position:fixed;bottom:130px;left:50%;transform:translateX(-50%);background:#22C55E;color:#fff;padding:10px 22px;border-radius:20px;font-size:14px;font-weight:600;z-index:200;box-shadow:0 4px 16px rgba(0,0,0,0.35);pointer-events:none;white-space:nowrap;animation:toastPop 0.9s ease forwards;}
+@keyframes toastPop{0%{opacity:0;transform:translateX(-50%) translateY(10px);}15%{opacity:1;transform:translateX(-50%) translateY(0);}78%{opacity:1;}100%{opacity:0;}}
 </style>
 </head>
 <body>
@@ -863,7 +865,83 @@ let pendingFocusId = null; // element id to focus after next render
 let barcodeStream = null; // live camera MediaStream while the barcode scanner is open
 let barcodeDetectionRAF = null; // requestAnimationFrame handle for the scan loop
 
+// ---- Toast (brief "Food Added" style confirmation) ----
+let toastToken = 0;
+function showToast(message) {
+  const token = ++toastToken;
+  state.toast = message;
+  rerender();
+  setTimeout(function() {
+    if (toastToken === token) { state.toast = null; rerender(); }
+  }, 900);
+}
+
+// ---- Back button / gesture navigation ----
+// This app has no router, but the browser back button and edge-swipe gestures both fire
+// the same popstate event, so we can intercept them without one. The model is 3 flat tiers:
+// depth 0 = dashboard tab; depth 1 = any other tab at its base view; depth 2 = a Food-tab
+// sub-screen (AI estimate, manual entry, barcode scan, wizard, recipe builder, etc). Every
+// render() call pushes/resyncs history to match the current depth automatically -- so
+// entering a deeper screen is always handled generically here, no matter which action got
+// you there. Only the "step back" direction needs each screen's close/cancel/confirm action
+// to opt in (call stepBackOneLevel()) instead of clearing its own flag directly, so that
+// physical back-button presses and in-app Cancel buttons collapse state exactly the same way.
+let navDepth = 0;
+function computeNavDepth() {
+  const fu = state.ui.food;
+  if (state.tab === "food" && fu && (fu.scanningBarcode || fu.loggingRecipe || fu.recipeBuilder || fu.wizardType || fu.showAI || fu.manualEntry || fu.addingFood)) return 2;
+  if (state.tab !== "dashboard") return 1;
+  return 0;
+}
+function syncNavHistoryDepth() {
+  const target = computeNavDepth();
+  while (navDepth < target) { navDepth++; history.pushState({ macrologNav: navDepth }, ""); }
+  if (target < navDepth) navDepth = target; // a "direct jump" (goToday, date nav, switching tabs) skips
+  // stepBackOneLevel()'s history.back() -- just resync the counter rather than trying to pop
+  // browser history to match; worst case a jump like this leaves a harmless extra entry that
+  // costs one extra back-press before the app exits, far rarer than the normal step-by-step case.
+}
+// Collapses exactly one level based on current state -- shared by the popstate handler and by
+// stepBackOneLevel()'s defensive fallback if navDepth somehow drifted out of sync.
+function collapseOneNavLevel() {
+  const fu = state.ui.food;
+  if (state.tab === "food" && fu) {
+    if (fu.scanningBarcode) { stopBarcodeCamera(); fu.scanningBarcode = false; fu.scanError = null; fu.scanManualCode = ""; fu.scanLoading = false; fu.scanNotFoundCode = null; return true; }
+    if (fu.loggingRecipe) { fu.loggingRecipe = null; return true; }
+    if (fu.recipeBuilder) { fu.recipeBuilder = null; return true; }
+    if (fu.wizardType) { fu.wizardType = null; fu.wizard = null; fu.wizardSuggestion = null; return true; }
+    if (fu.showAI) {
+      // Also reset aiDesc/aiPhoto (not just the results) -- otherwise a leftover description
+      // or photo from a cancelled attempt would silently resurface (and clobber whatever the
+      // search-box carryover would otherwise fill in) the next time the AI screen is opened.
+      fu.showAI = false; fu.aiResults = null; fu.aiError = null; fu.aiCompareResults = null; fu.aiCompareError = null; fu.aiDesc = ""; fu.aiPhoto = null;
+      return true;
+    }
+    if (fu.manualEntry) { fu.manualEntry = false; return true; }
+    if (fu.addingFood) { fu.addingFood = null; return true; }
+  }
+  if (state.tab !== "dashboard") { stopBarcodeCamera(); state.tab = "dashboard"; state.ui = {}; return true; }
+  return false;
+}
+// Call from a screen's own Cancel/Back/confirm action instead of clearing its flag directly,
+// so browser-back and the in-app button always collapse state through the same single path.
+// Guarded against rapid re-entry: history.back() is async (the actual collapse happens once
+// its popstate arrives), so a fast double-tap on Cancel before that fires would otherwise
+// queue a second history.back() and over-collapse by an extra level.
+let backNavPending = false;
+function stepBackOneLevel() {
+  if (navDepth > 0) {
+    if (backNavPending) return;
+    backNavPending = true;
+    history.back();
+  } else {
+    collapseOneNavLevel();
+    rerender();
+  }
+}
+
 function render() {
+  syncNavHistoryDepth();
   root.innerHTML = renderApp();
   if (pendingFocusId) {
     const el = document.getElementById(pendingFocusId);
@@ -1070,7 +1148,8 @@ function renderApp() {
         tabBtn("weight", "\u{1F4C8}", "Weight") +
         tabBtn("strategy", "⚙", "Strategy") +
       '</div>' +
-    '</div>';
+    '</div>' +
+    (s.toast ? '<div class="toast">' + esc(s.toast) + '</div>' : '');
 }
 
 function tabBtn(key, icon, label) {
@@ -1156,6 +1235,7 @@ function addFoodToLog(food) {
     state.foodCache[food.id] = food;
     saveFoodCache();
   }
+  showToast("Food Added");
 }
 
 function removeFoodFromLog(entryId) {
@@ -1518,10 +1598,12 @@ function renderFoodTab() {
       textInput({ id: "foodSearchInput", value: fu.query, placeholder: "Search foods...", bind: "foodQuery", enter: "doFoodSearch", enterHint: "search", style: "flex:1" }) +
       btn({ label: fu.searching ? "..." : "\u{1F50D}", action: "doFoodSearch", disabled: fu.searching }) +
       '</div>';
-    html += '<div class="row" style="margin-bottom:16px">';
+    html += '<input type="file" accept="image/*" capture="environment" id="aiPhotoInput" data-change="aiPhoto" style="display:none">';
+    html += '<div class="rowWrap" style="margin-bottom:16px">';
     html += btn({ label: "\u{1F4F7} Scan Barcode", action: "openBarcodeScan", small: true, outline: true });
     if (state.settings.aiEnabled) html += btn({ label: "\u2728 AI Estimate", action: "openAIScreen", small: true, outline: true });
     html += btn({ label: "\u270F\uFE0F Manual", action: "openManualEntry", small: true, outline: true });
+    if (state.settings.aiEnabled) html += btn({ label: "\u{1F4F8} Photo", action: "clickPhotoInput", small: true, outline: true });
     html += '</div>';
 
     if (fu.wizardSuggestion && fu.results.length > 0) {
@@ -1651,12 +1733,17 @@ actions.doFoodSearch = async function() {
 };
 
 actions.openWizard = function(type) { foodUi().wizardType = type; foodUi().wizard = { step: 0, selections: {}, weight: "", showAI: false, aiDesc: "", aiLoading: false, aiError: null, searchResults: [], searching: false, selectedFood: null }; rerender(); };
-actions.closeWizard = function() { foodUi().wizardType = null; rerender(); };
+actions.closeWizard = function() { stepBackOneLevel(); };
 
-actions.openAIScreen = function() { foodUi().showAI = true; rerender(); };
-actions.closeAIScreen = function() { const fu = foodUi(); fu.showAI = false; fu.aiResults = null; fu.aiError = null; fu.aiCompareResults = null; fu.aiCompareError = null; rerender(); };
+actions.openAIScreen = function() {
+  const fu = foodUi();
+  if (fu.query && fu.query.trim()) fu.aiDesc = fu.query;
+  fu.showAI = true;
+  rerender();
+};
+actions.closeAIScreen = function() { stepBackOneLevel(); };
 actions.openManualEntry = function() { foodUi().manualEntry = true; rerender(); };
-actions.closeManualEntry = function() { foodUi().manualEntry = false; rerender(); };
+actions.closeManualEntry = function() { stepBackOneLevel(); };
 
 // ---- Barcode scanning ----
 function renderBarcodeScanScreen(fu) {
@@ -1780,10 +1867,12 @@ actions.openBarcodeScan = function() {
   startBarcodeCamera();
 };
 actions.closeBarcodeScan = function() {
+  // Stop the camera synchronously, right here -- stepBackOneLevel()'s actual screen-state
+  // collapse happens asynchronously (after history.back()'s popstate arrives), and the scan
+  // loop only checks scanningBarcode at the top of each tick, so without this a barcode
+  // could still be detected and acted on in the brief gap after the user tapped Cancel.
   stopBarcodeCamera();
-  const fu = foodUi();
-  fu.scanningBarcode = false; fu.scanError = null; fu.scanManualCode = ""; fu.scanLoading = false; fu.scanNotFoundCode = null;
-  rerender();
+  stepBackOneLevel();
 };
 inputActions.scanManualCode = function(val) { foodUi().scanManualCode = val; };
 actions.lookupManualBarcode = async function() {
@@ -1849,7 +1938,7 @@ actions.editRecipe = function(id) {
   foodUi().recipeBuilder = { editingId: id, name: recipe.name, ingredients: recipe.ingredients.map(function(i){ return Object.assign({}, i); }), picker: null };
   rerender();
 };
-actions.cancelRecipeBuilder = function() { foodUi().recipeBuilder = null; rerender(); };
+actions.cancelRecipeBuilder = function() { stepBackOneLevel(); };
 actions.deleteRecipe = function(id) {
   state.recipes = state.recipes.filter(function(r){ return r.id !== id; });
   saveRecipes();
@@ -1859,11 +1948,13 @@ actions.deleteRecipe = function(id) {
 actions.deleteRecipeFromBuilder = function() {
   const rb = foodUi().recipeBuilder;
   if (!rb || !rb.editingId) return;
+  const now = Date.now();
+  if (rb._confirmLock && now - rb._confirmLock < 600) return;
+  rb._confirmLock = now;
   state.recipes = state.recipes.filter(function(r){ return r.id !== rb.editingId; });
   saveRecipes();
   scheduleCloudDelete("recipes", "id", rb.editingId);
-  foodUi().recipeBuilder = null;
-  rerender();
+  stepBackOneLevel();
 };
 inputActions.recipeName = function(val) {
   const rb = foodUi().recipeBuilder;
@@ -1875,6 +1966,9 @@ inputActions.recipeName = function(val) {
 actions.saveRecipe = function() {
   const rb = foodUi().recipeBuilder;
   if (!rb || !rb.name.trim() || rb.ingredients.length === 0) return;
+  const now = Date.now();
+  if (rb._confirmLock && now - rb._confirmLock < 600) return;
+  rb._confirmLock = now;
   if (rb.editingId) {
     state.recipes = state.recipes.map(function(r) {
       return r.id === rb.editingId ? Object.assign({}, r, { name: rb.name.trim(), ingredients: rb.ingredients, updatedAt: new Date().toISOString() }) : r;
@@ -1883,8 +1977,7 @@ actions.saveRecipe = function() {
     state.recipes.push({ id: "recipe_" + Date.now(), name: rb.name.trim(), ingredients: rb.ingredients, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
   }
   saveRecipes();
-  foodUi().recipeBuilder = null;
-  rerender();
+  stepBackOneLevel();
 };
 actions.removeRecipeIngredient = function(idxStr) {
   const rb = foodUi().recipeBuilder;
@@ -2117,12 +2210,15 @@ actions.logRecipe = function(id) {
   fu.loggingWeight = String(round1(totals.weight) || 100);
   rerender();
 };
-actions.cancelLogRecipe = function() { foodUi().loggingRecipe = null; rerender(); };
+actions.cancelLogRecipe = function() { stepBackOneLevel(); };
 inputActions.loggingRecipeWeight = function(val) { foodUi().loggingWeight = val; };
 actions.confirmLogRecipe = function() {
   const fu = foodUi();
   const recipe = fu.loggingRecipe;
   if (!recipe) return;
+  const now = Date.now();
+  if (fu._confirmLock && now - fu._confirmLock < 600) return;
+  fu._confirmLock = now;
   const totals = sumRecipeIngredients(recipe.ingredients);
   const w = parseFloat(fu.loggingWeight) || 0;
   const ratio = totals.weight > 0 ? w / totals.weight : 0;
@@ -2132,8 +2228,7 @@ actions.confirmLogRecipe = function() {
     calories: m.calories, protein: m.protein, carbs: m.carbs, fat: m.fat, fiber: m.fiber,
     state: "—", loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString(),
   });
-  fu.loggingRecipe = null;
-  rerender();
+  stepBackOneLevel();
 };
 
 function renderLogRecipeScreen(fu) {
@@ -2168,7 +2263,7 @@ actions.selectFoodForAdd = function(foodId, srcTab) {
   rerender();
 };
 
-actions.closeAddingFood = function() { foodUi().addingFood = null; rerender(); };
+actions.closeAddingFood = function() { stepBackOneLevel(); };
 
 function renderAddingFoodScreen(fu) {
   const food = fu.addingFood;
@@ -2218,10 +2313,13 @@ actions.confirmAddFood = function() {
   if (!food) return;
   const w = parseFloat(fu.addWeight);
   if (!w || w <= 0) return;
+  const now = Date.now();
+  if (fu._confirmLock && now - fu._confirmLock < 600) return;
+  fu._confirmLock = now;
   const m = calcMacrosForWeight(food, w);
   addFoodToLog(Object.assign({}, food, { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString() }));
-  fu.addingFood = null; fu.query = ""; fu.results = [];
-  rerender();
+  fu.query = ""; fu.results = [];
+  stepBackOneLevel();
 };
 
 actions.toggleFavorite = function(foodId) {
@@ -2268,6 +2366,9 @@ function manualField(key, label, value, color) {
 
 actions.addManualEntry = function() {
   const fu = foodUi();
+  const now = Date.now();
+  if (fu._confirmLock && now - fu._confirmLock < 600) return;
+  fu._confirmLock = now;
   const m = fu.manual;
   const cal = Math.max(0, parseFloat(m.calories) || 0), pro = Math.max(0, parseFloat(m.protein) || 0),
     carb = Math.max(0, parseFloat(m.carbs) || 0), ft = Math.max(0, parseFloat(m.fat) || 0), fib = Math.max(0, parseFloat(m.fiber) || 0);
@@ -2283,8 +2384,7 @@ actions.addManualEntry = function() {
   };
   addFoodToLog(food);
   fu.manual = { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" };
-  fu.manualEntry = false;
-  rerender();
+  stepBackOneLevel();
 };
 
 // ---- AI Estimation screen ----
@@ -2401,7 +2501,15 @@ changeActions.aiPhoto = function(el) {
   if (!file) return;
   const reader = new FileReader();
   reader.onload = function(ev) {
-    foodUi().aiPhoto = ev.target.result.split(",")[1];
+    const fu = foodUi();
+    fu.aiPhoto = ev.target.result.split(",")[1];
+    // Picking a photo from the main search screen (not already on the AI screen) jumps
+    // straight into the AI flow with the photo -- and whatever was typed in search -- already
+    // attached, so there's no separate trip through a blank AI screen just to find this button.
+    if (!fu.showAI) {
+      if (fu.query && fu.query.trim()) fu.aiDesc = fu.query;
+      fu.showAI = true;
+    }
     rerender();
   };
   reader.readAsDataURL(file);
@@ -2692,11 +2800,13 @@ actions.wizardConfirmAdd = function() {
   if (!wiz.selectedFood) return;
   const w = parseFloat(wiz.weight);
   if (!w || w <= 0) return;
+  const now = Date.now();
+  if (fu._confirmLock && now - fu._confirmLock < 600) return;
+  fu._confirmLock = now;
   const m = calcMacrosForWeight(wiz.selectedFood, w);
   addFoodToLog(Object.assign({}, wiz.selectedFood, { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString(), wizardUsed: true }));
-  fu.wizardType = null;
   fu.query = ""; fu.results = [];
-  rerender();
+  stepBackOneLevel();
 };
 
 
@@ -3380,6 +3490,17 @@ document.addEventListener("visibilitychange", function() {
     }
     hiddenSinceMs = null;
   }
+});
+
+// Physical back button and edge-swipe-back gestures both fire popstate. Collapse exactly
+// one app-level level (see collapseOneNavLevel above) instead of letting the browser close
+// the app -- it only actually exits once we're already at the base (dashboard) level, since
+// that's the point where there's nothing left in our pushed history to intercept.
+window.addEventListener("popstate", function() {
+  backNavPending = false;
+  if (navDepth > 0) navDepth--;
+  collapseOneNavLevel();
+  rerender();
 });
 
 </script>
