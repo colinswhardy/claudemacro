@@ -2418,24 +2418,7 @@ function renderAIForm(fu) {
   }
 
   if (fu.aiResults) {
-    html += '<div style="margin-bottom:16px"><div style="color:' + C.success + ';font-size:13px;font-weight:600;margin-bottom:8px">Estimated Results:</div>';
-    fu.aiResults.forEach(function(item, i) {
-      html += '<div style="padding:12px;background:' + C.inputBg + ';border-radius:10px;margin-bottom:6px;border:1px solid ' + C.border + '">' +
-        '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(item.name) + '</div>' +
-        '<div style="display:flex;gap:10px;margin-top:6px;font-size:12px">' +
-          '<span>' + item.quantity_grams + 'g</span>' +
-          '<span style="color:' + C.calories + '">' + item.calories + ' kcal</span>' +
-          '<span style="color:' + C.protein + '">P: ' + item.protein + 'g</span>' +
-          '<span style="color:' + C.carbs + '">C: ' + item.carbs + 'g</span>' +
-          '<span style="color:' + C.fat + '">F: ' + item.fat + 'g</span>' +
-        '</div>' +
-        btn({ label: "Add to Log", action: "addAiResult", arg: String(i), small: true, extraStyle: "margin-top:8px" }) +
-      '</div>';
-    });
-    if (fu.aiResults.length > 1) {
-      html += btn({ label: "\u2795 Add All as One Meal", action: "addAiResultsCombined", outline: true, full: true });
-    }
-    html += '</div>';
+    html += renderAiResultsBlock(aiProviderLabel(state.settings.aiProvider) + " Results:", C.success, fu.aiResults, "addAiResult", "addAiResultsCombined");
   }
 
   html += renderAiComparison(fu);
@@ -2455,7 +2438,7 @@ function renderAiComparison(fu) {
     html += '<div style="padding:10px 12px;background:' + C.warning + '15;border-radius:8px;color:' + C.warning + ';font-size:13px">' + esc(fu.aiCompareError) + '</div></div>';
     return html;
   }
-  const primaryLabel = state.settings.aiProvider === "claude-sonnet" ? "Sonnet" : "Haiku";
+  const primaryLabel = aiProviderLabel(state.settings.aiProvider);
   const a = sumAiItems(fu.aiResults);
   const b = sumAiItems(fu.aiCompareResults);
   const metrics = [["Calories", "calories", C.calories, ""], ["Protein", "protein", C.protein, "g"], ["Carbs", "carbs", C.carbs, "g"], ["Fat", "fat", C.fat, "g"]];
@@ -2480,6 +2463,7 @@ function renderAiComparison(fu) {
   if (fu.aiPhoto) {
     html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px">Gemini’s estimate is text-only — it doesn’t see the attached photo.</div>';
   }
+  html += renderAiResultsBlock("Gemini Results:", C.textSec, fu.aiCompareResults, "addAiCompareResult", "addAiCompareResultsCombined");
   html += '</div>';
   return html;
 }
@@ -2514,6 +2498,36 @@ changeActions.aiPhoto = function(el) {
   };
   reader.readAsDataURL(file);
 };
+
+function aiProviderLabel(provider) {
+  if (provider === "claude-sonnet") return "Sonnet";
+  if (provider === "claude-haiku") return "Haiku";
+  return "Gemini";
+}
+
+// Shared by the primary results list and the Gemini comparison results list -- same card
+// layout, different data source and "Add to Log" action underneath.
+function renderAiResultsBlock(label, labelColor, items, addAction, addAllAction) {
+  let html = '<div style="margin-bottom:16px"><div style="color:' + labelColor + ';font-size:13px;font-weight:600;margin-bottom:8px">' + esc(label) + '</div>';
+  items.forEach(function(item, i) {
+    html += '<div style="padding:12px;background:' + C.inputBg + ';border-radius:10px;margin-bottom:6px;border:1px solid ' + C.border + '">' +
+      '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(item.name) + '</div>' +
+      '<div style="display:flex;gap:10px;margin-top:6px;font-size:12px">' +
+        '<span>' + item.quantity_grams + 'g</span>' +
+        '<span style="color:' + C.calories + '">' + item.calories + ' kcal</span>' +
+        '<span style="color:' + C.protein + '">P: ' + item.protein + 'g</span>' +
+        '<span style="color:' + C.carbs + '">C: ' + item.carbs + 'g</span>' +
+        '<span style="color:' + C.fat + '">F: ' + item.fat + 'g</span>' +
+      '</div>' +
+      btn({ label: "Add to Log", action: addAction, arg: String(i), small: true, extraStyle: "margin-top:8px" }) +
+    '</div>';
+  });
+  if (items.length > 1) {
+    html += btn({ label: "➕ Add All as One Meal", action: addAllAction, outline: true, full: true });
+  }
+  html += '</div>';
+  return html;
+}
 
 function sumAiItems(items) {
   return (items || []).reduce(function(acc, item) {
@@ -2593,6 +2607,46 @@ actions.addAiResultsCombined = function() {
     id: "ai_" + Date.now() + "_combined", name: name, source: "AI Estimate",
     calories: Math.round(totals.calories), protein: round1(totals.protein), carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber),
     state: "\u2014", loggedWeight: round1(totals.weight),
+    loggedMacros: { calories: Math.round(totals.calories), protein: round1(totals.protein), carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber) },
+    timestamp: new Date().toISOString(), photo: fu.aiPhoto || null,
+  });
+  rerender();
+};
+
+// Same as addAiResult/addAiResultsCombined above, but for the Gemini comparison results --
+// lets you log Gemini's numbers instead of the primary provider's when they disagree and you
+// trust one over the other. Shares the same debounce lock since both sets of buttons live on
+// the same screen and a double-tap across either is exactly what it's meant to guard against.
+actions.addAiCompareResult = function(idxStr) {
+  const fu = foodUi();
+  const now = Date.now();
+  if (fu._aiAddLock && now - fu._aiAddLock < 600) return;
+  fu._aiAddLock = now;
+  const item = fu.aiCompareResults[parseInt(idxStr, 10)];
+  if (!item) return;
+  addFoodToLog({
+    id: "ai_" + Date.now() + "_cmp" + idxStr, name: item.name, source: "AI Estimate",
+    calories: item.calories, protein: item.protein, carbs: item.carbs, fat: item.fat, fiber: item.fiber || 0,
+    state: "—", loggedWeight: item.quantity_grams,
+    loggedMacros: { calories: item.calories, protein: item.protein, carbs: item.carbs, fat: item.fat, fiber: item.fiber || 0 },
+    timestamp: new Date().toISOString(), photo: fu.aiPhoto || null,
+  });
+  rerender();
+};
+
+actions.addAiCompareResultsCombined = function() {
+  const fu = foodUi();
+  const now = Date.now();
+  if (fu._aiAddLock && now - fu._aiAddLock < 600) return;
+  fu._aiAddLock = now;
+  const items = fu.aiCompareResults || [];
+  if (items.length === 0) return;
+  const totals = sumAiItems(items);
+  const name = fu.aiDesc.trim() || items.map(function(i){ return i.name; }).join(", ");
+  addFoodToLog({
+    id: "ai_" + Date.now() + "_cmpcombined", name: name, source: "AI Estimate",
+    calories: Math.round(totals.calories), protein: round1(totals.protein), carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber),
+    state: "—", loggedWeight: round1(totals.weight),
     loggedMacros: { calories: Math.round(totals.calories), protein: round1(totals.protein), carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber) },
     timestamp: new Date().toISOString(), photo: fu.aiPhoto || null,
   });
@@ -3332,7 +3386,7 @@ function renderAISection() {
 
   if (set.aiEnabled) {
     html += '<div style="margin-bottom:16px"><label class="label" style="margin-bottom:8px">AI Provider</label><div style="display:flex;flex-direction:column;gap:6px">';
-    [["claude-haiku","Claude Haiku","Fast, lower cost"],["claude-sonnet","Claude Sonnet","More accurate"],["gemini","Google Gemini Pro","Backup provider"]].forEach(function(o) {
+    [["claude-haiku","Claude Haiku","Fast, lower cost"],["claude-sonnet","Claude Sonnet","More accurate"],["gemini","Google Gemini","Backup provider"]].forEach(function(o) {
       const active = set.aiProvider === o[0];
       html += '<button data-action="setAiProvider" data-arg="' + o[0] + '" style="padding:12px 14px;border-radius:10px;cursor:pointer;text-align:left;background:' + (active ? C.primary+"22" : C.inputBg) + ';border:1px solid ' + (active ? C.primary+"44" : C.border) + ';color:' + C.text + '">' +
         '<div style="font-weight:600;font-size:14px">' + o[1] + '</div><div style="color:' + C.textMut + ';font-size:12px">' + o[2] + '</div></button>';
@@ -3343,7 +3397,7 @@ function renderAISection() {
 
     if (isClaudePrimary) {
       html += '<div style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:' + C.inputBg + ';border-radius:10px;border:1px solid ' + C.border + '">' +
-        '<div><div style="font-size:14px">Compare with Gemini</div><div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">Also query Gemini on every estimate and flag where the two disagree</div></div>' +
+        '<div><div style="font-size:14px">Compare with Gemini</div><div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">Also query Gemini on every estimate, flag where the two disagree, and let you pick either one’s macros to log</div></div>' +
         toggleSwitch(set.compareWithGemini, "toggleCompareGemini") +
       '</div>';
     }
