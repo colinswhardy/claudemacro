@@ -2951,7 +2951,15 @@ document.addEventListener("visibilitychange", function() {
 </script>
 <script>
 if('serviceWorker' in navigator){
-  navigator.serviceWorker.register('sw.js', {scope:'./'}).catch(e=>null);
+  navigator.serviceWorker.register('sw.js', {scope:'./', updateViaCache:'none'}).then(function(reg){
+    reg.update();
+    var reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', function(){
+      if (reloaded) return;
+      reloaded = true;
+      window.location.reload();
+    });
+  }).catch(function(e){});
 }
 </script>
 </body>
