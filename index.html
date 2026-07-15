@@ -207,12 +207,13 @@ const state = {
   session: db.get("supabaseSession", null),
   authError: null,
   authLoading: false,
+  lastSyncedAt: null,
   ui: {}
 };
 
-function saveSettings() { db.set("settings", state.settings); }
-function saveFoodLogs() { db.set("foodLogs", state.foodLogs); }
-function saveWeights() { db.set("weights", state.weights); }
+function saveSettings() { db.set("settings", state.settings); scheduleCloudSync("settings", pushSettingsToCloud); }
+function saveFoodLogs() { db.set("foodLogs", state.foodLogs); scheduleCloudSync("foodLogs", pushFoodLogsToCloud); }
+function saveWeights() { db.set("weights", state.weights); scheduleCloudSync("weights", pushWeightsToCloud); }
 function saveFavorites() { db.set("favorites", state.favorites); }
 function saveRecentFoods() { db.set("recentFoods", state.recentFoods); }
 function saveFoodCache() { db.set("foodCache", state.foodCache); }
@@ -391,6 +392,24 @@ async function pushWeightsToCloud() {
 async function pullWeightsFromCloud() {
   if (!state.session) return { error: "Not signed in" };
   return supabaseTable("weight_entries?user_id=eq." + state.session.userId + "&select=id");
+}
+
+// ---- Automatic background sync ----
+// Each push re-sends the full current dataset (upsert), so it's idempotent: a failed or
+// skipped push just gets caught up by the next one. That means no separate retry queue is
+// needed -- debouncing so we don't hammer the API on every keystroke is all this needs.
+const syncDebounceTimers = {};
+function scheduleCloudSync(kind, pushFn) {
+  if (!state.session) return;
+  if (syncDebounceTimers[kind]) clearTimeout(syncDebounceTimers[kind]);
+  syncDebounceTimers[kind] = setTimeout(function() {
+    // Deliberately does not rerender() on completion -- this can fire while the user is mid-
+    // keystroke elsewhere in the app, and a surprise rerender would steal focus. The "last
+    // synced" status just picks up the new value next time that screen is naturally rendered.
+    pushFn().then(function(result) {
+      if (!result.error) state.lastSyncedAt = Date.now();
+    });
+  }, 2500);
 }
 
 function renderLoginScreen() {
@@ -2989,6 +3008,7 @@ function renderDataSection() {
         '<div><div style="color:' + C.textMut + ';font-size:11px;text-transform:uppercase">Signed in</div><div style="color:' + C.text + ';font-size:13px;margin-top:2px">' + esc(state.session.email || "") + '</div></div>' +
         btn({ label: "Sign Out", action: "supabaseSignOut", outline: true, small: true, color: "danger" }) +
       '</div>' +
+      '<div style="color:' + C.textMut + ';font-size:11px;margin-top:8px">' + (state.lastSyncedAt ? "Auto-syncs in the background — last synced " + new Date(state.lastSyncedAt).toLocaleTimeString() : "Auto-syncs in the background after changes — not synced yet this session") + '</div>' +
       '<div style="margin-top:10px">' + btn({ label: su.syncTesting ? "Syncing..." : "\u{1F504} Sync All Data Now (test)", action: "testFullSync", outline: true, small: true, full: true, disabled: su.syncTesting }) + '</div>' +
       (su.syncTestMsg ? '<div style="margin-top:8px;font-size:12px;color:' + (su.syncTestMsg.ok ? C.success : C.danger) + '">' + esc(su.syncTestMsg.text) + '</div>' : '') +
     '</div>';
