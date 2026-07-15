@@ -153,6 +153,9 @@ const WIZARD_TRIGGERS = {
   pasta: ["pasta","spaghetti","penne","fettuccine","linguine","macaroni","noodle","noodles","rigatoni","fusilli","farfalle"],
 };
 
+const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
+
 const DEFAULT_SETTINGS = {
   calorieTarget: 1876, proteinTarget: 163, carbsTarget: 153, fatTarget: 68,
   weightUnit: "lbs", carbsDisplay: "total",
@@ -201,6 +204,9 @@ const state = {
   foodCache: db.get("foodCache", {}),
   recipes: db.get("recipes", []),
   customBarcodes: db.get("customBarcodes", {}),
+  session: db.get("supabaseSession", null),
+  authError: null,
+  authLoading: false,
   ui: {}
 };
 
@@ -232,6 +238,101 @@ function cleanExpiredPhotos() {
 // ============================================================
 // API HELPERS
 // ============================================================
+
+// ---- Supabase auth (plain REST, no SDK) ----
+function saveSession(session) {
+  state.session = session;
+  state.authError = null;
+  db.set("supabaseSession", session);
+}
+function clearSession() {
+  state.session = null;
+  db.set("supabaseSession", null);
+}
+
+async function supabaseSignIn(email, password) {
+  try {
+    const r = await fetch(SUPABASE_URL + "/auth/v1/token?grant_type=password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "apikey": SUPABASE_ANON_KEY },
+      body: JSON.stringify({ email: email, password: password }),
+    });
+    const d = await r.json();
+    if (!r.ok) return { error: d.error_description || d.msg || d.message || d.error || "Sign in failed" };
+    return {
+      data: {
+        accessToken: d.access_token, refreshToken: d.refresh_token,
+        expiresAt: Date.now() + (d.expires_in || 3600) * 1000,
+        userId: d.user && d.user.id, email: d.user && d.user.email,
+      }
+    };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function supabaseRefreshSession() {
+  if (!state.session || !state.session.refreshToken) return null;
+  try {
+    const r = await fetch(SUPABASE_URL + "/auth/v1/token?grant_type=refresh_token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "apikey": SUPABASE_ANON_KEY },
+      body: JSON.stringify({ refresh_token: state.session.refreshToken }),
+    });
+    const d = await r.json();
+    if (!r.ok) { clearSession(); return null; }
+    const session = {
+      accessToken: d.access_token, refreshToken: d.refresh_token,
+      expiresAt: Date.now() + (d.expires_in || 3600) * 1000,
+      userId: d.user && d.user.id, email: d.user && d.user.email,
+    };
+    saveSession(session);
+    return session;
+  } catch (e) { return null; } // offline or unreachable - keep the existing (possibly stale) session
+}
+
+// Returns a usable access token, refreshing first if it's expired or close to it.
+// Never blocks app usage on failure - just returns null and callers skip syncing for now.
+async function getValidAccessToken() {
+  if (!state.session) return null;
+  if (state.session.expiresAt - Date.now() > 60000) return state.session.accessToken;
+  const refreshed = await supabaseRefreshSession();
+  return refreshed ? refreshed.accessToken : null;
+}
+
+actions.supabaseLogin = async function() {
+  const email = (state.ui.loginEmail || "").trim();
+  const password = state.ui.loginPassword || "";
+  if (!email || !password) return;
+  state.authLoading = true; state.authError = null;
+  rerender();
+  const result = await supabaseSignIn(email, password);
+  state.authLoading = false;
+  if (result.error) { state.authError = result.error; rerender(); return; }
+  saveSession(result.data);
+  state.ui = {};
+  rerender();
+};
+actions.supabaseSignOut = function() {
+  clearSession();
+  state.ui = {};
+  rerender();
+};
+inputActions.loginEmail = function(val) { state.ui.loginEmail = val; };
+inputActions.loginPassword = function(val) { state.ui.loginPassword = val; };
+
+function renderLoginScreen() {
+  return '<div style="max-width:340px;margin:0 auto;padding:60px 20px 20px;">' +
+    '<div style="text-align:center;margin-bottom:32px"><div style="font-size:22px;font-weight:700;color:' + C.primary + '">MacroLog</div><div style="color:' + C.textMut + ';font-size:13px;margin-top:4px">Sign in to sync your data</div></div>' +
+    card(
+      '<div style="display:flex;flex-direction:column;gap:12px">' +
+        '<div><label class="label">Email</label>' + textInput({ id: "loginEmailInput", value: state.ui.loginEmail || "", type: "email", bind: "loginEmail", enter: "supabaseLogin" }) + '</div>' +
+        '<div><label class="label">Password</label>' + textInput({ value: state.ui.loginPassword || "", type: "password", bind: "loginPassword", enter: "supabaseLogin" }) + '</div>' +
+      '</div>' +
+      (state.authError ? '<div style="margin-top:12px;padding:10px 12px;background:' + C.danger + '15;border-radius:8px;color:' + C.danger + ';font-size:13px">' + esc(state.authError) + '</div>' : '') +
+      '<div style="margin-top:16px">' + btn({ label: state.authLoading ? "Signing in..." : "Sign In", action: "supabaseLogin", full: true, disabled: state.authLoading }) + '</div>'
+    ) +
+  '</div>';
+}
+
 // USDA only returns real serving-size metadata (servingSize/servingSizeUnit/householdServingFullText)
 // for Branded/Survey data types; Foundation/SR Legacy items have none. When present, surface it as
 // the top option (it's what's actually on the label), ahead of the generic weight shortcuts.
@@ -568,6 +669,7 @@ function card(innerHtml, extraStyle) {
 // ============================================================
 function renderApp() {
   const s = state;
+  if (!s.session) return renderLoginScreen();
   return '' +
     '<div class="header">' +
       '<div class="brand">MacroLog</div>' +
@@ -2752,6 +2854,12 @@ inputActions.geminiApiKey = function(v) { state.settings.geminiApiKey = v; saveS
 function renderDataSection() {
   const su = strategyUi();
   let html = '<h3 class="cardTitle">Data Management</h3>';
+  if (state.session) {
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:' + C.inputBg + ';border-radius:10px;margin-bottom:16px">' +
+      '<div><div style="color:' + C.textMut + ';font-size:11px;text-transform:uppercase">Signed in</div><div style="color:' + C.text + ';font-size:13px;margin-top:2px">' + esc(state.session.email || "") + '</div></div>' +
+      btn({ label: "Sign Out", action: "supabaseSignOut", outline: true, small: true, color: "danger" }) +
+    '</div>';
+  }
   html += '<div style="display:flex;flex-direction:column;gap:10px">';
   html += btn({ label: "\u{1F4E4} Export All Data (JSON)", action: "exportData", outline: true, full: true });
   html += '<input type="file" accept=".json" id="importFileInput" data-change="importData" style="display:none">';
@@ -2816,7 +2924,11 @@ actions.clearAllData = function() {
 // INIT
 // ============================================================
 cleanExpiredPhotos();
+if (!state.session) pendingFocusId = "loginEmailInput";
 render();
+
+// Keep the session token fresh in the background; never blocks app usage if offline/unreachable.
+if (state.session) getValidAccessToken();
 
 // If the app has been backgrounded for a while (not just a quick app-switch), treat
 // coming back to it like reopening it: land on Dashboard / today, not wherever it was left.
