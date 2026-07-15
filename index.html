@@ -326,6 +326,23 @@ async function supabaseTable(path, options) {
   } catch (e) { return { error: e.message }; }
 }
 
+// Fetches every row for a query by paging through PostgREST's Range header, so results
+// aren't silently truncated once a table grows past the server's default row cap.
+const SUPABASE_PAGE_SIZE = 1000;
+async function pullAllRows(path) {
+  let allRows = [];
+  let offset = 0;
+  while (true) {
+    const r = await supabaseTable(path, { headers: { "Range-Unit": "items", "Range": offset + "-" + (offset + SUPABASE_PAGE_SIZE - 1) } });
+    if (r.error) return r;
+    const rows = r.data || [];
+    allRows = allRows.concat(rows);
+    if (rows.length < SUPABASE_PAGE_SIZE) break;
+    offset += SUPABASE_PAGE_SIZE;
+  }
+  return { data: allRows };
+}
+
 async function pushSettingsToCloud() {
   if (!state.session) return { error: "Not signed in" };
   return supabaseTable("user_settings?on_conflict=user_id", {
@@ -350,7 +367,7 @@ function flattenFoodLogsForSync() {
         calories: e.macros.calories, protein: e.macros.protein, carbs: e.macros.carbs,
         fat: e.macros.fat, fiber: e.macros.fiber || 0,
         source: e.source || null, logged_at: e.timestamp || new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        updated_at: e.updatedAt || e.timestamp || new Date().toISOString(),
       });
     });
   });
@@ -366,7 +383,7 @@ async function pushFoodLogsToCloud() {
 }
 async function pullFoodLogsFromCloud() {
   if (!state.session) return { error: "Not signed in" };
-  return supabaseTable("food_log_entries?user_id=eq." + state.session.userId + "&select=id,log_date,food_id,name,weight,calories,protein,carbs,fat,fiber,source,logged_at");
+  return pullAllRows("food_log_entries?user_id=eq." + state.session.userId + "&select=id,log_date,food_id,name,weight,calories,protein,carbs,fat,fiber,source,logged_at,updated_at&order=id");
 }
 
 function flattenWeightsForSync() {
@@ -376,7 +393,7 @@ function flattenWeightsForSync() {
     rows.push({
       id: "weight_" + state.session.userId + "_" + date, user_id: state.session.userId, log_date: date,
       weight: w.weight, unit: w.unit || "lbs", logged_at: w.timestamp || new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+      updated_at: w.updatedAt || w.timestamp || new Date().toISOString(),
     });
   });
   return rows;
@@ -391,7 +408,7 @@ async function pushWeightsToCloud() {
 }
 async function pullWeightsFromCloud() {
   if (!state.session) return { error: "Not signed in" };
-  return supabaseTable("weight_entries?user_id=eq." + state.session.userId + "&select=id,log_date,weight,unit,logged_at");
+  return pullAllRows("weight_entries?user_id=eq." + state.session.userId + "&select=id,log_date,weight,unit,logged_at,updated_at&order=id");
 }
 
 // ---- Automatic background sync ----
@@ -412,41 +429,60 @@ function scheduleCloudSync(kind, pushFn) {
   }, 2500);
 }
 
-// Additive merge: rows that exist in the cloud but not locally (by id) get added; anything
-// already present locally is left as-is (it was presumably just pushed, so cloud already
-// matches it). This is what brings a fresh device's empty local store up to date on login.
+// Merge strategy: rows that exist in the cloud but not locally (by id) get added; rows that
+// exist in both get the newer one (by updated_at) kept. Mutates state.foodLogs/state.weights
+// in place (never reassigns the top-level object) so a concurrent local mutation elsewhere
+// can't be silently clobbered by a stale wholesale replace. This is also what brings a fresh
+// device's empty local store up to date on login.
 function mergeFoodLogsFromCloud(cloudRows) {
-  const byDate = Object.assign({}, state.foodLogs);
-  const localIds = new Set();
-  Object.keys(byDate).forEach(function(d) { (byDate[d] || []).forEach(function(e){ localIds.add(e.id); }); });
-  let added = 0;
+  const localById = new Map();
+  Object.keys(state.foodLogs).forEach(function(d) {
+    (state.foodLogs[d] || []).forEach(function(e){ localById.set(e.id, { date: d, entry: e }); });
+  });
+  let changed = 0;
   (cloudRows || []).forEach(function(row) {
-    if (localIds.has(row.id)) return;
+    if (wasRecentlyDeleted("food_log_entries", row.id)) return;
+    const existing = localById.get(row.id);
     const entry = {
       id: row.id, foodId: row.food_id, name: row.name, weight: row.weight,
       macros: { calories: row.calories, protein: row.protein, carbs: row.carbs, fat: row.fat, fiber: row.fiber || 0 },
-      timestamp: row.logged_at, source: row.source || "Synced",
+      timestamp: row.logged_at, source: row.source || "Synced", updatedAt: row.updated_at || row.logged_at,
     };
-    if (!byDate[row.log_date]) byDate[row.log_date] = [];
-    byDate[row.log_date].push(entry);
-    added++;
+    if (existing) {
+      const localTime = Date.parse(existing.entry.updatedAt || existing.entry.timestamp || 0) || 0;
+      const cloudTime = Date.parse(row.updated_at || row.logged_at || 0) || 0;
+      if (cloudTime <= localTime) return; // local is same-or-newer, keep it
+      const list = state.foodLogs[existing.date] || [];
+      const idx = list.findIndex(function(e){ return e.id === row.id; });
+      if (idx >= 0) { list[idx] = entry; changed++; }
+      return;
+    }
+    if (!state.foodLogs[row.log_date]) state.foodLogs[row.log_date] = [];
+    state.foodLogs[row.log_date].push(entry);
+    changed++;
   });
-  state.foodLogs = byDate;
   db.set("foodLogs", state.foodLogs);
-  return added;
+  return changed;
 }
 
 function mergeWeightsFromCloud(cloudRows) {
-  const weights = Object.assign({}, state.weights);
-  let added = 0;
+  let changed = 0;
   (cloudRows || []).forEach(function(row) {
-    if (weights[row.log_date]) return;
-    weights[row.log_date] = { weight: row.weight, unit: row.unit || "lbs", timestamp: row.logged_at };
-    added++;
+    const existing = state.weights[row.log_date];
+    const entry = { weight: row.weight, unit: row.unit || "lbs", timestamp: row.logged_at, updatedAt: row.updated_at || row.logged_at };
+    if (existing) {
+      const localTime = Date.parse(existing.updatedAt || existing.timestamp || 0) || 0;
+      const cloudTime = Date.parse(row.updated_at || row.logged_at || 0) || 0;
+      if (cloudTime <= localTime) return;
+      state.weights[row.log_date] = entry;
+      changed++;
+      return;
+    }
+    state.weights[row.log_date] = entry;
+    changed++;
   });
-  state.weights = weights;
   db.set("weights", state.weights);
-  return added;
+  return changed;
 }
 
 // Settings are a single blob, not a collection -- cloud wins when a row exists, on the
@@ -458,10 +494,28 @@ function mergeSettingsFromCloud(cloudData) {
   return true;
 }
 
+// Tracks ids deleted locally within the last little while, so a background sync's pull --
+// which can race ahead of the DELETE below actually landing in Supabase -- doesn't silently
+// resurrect a row the user just removed by treating it as "new from the cloud."
+const RECENTLY_DELETED_TTL_MS = 30000;
+const recentlyDeletedIds = { food_log_entries: new Map(), recipes: new Map() };
+function markRecentlyDeleted(table, id) {
+  if (recentlyDeletedIds[table]) recentlyDeletedIds[table].set(id, Date.now());
+}
+function wasRecentlyDeleted(table, id) {
+  const m = recentlyDeletedIds[table];
+  if (!m) return false;
+  const t = m.get(id);
+  if (t === undefined) return false;
+  if (Date.now() - t > RECENTLY_DELETED_TTL_MS) { m.delete(id); return false; }
+  return true;
+}
+
 // Fire-and-forget row delete; doesn't block or retry. If it fails while offline the row
 // resurfaces on the next pull -- an acceptable edge case at this scale rather than building
 // a full delete queue for a personal app used from one active device at a time.
 function scheduleCloudDelete(table, idColumn, idValue) {
+  markRecentlyDeleted(table, idValue);
   if (!state.session) return;
   supabaseTable(table + "?" + idColumn + "=eq." + encodeURIComponent(idValue), { method: "DELETE" });
 }
@@ -487,9 +541,7 @@ function mergeFavoritesFromCloud(cloudArr) {
   if (!cloudArr) return 0;
   const localIds = new Set(state.favorites.map(function(f){ return f.id; }));
   let added = 0;
-  const merged = state.favorites.slice();
-  cloudArr.forEach(function(f) { if (!localIds.has(f.id)) { merged.push(f); added++; } });
-  state.favorites = merged;
+  cloudArr.forEach(function(f) { if (!localIds.has(f.id)) { state.favorites.push(f); added++; } });
   db.set("favorites", state.favorites);
   return added;
 }
@@ -500,9 +552,7 @@ function mergeRecentFoodsFromCloud(cloudArr) {
   if (!cloudArr) return 0;
   const localIds = new Set(state.recentFoods.map(function(f){ return f.id; }));
   let added = 0;
-  const merged = state.recentFoods.slice();
-  cloudArr.forEach(function(f) { if (!localIds.has(f.id)) { merged.push(f); added++; } });
-  state.recentFoods = merged;
+  cloudArr.forEach(function(f) { if (!localIds.has(f.id)) { state.recentFoods.push(f); added++; } });
   db.set("recentFoods", state.recentFoods);
   return added;
 }
@@ -512,9 +562,7 @@ async function pullFoodCacheFromCloud() { return pullAppDataFromCloud("foodCache
 function mergeFoodCacheFromCloud(cloudDict) {
   if (!cloudDict) return 0;
   let added = 0;
-  const merged = Object.assign({}, state.foodCache);
-  Object.keys(cloudDict).forEach(function(id) { if (!merged[id]) { merged[id] = cloudDict[id]; added++; } });
-  state.foodCache = merged;
+  Object.keys(cloudDict).forEach(function(id) { if (!state.foodCache[id]) { state.foodCache[id] = cloudDict[id]; added++; } });
   db.set("foodCache", state.foodCache);
   return added;
 }
@@ -535,16 +583,18 @@ async function pullRecipesFromCloud() {
   if (!state.session) return { error: "Not signed in" };
   return supabaseTable("recipes?user_id=eq." + state.session.userId + "&select=id,name,ingredients,created_at");
 }
+// Note: the recipes table has no updated_at column (unlike food_log_entries/weight_entries),
+// so this stays an additive id-based merge rather than true newer-wins conflict resolution --
+// upgrading it would need a schema migration first.
 function mergeRecipesFromCloud(cloudRows) {
   const localIds = new Set(state.recipes.map(function(r){ return r.id; }));
   let added = 0;
-  const merged = state.recipes.slice();
   (cloudRows || []).forEach(function(row) {
     if (localIds.has(row.id)) return;
-    merged.push({ id: row.id, name: row.name, ingredients: row.ingredients, createdAt: row.created_at });
+    if (wasRecentlyDeleted("recipes", row.id)) return;
+    state.recipes.push({ id: row.id, name: row.name, ingredients: row.ingredients, createdAt: row.created_at });
     added++;
   });
-  state.recipes = merged;
   db.set("recipes", state.recipes);
   return added;
 }
@@ -566,10 +616,8 @@ async function pullCustomBarcodesFromCloud() {
   return supabaseTable("custom_barcodes?user_id=eq." + state.session.userId + "&select=barcode,food");
 }
 function mergeCustomBarcodesFromCloud(cloudRows) {
-  const merged = Object.assign({}, state.customBarcodes);
   let added = 0;
-  (cloudRows || []).forEach(function(row) { if (!merged[row.barcode]) { merged[row.barcode] = row.food; added++; } });
-  state.customBarcodes = merged;
+  (cloudRows || []).forEach(function(row) { if (!state.customBarcodes[row.barcode]) { state.customBarcodes[row.barcode] = row.food; added++; } });
   db.set("customBarcodes", state.customBarcodes);
   return added;
 }
@@ -738,7 +786,7 @@ async function estimateWithClaude(description, photoBase64, model, apiKey) {
   promptText += ' Return ONLY valid JSON (no markdown fences) as an array: [{"name":"food name","quantity_grams":number,"calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number}]. Estimate realistic portion sizes. Be as accurate as possible.';
   content.push({ type: "text", text: promptText });
   try {
-    const modelId = model === "claude-sonnet" ? "claude-sonnet-4-6" : "claude-haiku-4-5-20251001";
+    const modelId = model === "claude-sonnet" ? "claude-sonnet-5" : "claude-haiku-4-5-20251001";
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -759,7 +807,7 @@ async function estimateWithClaude(description, photoBase64, model, apiKey) {
 
 async function estimateWithGemini(description, apiKey) {
   try {
-    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" + apiKey, {
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: 'Estimate macronutrients for: "' + description + '". Return ONLY valid JSON array: [{"name":"food name","quantity_grams":number,"calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number}].' }] }],
@@ -1088,6 +1136,7 @@ function addFoodToLog(food) {
     source: food.source || "Manual",
     photo: food.photo || null,
     photoExpires: food.photo ? new Date(Date.now() + 2*24*60*60*1000).toISOString() : null,
+    updatedAt: new Date().toISOString(),
   };
   if (!state.foodLogs[state.date]) state.foodLogs[state.date] = [];
   state.foodLogs[state.date].push(entry);
@@ -1117,7 +1166,7 @@ function removeFoodFromLog(entryId) {
 
 function updateFoodEntry(entryId, updates) {
   state.foodLogs[state.date] = (state.foodLogs[state.date] || []).map(function(e) {
-    return e.id === entryId ? Object.assign({}, e, updates) : e;
+    return e.id === entryId ? Object.assign({}, e, updates, { updatedAt: new Date().toISOString() }) : e;
   });
   saveFoodLogs();
 }
@@ -1357,7 +1406,7 @@ function propagateCustomFoodEdit(entry, newMacros) {
         const p2 = round1(ing.protein * ratioP), c2 = round1(ing.carbs * ratioC), f2 = round1(ing.fat * ratioF);
         return Object.assign({}, ing, { protein: p2, carbs: c2, fat: f2, calories: Math.round(p2 * 4 + c2 * 4 + f2 * 9) });
       });
-      state.recipes = state.recipes.map(function(r){ return r.id === recipeId ? Object.assign({}, r, { ingredients: newIngredients }) : r; });
+      state.recipes = state.recipes.map(function(r){ return r.id === recipeId ? Object.assign({}, r, { ingredients: newIngredients, updatedAt: new Date().toISOString() }) : r; });
       saveRecipes();
     }
   }
@@ -1368,10 +1417,10 @@ actions.saveEditMacros = function() {
   if (!id) return;
   const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === id; });
   if (!entry) return;
-  const p = parseFloat(document.getElementById("editMacro_protein").value) || 0;
-  const c = parseFloat(document.getElementById("editMacro_carbs").value) || 0;
-  const f = parseFloat(document.getElementById("editMacro_fat").value) || 0;
-  const fib = parseFloat(document.getElementById("editMacro_fiber").value) || 0;
+  const p = Math.max(0, parseFloat(document.getElementById("editMacro_protein").value) || 0);
+  const c = Math.max(0, parseFloat(document.getElementById("editMacro_carbs").value) || 0);
+  const f = Math.max(0, parseFloat(document.getElementById("editMacro_fat").value) || 0);
+  const fib = Math.max(0, parseFloat(document.getElementById("editMacro_fiber").value) || 0);
   const newMacros = { protein: p, carbs: c, fat: f, fiber: fib, calories: Math.round(p*4 + c*4 + f*9) };
   propagateCustomFoodEdit(entry, newMacros);
   updateFoodEntry(id, { macros: newMacros });
@@ -1759,11 +1808,12 @@ actions.saveCustomBarcode = function() {
   const code = fu.scanNotFoundCode;
   const m = fu.customBarcodeManual;
   if (!code || !m.name.trim()) return;
-  const weight = parseFloat(m.weight) || 100;
+  const weightParsed = parseFloat(m.weight);
+  const weight = isNaN(weightParsed) ? 100 : Math.max(0, weightParsed);
   const food = {
     id: "barcode_" + code, name: m.name.trim(), brand: "", source: "Custom Barcode Entry",
-    per100g: false, calories: parseFloat(m.calories) || 0, protein: parseFloat(m.protein) || 0,
-    carbs: parseFloat(m.carbs) || 0, fat: parseFloat(m.fat) || 0, fiber: parseFloat(m.fiber) || 0,
+    per100g: false, calories: Math.max(0, parseFloat(m.calories) || 0), protein: Math.max(0, parseFloat(m.protein) || 0),
+    carbs: Math.max(0, parseFloat(m.carbs) || 0), fat: Math.max(0, parseFloat(m.fat) || 0), fiber: Math.max(0, parseFloat(m.fiber) || 0),
     state: "—", servingSizes: [{ label: weight + "g", grams: weight }],
   };
   state.customBarcodes[code] = food;
@@ -1827,10 +1877,10 @@ actions.saveRecipe = function() {
   if (!rb || !rb.name.trim() || rb.ingredients.length === 0) return;
   if (rb.editingId) {
     state.recipes = state.recipes.map(function(r) {
-      return r.id === rb.editingId ? Object.assign({}, r, { name: rb.name.trim(), ingredients: rb.ingredients }) : r;
+      return r.id === rb.editingId ? Object.assign({}, r, { name: rb.name.trim(), ingredients: rb.ingredients, updatedAt: new Date().toISOString() }) : r;
     });
   } else {
-    state.recipes.push({ id: "recipe_" + Date.now(), name: rb.name.trim(), ingredients: rb.ingredients, createdAt: new Date().toISOString() });
+    state.recipes.push({ id: "recipe_" + Date.now(), name: rb.name.trim(), ingredients: rb.ingredients, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
   }
   saveRecipes();
   foodUi().recipeBuilder = null;
@@ -2219,13 +2269,16 @@ function manualField(key, label, value, color) {
 actions.addManualEntry = function() {
   const fu = foodUi();
   const m = fu.manual;
+  const cal = Math.max(0, parseFloat(m.calories) || 0), pro = Math.max(0, parseFloat(m.protein) || 0),
+    carb = Math.max(0, parseFloat(m.carbs) || 0), ft = Math.max(0, parseFloat(m.fat) || 0), fib = Math.max(0, parseFloat(m.fiber) || 0);
+  const weightParsed = parseFloat(m.weight);
+  const weight = isNaN(weightParsed) ? 100 : Math.max(0, weightParsed);
   const food = {
     id: "manual_" + Date.now(), name: m.name || "Custom Food", source: "Manual Entry",
-    calories: parseFloat(m.calories) || 0, protein: parseFloat(m.protein) || 0,
-    carbs: parseFloat(m.carbs) || 0, fat: parseFloat(m.fat) || 0, fiber: parseFloat(m.fiber) || 0,
+    calories: cal, protein: pro, carbs: carb, fat: ft, fiber: fib,
     state: "\u2014",
-    loggedWeight: parseFloat(m.weight) || 100,
-    loggedMacros: { calories: parseFloat(m.calories) || 0, protein: parseFloat(m.protein) || 0, carbs: parseFloat(m.carbs) || 0, fat: parseFloat(m.fat) || 0, fiber: parseFloat(m.fiber) || 0 },
+    loggedWeight: weight,
+    loggedMacros: { calories: cal, protein: pro, carbs: carb, fat: ft, fiber: fib },
     timestamp: new Date().toISOString(), per100g: false, servingSizes: [],
   };
   addFoodToLog(food);
@@ -2256,7 +2309,9 @@ function renderAIForm(fu) {
     '<div class="row">' +
       btn({ label: (fu.aiPhoto ? "Photo Added \u2713" : "\u{1F4F7} Take/Upload Photo"), action: "clickPhotoInput", outline: true, small: true }) +
       (fu.aiPhoto ? btn({ label: "Remove", action: "removeAiPhoto", outline: true, small: true, color: "danger" }) : '') +
-    '</div></div>';
+    '</div>' +
+    (fu.aiPhoto && state.settings.aiProvider === "gemini" ? '<div style="color:' + C.warning + ';font-size:11px;margin-top:6px">Gemini’s estimate is text-only — it won’t see this photo.</div>' : '') +
+    '</div>';
 
   if (fu.aiError) {
     html += '<div style="padding:10px 12px;background:' + C.danger + '15;border-radius:8px;color:' + C.danger + ';font-size:13px;margin-bottom:12px">' + esc(fu.aiError) + '</div>';
@@ -2402,6 +2457,9 @@ actions.runAIEstimate = async function() {
 
 actions.addAiResult = function(idxStr) {
   const fu = foodUi();
+  const now = Date.now();
+  if (fu._aiAddLock && now - fu._aiAddLock < 600) return;
+  fu._aiAddLock = now;
   const item = fu.aiResults[parseInt(idxStr, 10)];
   if (!item) return;
   addFoodToLog({
@@ -2416,6 +2474,9 @@ actions.addAiResult = function(idxStr) {
 
 actions.addAiResultsCombined = function() {
   const fu = foodUi();
+  const now = Date.now();
+  if (fu._aiAddLock && now - fu._aiAddLock < 600) return;
+  fu._aiAddLock = now;
   const items = fu.aiResults || [];
   if (items.length === 0) return;
   const totals = sumAiItems(items);
@@ -2852,7 +2913,7 @@ actions.logWeight = function() {
   const wu = weightUi();
   const w = parseFloat(wu.input);
   if (!w || w <= 0) return;
-  state.weights[state.date] = { weight: w, unit: state.settings.weightUnit, timestamp: new Date().toISOString() };
+  state.weights[state.date] = { weight: w, unit: state.settings.weightUnit, timestamp: new Date().toISOString(), updatedAt: new Date().toISOString() };
   saveWeights();
   wu.input = "";
   rerender();
@@ -2908,7 +2969,7 @@ changeActions.renphoImport = function(el) {
           d = fmtDate(new Date(dateStr));
         }
         if (d && d !== "NaN-NaN-NaN" && !state.weights[d]) {
-          state.weights[d] = { weight: w, unit: "lbs", timestamp: new Date(dateStr).toISOString() };
+          state.weights[d] = { weight: w, unit: "lbs", timestamp: new Date(dateStr).toISOString(), updatedAt: new Date().toISOString() };
           count++;
         }
       }
@@ -3219,7 +3280,7 @@ function renderDataSection() {
     html += '<div style="padding:16px;background:' + C.danger + '11;border-radius:12px;border:1px solid ' + C.danger + '33">' +
       '<div style="color:' + C.danger + ';font-weight:600;margin-bottom:8px">Are you sure?</div>' +
       '<div style="color:' + C.textSec + ';font-size:13px;margin-bottom:12px">This will permanently delete all your food logs, weight history, favorites, and settings. Export your data first if you want to keep it.</div>' +
-      '<div class="row">' + btn({ label: "Cancel", action: "cancelConfirmClear", outline: true, small: true, full: true }) + btn({ label: "Delete Everything", action: "clearAllData", small: true, full: true, color: "danger" }) + '</div>' +
+      '<div class="row">' + btn({ label: "Cancel", action: "cancelConfirmClear", outline: true, small: true, full: true, disabled: su.clearing }) + btn({ label: su.clearing ? "Deleting..." : "Delete Everything", action: "clearAllData", small: true, full: true, color: "danger", disabled: su.clearing }) + '</div>' +
     '</div>';
   }
   html += '</div>';
@@ -3259,11 +3320,29 @@ changeActions.importData = function(el) {
 };
 actions.askConfirmClear = function() { strategyUi().confirmClear = true; rerender(); };
 actions.cancelConfirmClear = function() { strategyUi().confirmClear = false; rerender(); };
-actions.clearAllData = function() {
+actions.clearAllData = async function() {
+  const su = strategyUi();
+  su.clearing = true;
+  rerender();
+  // Local wipe + push functions all upsert and never delete, so pushing an empty dataset
+  // afterward wouldn't actually remove anything already in the cloud. Explicit DELETEs
+  // (RLS-scoped to just this user's rows via user_id) are the only thing that really clears it.
+  if (state.session) {
+    const uid = state.session.userId;
+    await Promise.all([
+      supabaseTable("food_log_entries?user_id=eq." + uid, { method: "DELETE" }),
+      supabaseTable("weight_entries?user_id=eq." + uid, { method: "DELETE" }),
+      supabaseTable("recipes?user_id=eq." + uid, { method: "DELETE" }),
+      supabaseTable("custom_barcodes?user_id=eq." + uid, { method: "DELETE" }),
+      supabaseTable("user_settings?user_id=eq." + uid, { method: "DELETE" }),
+      supabaseTable("user_app_data?user_id=eq." + uid, { method: "DELETE" }),
+    ]);
+  }
   state.settings = Object.assign({}, DEFAULT_SETTINGS);
   state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {}; state.recipes = []; state.customBarcodes = {};
   saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache(); saveRecipes(); saveCustomBarcodes();
-  strategyUi().confirmClear = false;
+  su.clearing = false;
+  su.confirmClear = false;
   rerender();
 };
 
