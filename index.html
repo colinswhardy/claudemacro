@@ -339,6 +339,60 @@ async function pullSettingsFromCloud() {
   return supabaseTable("user_settings?user_id=eq." + state.session.userId + "&select=data,updated_at");
 }
 
+function flattenFoodLogsForSync() {
+  const rows = [];
+  Object.keys(state.foodLogs).forEach(function(date) {
+    (state.foodLogs[date] || []).forEach(function(e) {
+      rows.push({
+        id: e.id, user_id: state.session.userId, log_date: date,
+        food_id: e.foodId || null, name: e.name, weight: e.weight,
+        calories: e.macros.calories, protein: e.macros.protein, carbs: e.macros.carbs,
+        fat: e.macros.fat, fiber: e.macros.fiber || 0,
+        source: e.source || null, logged_at: e.timestamp || new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    });
+  });
+  return rows;
+}
+async function pushFoodLogsToCloud() {
+  if (!state.session) return { error: "Not signed in" };
+  const rows = flattenFoodLogsForSync();
+  if (rows.length === 0) return { data: [] };
+  return supabaseTable("food_log_entries?on_conflict=id", {
+    method: "POST", headers: { "Prefer": "resolution=merge-duplicates" }, body: rows,
+  });
+}
+async function pullFoodLogsFromCloud() {
+  if (!state.session) return { error: "Not signed in" };
+  return supabaseTable("food_log_entries?user_id=eq." + state.session.userId + "&select=id");
+}
+
+function flattenWeightsForSync() {
+  const rows = [];
+  Object.keys(state.weights).forEach(function(date) {
+    const w = state.weights[date];
+    rows.push({
+      id: "weight_" + state.session.userId + "_" + date, user_id: state.session.userId, log_date: date,
+      weight: w.weight, unit: w.unit || "lbs", logged_at: w.timestamp || new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+  });
+  return rows;
+}
+async function pushWeightsToCloud() {
+  if (!state.session) return { error: "Not signed in" };
+  const rows = flattenWeightsForSync();
+  if (rows.length === 0) return { data: [] };
+  return supabaseTable("weight_entries?on_conflict=id", {
+    method: "POST", headers: { "Prefer": "resolution=merge-duplicates" }, body: rows,
+  });
+}
+async function pullWeightsFromCloud() {
+  if (!state.session) return { error: "Not signed in" };
+  return supabaseTable("weight_entries?user_id=eq." + state.session.userId + "&select=id");
+}
+
 function renderLoginScreen() {
   return '<div style="max-width:340px;margin:0 auto;padding:60px 20px 20px;">' +
     '<div style="text-align:center;margin-bottom:32px"><div style="font-size:22px;font-weight:700;color:' + C.primary + '">MacroLog</div><div style="color:' + C.textMut + ';font-size:13px;margin-top:4px">Sign in to sync your data</div></div>' +
@@ -626,27 +680,36 @@ actions.supabaseSignOut = function() {
 inputActions.loginEmail = function(val) { state.ui.loginEmail = val; };
 inputActions.loginPassword = function(val) { state.ui.loginPassword = val; };
 
-actions.testSyncSettings = async function() {
+actions.testFullSync = async function() {
   const su = strategyUi();
   su.syncTesting = true; su.syncTestMsg = null;
   rerender();
 
-  const pushResult = await pushSettingsToCloud();
-  if (pushResult.error) {
-    su.syncTesting = false;
-    su.syncTestMsg = { ok: false, text: "Push failed: " + pushResult.error };
-    rerender();
-    return;
+  const steps = [
+    ["Settings push", pushSettingsToCloud],
+    ["Food log push", pushFoodLogsToCloud],
+    ["Weight push", pushWeightsToCloud],
+  ];
+  for (let i = 0; i < steps.length; i++) {
+    const result = await steps[i][1]();
+    if (result.error) {
+      su.syncTesting = false;
+      su.syncTestMsg = { ok: false, text: steps[i][0] + " failed: " + result.error };
+      rerender();
+      return;
+    }
   }
 
-  const pullResult = await pullSettingsFromCloud();
+  const logsPull = await pullFoodLogsFromCloud();
+  const weightsPull = await pullWeightsFromCloud();
   su.syncTesting = false;
-  if (pullResult.error) {
-    su.syncTestMsg = { ok: false, text: "Pushed OK, but pull-back failed: " + pullResult.error };
-  } else if (pullResult.data && pullResult.data.length > 0) {
-    su.syncTestMsg = { ok: true, text: "Success — pushed and read back settings updated at " + new Date(pullResult.data[0].updated_at).toLocaleTimeString() + ". Check Supabase Table Editor → user_settings to see it." };
+
+  if (logsPull.error || weightsPull.error) {
+    su.syncTestMsg = { ok: false, text: "Pushed OK, but pull-back failed: " + (logsPull.error || weightsPull.error) };
   } else {
-    su.syncTestMsg = { ok: false, text: "Pushed OK, but no row came back on pull — check RLS policies." };
+    const logCount = (logsPull.data || []).length;
+    const weightCount = (weightsPull.data || []).length;
+    su.syncTestMsg = { ok: true, text: "Success — synced settings, " + logCount + " food log entries, and " + weightCount + " weight entries. Check Table Editor to confirm." };
   }
   rerender();
 };
@@ -2926,7 +2989,7 @@ function renderDataSection() {
         '<div><div style="color:' + C.textMut + ';font-size:11px;text-transform:uppercase">Signed in</div><div style="color:' + C.text + ';font-size:13px;margin-top:2px">' + esc(state.session.email || "") + '</div></div>' +
         btn({ label: "Sign Out", action: "supabaseSignOut", outline: true, small: true, color: "danger" }) +
       '</div>' +
-      '<div style="margin-top:10px">' + btn({ label: su.syncTesting ? "Syncing..." : "\u{1F504} Sync Settings Now (test)", action: "testSyncSettings", outline: true, small: true, full: true, disabled: su.syncTesting }) + '</div>' +
+      '<div style="margin-top:10px">' + btn({ label: su.syncTesting ? "Syncing..." : "\u{1F504} Sync All Data Now (test)", action: "testFullSync", outline: true, small: true, full: true, disabled: su.syncTesting }) + '</div>' +
       (su.syncTestMsg ? '<div style="margin-top:8px;font-size:12px;color:' + (su.syncTestMsg.ok ? C.success : C.danger) + '">' + esc(su.syncTestMsg.text) + '</div>' : '') +
     '</div>';
   }
