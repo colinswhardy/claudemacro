@@ -366,7 +366,7 @@ async function pushFoodLogsToCloud() {
 }
 async function pullFoodLogsFromCloud() {
   if (!state.session) return { error: "Not signed in" };
-  return supabaseTable("food_log_entries?user_id=eq." + state.session.userId + "&select=id");
+  return supabaseTable("food_log_entries?user_id=eq." + state.session.userId + "&select=id,log_date,food_id,name,weight,calories,protein,carbs,fat,fiber,source,logged_at");
 }
 
 function flattenWeightsForSync() {
@@ -391,7 +391,7 @@ async function pushWeightsToCloud() {
 }
 async function pullWeightsFromCloud() {
   if (!state.session) return { error: "Not signed in" };
-  return supabaseTable("weight_entries?user_id=eq." + state.session.userId + "&select=id");
+  return supabaseTable("weight_entries?user_id=eq." + state.session.userId + "&select=id,log_date,weight,unit,logged_at");
 }
 
 // ---- Automatic background sync ----
@@ -410,6 +410,79 @@ function scheduleCloudSync(kind, pushFn) {
       if (!result.error) state.lastSyncedAt = Date.now();
     });
   }, 2500);
+}
+
+// Additive merge: rows that exist in the cloud but not locally (by id) get added; anything
+// already present locally is left as-is (it was presumably just pushed, so cloud already
+// matches it). This is what brings a fresh device's empty local store up to date on login.
+function mergeFoodLogsFromCloud(cloudRows) {
+  const byDate = Object.assign({}, state.foodLogs);
+  const localIds = new Set();
+  Object.keys(byDate).forEach(function(d) { (byDate[d] || []).forEach(function(e){ localIds.add(e.id); }); });
+  let added = 0;
+  (cloudRows || []).forEach(function(row) {
+    if (localIds.has(row.id)) return;
+    const entry = {
+      id: row.id, foodId: row.food_id, name: row.name, weight: row.weight,
+      macros: { calories: row.calories, protein: row.protein, carbs: row.carbs, fat: row.fat, fiber: row.fiber || 0 },
+      timestamp: row.logged_at, source: row.source || "Synced",
+    };
+    if (!byDate[row.log_date]) byDate[row.log_date] = [];
+    byDate[row.log_date].push(entry);
+    added++;
+  });
+  state.foodLogs = byDate;
+  db.set("foodLogs", state.foodLogs);
+  return added;
+}
+
+function mergeWeightsFromCloud(cloudRows) {
+  const weights = Object.assign({}, state.weights);
+  let added = 0;
+  (cloudRows || []).forEach(function(row) {
+    if (weights[row.log_date]) return;
+    weights[row.log_date] = { weight: row.weight, unit: row.unit || "lbs", timestamp: row.logged_at };
+    added++;
+  });
+  state.weights = weights;
+  db.set("weights", state.weights);
+  return added;
+}
+
+// Settings are a single blob, not a collection -- cloud wins when a row exists, on the
+// assumption a device joining an existing account should adopt the account's saved prefs.
+function mergeSettingsFromCloud(cloudData) {
+  if (!cloudData) return false;
+  state.settings = Object.assign({}, DEFAULT_SETTINGS, cloudData);
+  db.set("settings", state.settings);
+  return true;
+}
+
+// Safe to call anytime (login, or periodically in the background).
+async function pullAndMergeAll() {
+  if (!state.session) return { error: "Not signed in" };
+
+  // Settings must be pulled BEFORE pushing: a freshly-installed device's local defaults
+  // would otherwise overwrite the real account settings the instant it logs in. Only seed
+  // the cloud from local if there's genuinely nothing there yet (first-ever setup).
+  const settingsPull = await pullSettingsFromCloud();
+  if (settingsPull.error) return { error: settingsPull.error };
+  if (settingsPull.data && settingsPull.data.length > 0) {
+    mergeSettingsFromCloud(settingsPull.data[0].data);
+  } else {
+    await pushSettingsToCloud();
+  }
+
+  // Food logs and weights are id/date-keyed additive merges, so push-then-pull is safe:
+  // pushing first just ensures whatever's local is already in the set we pull back.
+  await Promise.all([pushFoodLogsToCloud(), pushWeightsToCloud()]);
+  const [logsPull, weightsPull] = await Promise.all([pullFoodLogsFromCloud(), pullWeightsFromCloud()]);
+  if (logsPull.error || weightsPull.error) return { error: logsPull.error || weightsPull.error };
+
+  const logsAdded = mergeFoodLogsFromCloud(logsPull.data);
+  const weightsAdded = mergeWeightsFromCloud(weightsPull.data);
+  state.lastSyncedAt = Date.now();
+  return { data: { logsAdded: logsAdded, weightsAdded: weightsAdded } };
 }
 
 function renderLoginScreen() {
@@ -685,9 +758,10 @@ actions.supabaseLogin = async function() {
   state.authLoading = true; state.authError = null;
   rerender();
   const result = await supabaseSignIn(email, password);
-  state.authLoading = false;
-  if (result.error) { state.authError = result.error; rerender(); return; }
+  if (result.error) { state.authLoading = false; state.authError = result.error; rerender(); return; }
   saveSession(result.data);
+  await pullAndMergeAll(); // bring down any existing cloud data before the app is shown
+  state.authLoading = false;
   state.ui = {};
   rerender();
 };
@@ -3080,8 +3154,15 @@ cleanExpiredPhotos();
 if (!state.session) pendingFocusId = "loginEmailInput";
 render();
 
-// Keep the session token fresh in the background; never blocks app usage if offline/unreachable.
-if (state.session) getValidAccessToken();
+// On boot, if already signed in, catch up with anything changed elsewhere (another device,
+// a future companion app) and flush anything local that hasn't synced yet. This also keeps
+// the session token fresh. Non-blocking - never delays first paint, only rerenders if
+// something was actually pulled in that wasn't already showing.
+if (state.session) {
+  pullAndMergeAll().then(function(result) {
+    if (result && result.data && (result.data.logsAdded > 0 || result.data.weightsAdded > 0)) rerender();
+  });
+}
 
 // If the app has been backgrounded for a while (not just a quick app-switch), treat
 // coming back to it like reopening it: land on Dashboard / today, not wherever it was left.
