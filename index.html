@@ -298,27 +298,6 @@ async function getValidAccessToken() {
   return refreshed ? refreshed.accessToken : null;
 }
 
-actions.supabaseLogin = async function() {
-  const email = (state.ui.loginEmail || "").trim();
-  const password = state.ui.loginPassword || "";
-  if (!email || !password) return;
-  state.authLoading = true; state.authError = null;
-  rerender();
-  const result = await supabaseSignIn(email, password);
-  state.authLoading = false;
-  if (result.error) { state.authError = result.error; rerender(); return; }
-  saveSession(result.data);
-  state.ui = {};
-  rerender();
-};
-actions.supabaseSignOut = function() {
-  clearSession();
-  state.ui = {};
-  rerender();
-};
-inputActions.loginEmail = function(val) { state.ui.loginEmail = val; };
-inputActions.loginPassword = function(val) { state.ui.loginPassword = val; };
-
 function renderLoginScreen() {
   return '<div style="max-width:340px;margin:0 auto;padding:60px 20px 20px;">' +
     '<div style="text-align:center;margin-bottom:32px"><div style="font-size:22px;font-weight:700;color:' + C.primary + '">MacroLog</div><div style="color:' + C.textMut + ';font-size:13px;margin-top:4px">Sign in to sync your data</div></div>' +
@@ -584,6 +563,27 @@ root.addEventListener("keydown", function(e) {
 const actions = {};
 const inputActions = {};
 const changeActions = {};
+
+actions.supabaseLogin = async function() {
+  const email = (state.ui.loginEmail || "").trim();
+  const password = state.ui.loginPassword || "";
+  if (!email || !password) return;
+  state.authLoading = true; state.authError = null;
+  rerender();
+  const result = await supabaseSignIn(email, password);
+  state.authLoading = false;
+  if (result.error) { state.authError = result.error; rerender(); return; }
+  saveSession(result.data);
+  state.ui = {};
+  rerender();
+};
+actions.supabaseSignOut = function() {
+  clearSession();
+  state.ui = {};
+  rerender();
+};
+inputActions.loginEmail = function(val) { state.ui.loginEmail = val; };
+inputActions.loginPassword = function(val) { state.ui.loginPassword = val; };
 
 function esc_attr(s) { return esc(s).replace(/"/g, "&quot;"); }
 
