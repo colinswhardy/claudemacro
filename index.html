@@ -25,7 +25,7 @@ input[type="range"]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;c
 button{cursor:pointer;}
 a{color:inherit;}
 .hidden{display:none !important;}
-#app{max-width:500px;margin:0 auto;position:relative;padding-bottom:132px;min-height:100vh;}
+#app{max-width:500px;margin:0 auto;position:relative;padding-bottom:120px;min-height:100vh;}
 .header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;position:sticky;top:0;z-index:100;background:rgba(11,14,24,0.92);backdrop-filter:blur(12px);}
 .brand{font-size:18px;font-weight:700;color:#3B82F6;}
 .dateNav{display:flex;align-items:center;gap:8px;}
@@ -34,8 +34,9 @@ a{color:inherit;}
 .dateBtn.today{color:#3B82F6;}
 .settingsBtn{background:none;border:none;color:#64748B;font-size:20px;cursor:pointer;}
 .content{padding:0 16px;}
-.bottomNav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:500px;background:rgba(20,24,40,0.94);border-top:1px solid #1E2640;display:flex;backdrop-filter:blur(12px);z-index:100;}
-.quickActions{position:fixed;bottom:76px;left:50%;transform:translateX(-50%);width:100%;max-width:500px;box-sizing:border-box;display:flex;gap:8px;padding:10px 16px;background:rgba(20,24,40,0.94);border-top:1px solid #1E2640;backdrop-filter:blur(12px);z-index:99;}
+.bottomBar{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:500px;z-index:100;display:flex;flex-direction:column;background:rgba(20,24,40,0.94);border-top:1px solid #1E2640;backdrop-filter:blur(12px);}
+.bottomNav{display:flex;box-sizing:border-box;}
+.quickActions{display:flex;gap:8px;padding:6px 16px;box-sizing:border-box;}
 .tabBtn{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;background:none;border:none;padding:10px 4px;color:#64748B;cursor:pointer;font-size:11px;}
 .tabBtn.active{color:#3B82F6;font-weight:600;}
 .tabIcon{font-size:20px;}
@@ -199,6 +200,7 @@ const state = {
   recentFoods: db.get("recentFoods", []),
   foodCache: db.get("foodCache", {}),
   recipes: db.get("recipes", []),
+  customBarcodes: db.get("customBarcodes", {}),
   ui: {}
 };
 
@@ -209,6 +211,7 @@ function saveFavorites() { db.set("favorites", state.favorites); }
 function saveRecentFoods() { db.set("recentFoods", state.recentFoods); }
 function saveFoodCache() { db.set("foodCache", state.foodCache); }
 function saveRecipes() { db.set("recipes", state.recipes); }
+function saveCustomBarcodes() { db.set("customBarcodes", state.customBarcodes); }
 
 function cleanExpiredPhotos() {
   const now = new Date().toISOString();
@@ -438,6 +441,20 @@ root.addEventListener("change", function(e) {
   }
 });
 
+// Enter key on any input tagged with data-enter triggers the same action as that
+// screen's primary "confirm" button (search, log, save, add, etc.).
+root.addEventListener("keydown", function(e) {
+  if (e.key !== "Enter") return;
+  const el = e.target;
+  if (!el || el.tagName !== "INPUT") return;
+  const actionName = el.getAttribute("data-enter");
+  if (actionName && typeof actions[actionName] === "function") {
+    e.preventDefault();
+    el.blur();
+    actions[actionName]();
+  }
+});
+
 const actions = {};
 const inputActions = {};
 const changeActions = {};
@@ -500,13 +517,14 @@ function btn(opts) {
 }
 
 function textInput(opts) {
-  // opts: {id, value, placeholder, type, bind, style}
+  // opts: {id, value, placeholder, type, bind, style, enter}
   return '<input class="input" type="' + (opts.type || "text") + '"' +
     (opts.id ? ' id="' + opts.id + '"' : '') +
     ' value="' + esc_attr(opts.value == null ? "" : opts.value) + '"' +
     (opts.placeholder ? ' placeholder="' + esc_attr(opts.placeholder) + '"' : '') +
     (opts.bind ? ' data-bind="' + esc_attr(opts.bind) + '"' : '') +
     (opts.step ? ' step="' + opts.step + '"' : '') +
+    (opts.enter ? ' data-enter="' + esc_attr(opts.enter) + '" enterkeyhint="' + (opts.enterHint || "done") + '"' : '') +
     (opts.style ? ' style="' + opts.style + '"' : '') + '>';
 }
 
@@ -536,15 +554,17 @@ function renderApp() {
       '<button class="settingsBtn" data-action="setTab" data-arg="strategy">\u2699</button>' +
     '</div>' +
     '<div class="content">' + renderTabContent() + '</div>' +
-    '<div class="quickActions">' +
-      btn({ label: "\u{1F4F7} Scan Barcode", action: "openBarcodeScan", outline: true, full: true }) +
-      btn({ label: "➕ Add Food", action: "quickAddFood", full: true }) +
-    '</div>' +
-    '<div class="bottomNav">' +
-      tabBtn("dashboard", "\u{1F4CA}", "Dashboard") +
-      tabBtn("food", "\u{1F37D}", "Food") +
-      tabBtn("weight", "\u{1F4C8}", "Weight") +
-      tabBtn("strategy", "\u2699", "Strategy") +
+    '<div class="bottomBar">' +
+      '<div class="quickActions">' +
+        btn({ label: "\u{1F4F7} Scan Barcode", action: "openBarcodeScan", outline: true, full: true, small: true }) +
+        btn({ label: "➕ Add Food", action: "quickAddFood", full: true, small: true }) +
+      '</div>' +
+      '<div class="bottomNav">' +
+        tabBtn("dashboard", "\u{1F4CA}", "Dashboard") +
+        tabBtn("food", "\u{1F37D}", "Food") +
+        tabBtn("weight", "\u{1F4C8}", "Weight") +
+        tabBtn("strategy", "⚙", "Strategy") +
+      '</div>' +
     '</div>';
 }
 
@@ -565,14 +585,10 @@ actions.setTab = function(tabName) {
   stopBarcodeCamera();
   state.tab = tabName;
   state.ui = {}; // reset transient UI state on tab switch
+  if (tabName === "food") pendingFocusId = "foodSearchInput";
   rerender();
 };
-actions.quickAddFood = function() {
-  stopBarcodeCamera();
-  state.tab = "food";
-  state.ui = {};
-  rerender();
-};
+actions.quickAddFood = function() { actions.setTab("food"); };
 actions.shiftDate = function(dirStr) {
   stopBarcodeCamera();
   const dir = parseInt(dirStr, 10);
@@ -712,9 +728,8 @@ function renderDashboard() {
 
 function renderFoodEntry(entry) {
   const editing = state.ui.editingEntryId === entry.id;
-  const editMode = state.ui.editMode || "weight";
   let html = '<div class="foodEntry">' +
-    '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+    '<div data-action="toggleEntryEditor" data-arg="' + entry.id + '" style="cursor:pointer;display:flex;justify-content:space-between;align-items:flex-start">' +
       '<div style="flex:1;min-width:0">' +
         '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(entry.name) + '</div>' +
         '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">' + esc(entry.source) + ' \u2022 ' + entry.weight + 'g</div>' +
@@ -729,34 +744,68 @@ function renderFoodEntry(entry) {
       '<span style="color:' + C.protein + '">P: ' + entry.macros.protein + 'g</span>' +
       '<span style="color:' + C.carbs + '">C: ' + entry.macros.carbs + 'g</span>' +
       '<span style="color:' + C.fat + '">F: ' + entry.macros.fat + 'g</span>' +
-    '</div>' +
-    '<div style="margin-top:8px">' +
-      '<button data-action="toggleEditEntry" data-arg="' + entry.id + '" style="background:none;border:1px solid ' + C.border + ';border-radius:6px;color:' + C.textSec + ';font-size:11px;padding:4px 8px;cursor:pointer">' + (editing ? "Close" : "Edit") + '</button>' +
     '</div>';
 
-  if (editing) {
-    html += '<div style="margin-top:10px;padding:10px;background:' + C.bg + ';border-radius:10px">' +
-      '<div class="row" style="margin-bottom:10px">' +
-        '<button class="sectionBtn' + (editMode === "weight" ? " active" : "") + '" data-action="setEditMode" data-arg="weight">Edit Weight</button>' +
-        '<button class="sectionBtn' + (editMode === "macros" ? " active" : "") + '" data-action="setEditMode" data-arg="macros">Edit Macros</button>' +
+  if (editing) html += renderEntryEditor(entry);
+  html += '</div>';
+  return html;
+}
+
+function renderEntryEditor(entry) {
+  const section = state.ui.entrySection || "portion";
+  let html = '<div style="margin-top:10px;padding:10px;background:' + C.bg + ';border-radius:10px">' +
+    '<div class="row" style="margin-bottom:10px;flex-wrap:wrap">' +
+      '<button class="sectionBtn' + (section === "portion" ? " active" : "") + '" data-action="setEntrySection" data-arg="portion">Portion</button>' +
+      '<button class="sectionBtn' + (section === "macros" ? " active" : "") + '" data-action="setEntrySection" data-arg="macros">Macros</button>' +
+      '<button class="sectionBtn' + (section === "move" ? " active" : "") + '" data-action="setEntrySection" data-arg="move">Move Day</button>' +
+    '</div>';
+
+  if (section === "portion") {
+    const cachedFood = state.foodCache[entry.foodId];
+    const weightVal = state.ui.entryWeightInput != null ? state.ui.entryWeightInput : String(entry.weight);
+    const sizes = (cachedFood && cachedFood.servingSizes) || [];
+    if (sizes.length > 0) {
+      html += '<div class="rowWrap" style="margin-bottom:10px">' +
+        sizes.map(function(s) {
+          return '<button class="chip' + (parseFloat(weightVal) === s.grams ? ' active' : '') + '" data-action="setEntryWeight" data-arg="' + s.grams + '">' + esc(s.label) + '</button>';
+        }).join('') +
       '</div>';
-    if (editMode === "weight") {
-      html += '<div class="row" style="align-items:center">' +
-        '<input class="input" type="number" id="editWeightInput" value="' + entry.weight + '" style="flex:1">' +
-        '<span style="color:' + C.textMut + ';font-size:12px;align-self:center">g</span>' +
-        btn({ label: "Save", action: "saveEditWeight", arg: entry.id, small: true }) +
-        '</div>';
-    } else {
-      const m = entry.macros;
-      html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">' +
-        macroEditField("protein", "Protein (g)", m.protein) +
-        macroEditField("carbs", "Carbs (g)", m.carbs) +
-        macroEditField("fat", "Fat (g)", m.fat) +
-        macroEditField("fiber", "Fiber (g)", m.fiber || 0) +
-        '</div>' +
-        btn({ label: "Save Macros", action: "saveEditMacros", arg: entry.id, small: true });
     }
-    html += '</div>';
+    html += '<div class="row" style="align-items:center;margin-bottom:8px">' +
+      textInput({ id: "entryWeightInput", value: weightVal, type: "number", bind: "entryWeightInput", enter: "saveEntryPortion", style: "flex:1" }) +
+      '<span style="color:' + C.textMut + ';font-size:12px">g</span>' +
+      btn({ label: "Save", action: "saveEntryPortion", small: true }) +
+    '</div>';
+    if (cachedFood) {
+      const w = parseFloat(weightVal) || 0;
+      const m = calcMacrosForWeight(cachedFood, w);
+      html += '<div style="color:' + C.textMut + ';font-size:11px">Preview: ' + m.calories + ' kcal \u2022 P ' + m.protein + 'g \u2022 C ' + m.carbs + 'g \u2022 F ' + m.fat + 'g</div>';
+    } else {
+      html += '<div style="color:' + C.textMut + ';font-size:11px">Original food details unavailable \u2014 weight will scale the current macros proportionally.</div>';
+    }
+  } else if (section === "macros") {
+    const m = entry.macros;
+    const isCustom = entry.source === "Recipe" || entry.source === "Manual Entry" || entry.source === "Custom Barcode Entry";
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">' +
+      macroEditField("protein", "Protein (g)", m.protein) +
+      macroEditField("carbs", "Carbs (g)", m.carbs) +
+      macroEditField("fat", "Fat (g)", m.fat) +
+      macroEditField("fiber", "Fiber (g)", m.fiber || 0) +
+    '</div>';
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">' +
+      (isCustom ? "This is a " + (entry.source === "Recipe" ? "recipe" : "custom food") + " you created \u2014 saving here also updates it for next time." : "This only changes today\u2019s entry \u2014 the original food won\u2019t be affected.") +
+    '</div>';
+    html += btn({ label: "Save Macros", action: "saveEditMacros", small: true });
+  } else {
+    const targetDate = state.ui.entryMoveDate || state.date;
+    html += '<div class="row" style="margin-bottom:10px">' +
+      btn({ label: "\u2039 Yesterday", action: "moveEntryYesterday", small: true, outline: true }) +
+      btn({ label: "Tomorrow \u203a", action: "moveEntryTomorrow", small: true, outline: true }) +
+    '</div>';
+    html += '<div class="row" style="align-items:center">' +
+      textInput({ value: targetDate, type: "date", bind: "entryMoveDate", style: "flex:1" }) +
+      btn({ label: "Move", action: "moveEntryCustomDate", small: true }) +
+    '</div>';
   }
   html += '</div>';
   return html;
@@ -764,45 +813,152 @@ function renderFoodEntry(entry) {
 
 function macroEditField(key, label, value) {
   return '<div><label class="label" style="text-transform:capitalize">' + label + '</label>' +
-    '<input class="input" type="number" id="editMacro_' + key + '" value="' + value + '" style="padding:6px;font-size:13px"></div>';
+    '<input class="input" type="number" id="editMacro_' + key + '" value="' + value + '" data-enter="saveEditMacros" style="padding:6px;font-size:13px"></div>';
 }
 
-actions.toggleEditEntry = function(entryId) {
-  if (state.ui.editingEntryId === entryId) { state.ui.editingEntryId = null; }
-  else { state.ui.editingEntryId = entryId; state.ui.editMode = "weight"; }
+function closeEntryEditor() {
+  state.ui.editingEntryId = null;
+  state.ui.entrySection = "portion";
+  state.ui.entryWeightInput = null;
+  state.ui.entryMoveDate = null;
+}
+
+actions.toggleEntryEditor = function(entryId) {
+  if (state.ui.editingEntryId === entryId) {
+    closeEntryEditor();
+  } else {
+    const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === entryId; });
+    state.ui.editingEntryId = entryId;
+    state.ui.entrySection = "portion";
+    state.ui.entryWeightInput = entry ? String(entry.weight) : "100";
+    state.ui.entryMoveDate = state.date;
+  }
   rerender();
 };
-actions.setEditMode = function(mode) { state.ui.editMode = mode; rerender(); };
+actions.setEntrySection = function(section) { state.ui.entrySection = section; rerender(); };
 actions.removeFood = function(entryId) { removeFoodFromLog(entryId); rerender(); };
 
-actions.saveEditWeight = function(entryId) {
-  const input = document.getElementById("editWeightInput");
-  const w = parseFloat(input.value);
+inputActions.entryWeightInput = function(val) { state.ui.entryWeightInput = val; };
+actions.setEntryWeight = function(grams) { state.ui.entryWeightInput = grams; rerender(); };
+actions.saveEntryPortion = function() {
+  const id = state.ui.editingEntryId;
+  if (!id) return;
+  const w = parseFloat(state.ui.entryWeightInput);
   if (!w || w <= 0) return;
-  const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === entryId; });
+  const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === id; });
   if (!entry) return;
-  const ratio = w / entry.weight;
-  updateFoodEntry(entryId, {
-    weight: w,
-    macros: {
+  const cachedFood = state.foodCache[entry.foodId];
+  let macros;
+  if (cachedFood) {
+    macros = calcMacrosForWeight(cachedFood, w);
+  } else {
+    const ratio = w / entry.weight;
+    macros = {
       calories: Math.round(entry.macros.calories * ratio),
       protein: round1(entry.macros.protein * ratio),
       carbs: round1(entry.macros.carbs * ratio),
       fat: round1(entry.macros.fat * ratio),
       fiber: round1((entry.macros.fiber||0) * ratio),
-    }
-  });
-  state.ui.editingEntryId = null;
+    };
+  }
+  updateFoodEntry(id, { weight: w, macros: macros });
+  closeEntryEditor();
   rerender();
 };
 
-actions.saveEditMacros = function(entryId) {
+// Editing macros on a log entry only affects that entry \u2014 UNLESS it's a food you created
+// yourself (a recipe or a manual/custom-barcode entry), in which case the correction is
+// also written back to the source so future uses of it are already fixed.
+function propagateCustomFoodEdit(entry, newMacros) {
+  if (entry.source === "Manual Entry" || entry.source === "Custom Barcode Entry") {
+    const cached = state.foodCache[entry.foodId];
+    if (cached) {
+      state.foodCache[entry.foodId] = Object.assign({}, cached, {
+        calories: newMacros.calories, protein: newMacros.protein, carbs: newMacros.carbs, fat: newMacros.fat, fiber: newMacros.fiber,
+      });
+      saveFoodCache();
+    }
+    if (entry.source === "Custom Barcode Entry" && entry.foodId && entry.foodId.indexOf("barcode_") === 0) {
+      const code = entry.foodId.slice("barcode_".length);
+      if (state.customBarcodes[code]) {
+        state.customBarcodes[code] = Object.assign({}, state.customBarcodes[code], {
+          calories: newMacros.calories, protein: newMacros.protein, carbs: newMacros.carbs, fat: newMacros.fat, fiber: newMacros.fiber,
+        });
+        saveCustomBarcodes();
+      }
+    }
+  } else if (entry.source === "Recipe" && entry.foodId && entry.foodId.indexOf("recipe_food_") === 0) {
+    const recipeId = entry.foodId.slice("recipe_food_".length);
+    const recipe = state.recipes.find(function(r){ return r.id === recipeId; });
+    if (recipe) {
+      const old = entry.macros;
+      const ratioP = old.protein > 0 ? newMacros.protein / old.protein : 1;
+      const ratioC = old.carbs > 0 ? newMacros.carbs / old.carbs : 1;
+      const ratioF = old.fat > 0 ? newMacros.fat / old.fat : 1;
+      const newIngredients = recipe.ingredients.map(function(ing) {
+        const p2 = round1(ing.protein * ratioP), c2 = round1(ing.carbs * ratioC), f2 = round1(ing.fat * ratioF);
+        return Object.assign({}, ing, { protein: p2, carbs: c2, fat: f2, calories: Math.round(p2 * 4 + c2 * 4 + f2 * 9) });
+      });
+      state.recipes = state.recipes.map(function(r){ return r.id === recipeId ? Object.assign({}, r, { ingredients: newIngredients }) : r; });
+      saveRecipes();
+    }
+  }
+}
+
+actions.saveEditMacros = function() {
+  const id = state.ui.editingEntryId;
+  if (!id) return;
+  const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === id; });
+  if (!entry) return;
   const p = parseFloat(document.getElementById("editMacro_protein").value) || 0;
   const c = parseFloat(document.getElementById("editMacro_carbs").value) || 0;
   const f = parseFloat(document.getElementById("editMacro_fat").value) || 0;
   const fib = parseFloat(document.getElementById("editMacro_fiber").value) || 0;
-  updateFoodEntry(entryId, { macros: { protein: p, carbs: c, fat: f, fiber: fib, calories: Math.round(p*4 + c*4 + f*9) } });
-  state.ui.editingEntryId = null;
+  const newMacros = { protein: p, carbs: c, fat: f, fiber: fib, calories: Math.round(p*4 + c*4 + f*9) };
+  propagateCustomFoodEdit(entry, newMacros);
+  updateFoodEntry(id, { macros: newMacros });
+  closeEntryEditor();
+  rerender();
+};
+
+function moveFoodEntryToDate(entryId, toDate) {
+  const fromDate = state.date;
+  if (!toDate || toDate === fromDate) return false;
+  const list = state.foodLogs[fromDate] || [];
+  const idx = list.findIndex(function(e){ return e.id === entryId; });
+  if (idx < 0) return false;
+  const entry = list[idx];
+  list.splice(idx, 1);
+  state.foodLogs[fromDate] = list;
+  if (!state.foodLogs[toDate]) state.foodLogs[toDate] = [];
+  state.foodLogs[toDate].push(entry);
+  saveFoodLogs();
+  return true;
+}
+inputActions.entryMoveDate = function(val) { state.ui.entryMoveDate = val; };
+actions.moveEntryYesterday = function() {
+  const id = state.ui.editingEntryId;
+  if (!id) return;
+  const d = parseDateStr(state.date);
+  d.setDate(d.getDate() - 1);
+  moveFoodEntryToDate(id, fmtDate(d));
+  closeEntryEditor();
+  rerender();
+};
+actions.moveEntryTomorrow = function() {
+  const id = state.ui.editingEntryId;
+  if (!id) return;
+  const d = parseDateStr(state.date);
+  d.setDate(d.getDate() + 1);
+  moveFoodEntryToDate(id, fmtDate(d));
+  closeEntryEditor();
+  rerender();
+};
+actions.moveEntryCustomDate = function() {
+  const id = state.ui.editingEntryId;
+  if (!id || !state.ui.entryMoveDate) return;
+  moveFoodEntryToDate(id, state.ui.entryMoveDate);
+  closeEntryEditor();
   rerender();
 };
 
@@ -811,7 +967,7 @@ actions.saveEditMacros = function(entryId) {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100" };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100" };
   return state.ui.food;
 }
 
@@ -842,7 +998,7 @@ function renderFoodTab() {
 
   if (fu.subTab === "search") {
     html += '<div class="row" style="margin-bottom:12px">' +
-      textInput({ id: "foodSearchInput", value: fu.query, placeholder: "Search foods...", bind: "foodQuery", style: "flex:1" }) +
+      textInput({ id: "foodSearchInput", value: fu.query, placeholder: "Search foods...", bind: "foodQuery", enter: "doFoodSearch", enterHint: "search", style: "flex:1" }) +
       btn({ label: fu.searching ? "..." : "\u{1F50D}", action: "doFoodSearch", disabled: fu.searching }) +
       '</div>';
     html += '<div class="row" style="margin-bottom:16px">';
@@ -885,16 +1041,18 @@ function renderFoodTab() {
       html += card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No food history yet</div>');
     } else {
       state.recentFoods.forEach(function(food) {
+        const m = food.loggedMacros || { calories: food.calories, protein: food.protein, carbs: food.carbs, fat: food.fat };
+        const w = food.loggedWeight;
         html += '<div class="foodResult" data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '" data-arg2="history">' +
           '<div style="display:flex;justify-content:space-between">' +
             '<div style="color:' + C.text + ';font-weight:500;font-size:14px">' + esc(food.name) + '</div>' +
-            '<span style="color:' + C.calories + ';font-weight:600">' + food.calories + ' kcal</span>' +
+            '<span style="color:' + C.calories + ';font-weight:600">' + m.calories + ' kcal</span>' +
           '</div>' +
           '<div style="display:flex;gap:10px;margin-top:4px;font-size:12px">' +
-            '<span style="color:' + C.protein + '">P: ' + food.protein + 'g</span>' +
-            '<span style="color:' + C.carbs + '">C: ' + food.carbs + 'g</span>' +
-            '<span style="color:' + C.fat + '">F: ' + food.fat + 'g</span>' +
-            '<span style="color:' + C.textMut + ';margin-left:auto">/100g</span>' +
+            '<span style="color:' + C.protein + '">P: ' + m.protein + 'g</span>' +
+            '<span style="color:' + C.carbs + '">C: ' + m.carbs + 'g</span>' +
+            '<span style="color:' + C.fat + '">F: ' + m.fat + 'g</span>' +
+            (w ? '<span style="color:' + C.textMut + ';margin-left:auto">last: ' + w + 'g</span>' : '') +
           '</div></div>';
       });
     }
@@ -986,6 +1144,29 @@ actions.closeManualEntry = function() { foodUi().manualEntry = false; rerender()
 // ---- Barcode scanning ----
 function renderBarcodeScanScreen(fu) {
   let html = '<button class="backBtn" data-action="closeBarcodeScan">← Back</button>';
+
+  if (fu.scanNotFoundCode) {
+    const m = fu.customBarcodeManual;
+    let inner = '<h3 class="cardTitle" style="margin-bottom:4px">Product Not Found</h3>' +
+      '<div style="color:' + C.textMut + ';font-size:13px;margin-bottom:16px">No match for barcode ' + esc(fu.scanNotFoundCode) + '. Enter it once and MacroLog will remember it next time you scan this barcode.</div>' +
+      '<div style="display:flex;flex-direction:column;gap:10px">' +
+        '<div><label class="label">Food Name</label>' + textInput({ value: m.name, placeholder: "e.g. Trail Mix", bind: "customBarcodeName", enter: "saveCustomBarcode" }) + '</div>' +
+        '<div><label class="label">Weight (g)</label>' + textInput({ value: m.weight, type: "number", bind: "customBarcodeWeight", enter: "saveCustomBarcode" }) + '</div>' +
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
+          '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' + textInput({ value: m.calories, type: "number", bind: "customBarcodeCalories", enter: "saveCustomBarcode" }) + '</div>' +
+          '<div><label class="label" style="color:' + C.protein + '">Protein (g)</label>' + textInput({ value: m.protein, type: "number", bind: "customBarcodeProtein", enter: "saveCustomBarcode" }) + '</div>' +
+          '<div><label class="label" style="color:' + C.carbs + '">Carbs (g)</label>' + textInput({ value: m.carbs, type: "number", bind: "customBarcodeCarbs", enter: "saveCustomBarcode" }) + '</div>' +
+          '<div><label class="label" style="color:' + C.fat + '">Fat (g)</label>' + textInput({ value: m.fat, type: "number", bind: "customBarcodeFat", enter: "saveCustomBarcode" }) + '</div>' +
+        '</div>' +
+      '</div>';
+    inner += '<div class="row" style="margin-top:16px">' +
+      btn({ label: "Cancel", action: "cancelCustomBarcode", outline: true, full: true }) +
+      btn({ label: "Save & Add", action: "saveCustomBarcode", full: true }) +
+    '</div>';
+    html += card(inner);
+    return html;
+  }
+
   let inner = '<h3 class="cardTitle" style="margin-bottom:12px">Scan Barcode</h3>';
   inner += '<div style="position:relative;background:#000;border-radius:12px;overflow:hidden;margin-bottom:12px;aspect-ratio:4/3">' +
     '<video id="barcodeVideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;display:block"></video>' +
@@ -995,7 +1176,7 @@ function renderBarcodeScanScreen(fu) {
   if (fu.scanError) inner += '<div style="padding:10px 12px;background:' + C.warning + '15;border-radius:8px;color:' + C.warning + ';font-size:13px;margin-bottom:12px">' + esc(fu.scanError) + '</div>';
   inner += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:16px">Point your camera at a barcode — it scans automatically. Or type the number in below.</div>';
   inner += '<div class="row" style="align-items:center">' +
-    textInput({ value: fu.scanManualCode, type: "text", placeholder: "Enter barcode number", bind: "scanManualCode", style: "flex:1" }) +
+    textInput({ value: fu.scanManualCode, type: "text", placeholder: "Enter barcode number", bind: "scanManualCode", enter: "lookupManualBarcode", style: "flex:1" }) +
     btn({ label: "Look Up", action: "lookupManualBarcode", disabled: fu.scanLoading }) +
   '</div>';
   html += card(inner);
@@ -1044,12 +1225,24 @@ async function startBarcodeCamera() {
 
 async function handleBarcodeDetected(code) {
   const fu = foodUi();
+  fu.scanNotFoundCode = null;
+
+  const remembered = state.customBarcodes[code];
+  if (remembered) {
+    fu.scanningBarcode = false;
+    fu.addingFood = remembered;
+    fu.addWeight = String(remembered.loggedWeight || (remembered.servingSizes && remembered.servingSizes[0] && remembered.servingSizes[0].grams) || 100);
+    rerender();
+    return;
+  }
+
   fu.scanLoading = true; fu.scanError = null;
   rerender();
   const food = await searchBarcode(code);
   fu.scanLoading = false;
   if (!food) {
-    fu.scanError = "No product found for barcode " + code + ". Try again, search by name, or use manual entry.";
+    fu.scanNotFoundCode = code;
+    fu.customBarcodeManual = { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" };
     rerender();
     return;
   }
@@ -1070,7 +1263,7 @@ actions.openBarcodeScan = function() {
 actions.closeBarcodeScan = function() {
   stopBarcodeCamera();
   const fu = foodUi();
-  fu.scanningBarcode = false; fu.scanError = null; fu.scanManualCode = ""; fu.scanLoading = false;
+  fu.scanningBarcode = false; fu.scanError = null; fu.scanManualCode = ""; fu.scanLoading = false; fu.scanNotFoundCode = null;
   rerender();
 };
 inputActions.scanManualCode = function(val) { foodUi().scanManualCode = val; };
@@ -1080,6 +1273,36 @@ actions.lookupManualBarcode = async function() {
   if (!code) return;
   stopBarcodeCamera();
   await handleBarcodeDetected(code);
+};
+
+["Name","Weight","Calories","Protein","Carbs","Fat"].forEach(function(f) {
+  inputActions["customBarcode" + f] = function(val) { foodUi().customBarcodeManual[f.toLowerCase()] = val; };
+});
+actions.cancelCustomBarcode = function() {
+  const fu = foodUi();
+  fu.scanNotFoundCode = null;
+  fu.scanManualCode = "";
+  rerender();
+};
+actions.saveCustomBarcode = function() {
+  const fu = foodUi();
+  const code = fu.scanNotFoundCode;
+  const m = fu.customBarcodeManual;
+  if (!code || !m.name.trim()) return;
+  const weight = parseFloat(m.weight) || 100;
+  const food = {
+    id: "barcode_" + code, name: m.name.trim(), brand: "", source: "Custom Barcode Entry",
+    per100g: false, calories: parseFloat(m.calories) || 0, protein: parseFloat(m.protein) || 0,
+    carbs: parseFloat(m.carbs) || 0, fat: parseFloat(m.fat) || 0, fiber: parseFloat(m.fiber) || 0,
+    state: "—", servingSizes: [{ label: weight + "g", grams: weight }],
+  };
+  state.customBarcodes[code] = food;
+  saveCustomBarcodes();
+  fu.scanningBarcode = false;
+  fu.scanNotFoundCode = null;
+  fu.addingFood = food;
+  fu.addWeight = String(weight);
+  rerender();
 };
 
 // ---- Recipes ----
@@ -1154,7 +1377,7 @@ function renderRecipeBuilderScreen(fu) {
   const totals = sumRecipeIngredients(rb.ingredients);
   let html = '<button class="backBtn" data-action="cancelRecipeBuilder">← Back</button>';
   let inner = '<h3 class="cardTitle" style="margin-bottom:12px">' + (rb.editingId ? "Edit Recipe" : "New Recipe") + '</h3>';
-  inner += '<div style="margin-bottom:16px"><label class="label">Recipe Name</label>' + textInput({ value: rb.name, placeholder: "e.g. Daily Shake", bind: "recipeName" }) + '</div>';
+  inner += '<div style="margin-bottom:16px"><label class="label">Recipe Name</label>' + textInput({ value: rb.name, placeholder: "e.g. Daily Shake", bind: "recipeName", enter: "openIngredientPicker" }) + '</div>';
 
   if (rb.ingredients.length === 0) {
     inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + ';font-size:13px">No ingredients yet. Add some below.</div>';
@@ -1292,7 +1515,7 @@ function renderIngredientPickerScreen(fu, rb) {
       }).join('') +
     '</div>';
     inner += '<div class="row" style="align-items:center;margin-bottom:20px">' +
-      textInput({ value: pk.weight, type: "number", bind: "ingredientWeight", style: "flex:1" }) +
+      textInput({ value: pk.weight, type: "number", bind: "ingredientWeight", enter: "confirmAddIngredient", style: "flex:1" }) +
       '<span style="color:' + C.textMut + '">grams</span></div>';
     inner += '<div style="text-align:center;margin-bottom:16px"><div style="font-size:28px;font-weight:800;color:' + C.calories + '">' + m.calories + ' kcal</div></div>';
     inner += '<div style="display:flex;justify-content:space-around;margin-bottom:20px">' + macroStat("Protein", m.protein, C.protein) + macroStat("Carbs", m.carbs, C.carbs) + macroStat("Fat", m.fat, C.fat) + '</div>';
@@ -1310,7 +1533,7 @@ function renderIngredientPickerScreen(fu, rb) {
 
   if (pk.mode === "search") {
     inner += '<div class="row" style="margin-bottom:12px">' +
-      textInput({ value: pk.query, placeholder: "Search foods...", bind: "ingredientQuery", style: "flex:1" }) +
+      textInput({ value: pk.query, placeholder: "Search foods...", bind: "ingredientQuery", enter: "doIngredientSearch", enterHint: "search", style: "flex:1" }) +
       btn({ label: pk.searching ? "..." : "\u{1F50D}", action: "doIngredientSearch", disabled: pk.searching }) +
     '</div>';
     pk.results.forEach(function(food) {
@@ -1338,13 +1561,13 @@ function renderIngredientPickerScreen(fu, rb) {
   } else {
     const m = pk.manual;
     inner += '<div style="display:flex;flex-direction:column;gap:10px">' +
-      '<div><label class="label">Ingredient Name</label>' + textInput({ value: m.name, placeholder: "e.g. Olive Oil", bind: "ingManualName" }) + '</div>' +
-      '<div><label class="label">Weight (g)</label>' + textInput({ value: m.weight, type: "number", bind: "ingManualWeight" }) + '</div>' +
+      '<div><label class="label">Ingredient Name</label>' + textInput({ value: m.name, placeholder: "e.g. Olive Oil", bind: "ingManualName", enter: "confirmAddManualIngredient" }) + '</div>' +
+      '<div><label class="label">Weight (g)</label>' + textInput({ value: m.weight, type: "number", bind: "ingManualWeight", enter: "confirmAddManualIngredient" }) + '</div>' +
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
-        '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' + textInput({ value: m.calories, type: "number", bind: "ingManualCalories" }) + '</div>' +
-        '<div><label class="label" style="color:' + C.protein + '">Protein (g)</label>' + textInput({ value: m.protein, type: "number", bind: "ingManualProtein" }) + '</div>' +
-        '<div><label class="label" style="color:' + C.carbs + '">Carbs (g)</label>' + textInput({ value: m.carbs, type: "number", bind: "ingManualCarbs" }) + '</div>' +
-        '<div><label class="label" style="color:' + C.fat + '">Fat (g)</label>' + textInput({ value: m.fat, type: "number", bind: "ingManualFat" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' + textInput({ value: m.calories, type: "number", bind: "ingManualCalories", enter: "confirmAddManualIngredient" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.protein + '">Protein (g)</label>' + textInput({ value: m.protein, type: "number", bind: "ingManualProtein", enter: "confirmAddManualIngredient" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.carbs + '">Carbs (g)</label>' + textInput({ value: m.carbs, type: "number", bind: "ingManualCarbs", enter: "confirmAddManualIngredient" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.fat + '">Fat (g)</label>' + textInput({ value: m.fat, type: "number", bind: "ingManualFat", enter: "confirmAddManualIngredient" }) + '</div>' +
       '</div>' +
     '</div>';
     inner += btn({ label: "Add Ingredient", action: "confirmAddManualIngredient", full: true, extraStyle: "margin-top:16px" });
@@ -1392,7 +1615,7 @@ function renderLogRecipeScreen(fu) {
   let html = '<button class="backBtn" data-action="cancelLogRecipe">← Back</button>';
   let inner = '<h3 class="cardTitle" style="margin-bottom:16px">' + esc(recipe.name) + '</h3>';
   inner += '<div class="row" style="align-items:center;margin-bottom:8px">' +
-    textInput({ value: fu.loggingWeight, type: "number", bind: "loggingRecipeWeight", style: "flex:1" }) +
+    textInput({ value: fu.loggingWeight, type: "number", bind: "loggingRecipeWeight", enter: "confirmLogRecipe", style: "flex:1" }) +
     '<span style="color:' + C.textMut + ';font-size:13px">grams</span></div>';
   inner += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:20px">Full recipe is ' + round1(totals.weight) + 'g</div>';
   inner += '<div style="text-align:center;margin-bottom:16px"><div style="font-size:32px;font-weight:800;color:' + C.calories + '">' + m.calories + ' <span style="font-size:16px;font-weight:400">kcal</span></div></div>';
@@ -1410,7 +1633,7 @@ actions.selectFoodForAdd = function(foodId, srcTab) {
   if (!food) food = state.foodCache[foodId];
   if (!food) return;
   fu.addingFood = food;
-  fu.addWeight = String((food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams) || 100);
+  fu.addWeight = String(food.loggedWeight || (food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams) || 100);
   rerender();
 };
 
@@ -1431,7 +1654,7 @@ function renderAddingFoodScreen(fu) {
       }).join('') +
     '</div>' +
     '<div class="row" style="align-items:center;margin-bottom:20px">' +
-      textInput({ id: "addWeightInput", value: fu.addWeight, type: "number", bind: "addWeight", style: "flex:1" }) +
+      textInput({ id: "addWeightInput", value: fu.addWeight, type: "number", bind: "addWeight", enter: "confirmAddFood", style: "flex:1" }) +
       '<span style="color:' + C.textMut + ';align-self:center">grams</span>' +
     '</div>' +
     '<div style="text-align:center;margin-bottom:16px"><div style="font-size:32px;font-weight:800;color:' + C.calories + '">' + m.calories + ' <span style="font-size:16px;font-weight:400">kcal</span></div></div>' +
@@ -1483,8 +1706,8 @@ function renderManualEntryScreen(fu) {
   return card(
     '<h3 class="cardTitle">Manual Entry</h3>' +
     '<div style="display:flex;flex-direction:column;gap:10px">' +
-      '<div><label class="label">Food Name</label>' + textInput({ value: m.name, placeholder: "e.g. Chicken Breast", bind: "manualName" }) + '</div>' +
-      '<div><label class="label">Weight (g)</label>' + textInput({ value: m.weight, type: "number", bind: "manualWeight" }) + '</div>' +
+      '<div><label class="label">Food Name</label>' + textInput({ value: m.name, placeholder: "e.g. Chicken Breast", bind: "manualName", enter: "addManualEntry" }) + '</div>' +
+      '<div><label class="label">Weight (g)</label>' + textInput({ value: m.weight, type: "number", bind: "manualWeight", enter: "addManualEntry" }) + '</div>' +
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
         manualField("calories", "Calories (kcal)", m.calories, C.calories) +
         manualField("protein", "Protein (g)", m.protein, C.protein) +
@@ -1499,7 +1722,7 @@ function renderManualEntryScreen(fu) {
   );
 }
 function manualField(key, label, value, color) {
-  return '<div><label class="label" style="color:' + color + '">' + label + '</label>' + textInput({ value: value, type: "number", bind: "manual_" + key }) + '</div>';
+  return '<div><label class="label" style="color:' + color + '">' + label + '</label>' + textInput({ value: value, type: "number", bind: "manual_" + key, enter: "addManualEntry" }) + '</div>';
 }
 ["name","weight","calories","protein","carbs","fat","fiber"].forEach(function(key) {
   inputActions["manual" + key.charAt(0).toUpperCase() + key.slice(1)] = function(val) { foodUi().manual[key] = val; };
@@ -1540,7 +1763,7 @@ function renderAIScreen(fu) {
 
 function renderAIForm(fu) {
   let html = '<div style="margin-bottom:12px"><label class="label">Describe what you ate</label>' +
-    textInput({ value: fu.aiDesc, placeholder: 'e.g. "large bowl of chicken pasta with cream sauce"', bind: "aiDesc" }) + '</div>';
+    textInput({ value: fu.aiDesc, placeholder: 'e.g. "large bowl of chicken pasta with cream sauce"', bind: "aiDesc", enter: "runAIEstimate" }) + '</div>';
   html += '<div style="margin-bottom:16px"><label class="label">Upload a photo (optional)</label>' +
     '<input type="file" accept="image/*" capture="environment" id="aiPhotoInput" data-change="aiPhoto" style="display:none">' +
     '<div class="row">' +
@@ -1765,7 +1988,7 @@ function renderWizardSteps(config, wiz) {
 
 function renderWizardAI(config, wiz) {
   let html = '<div style="color:' + C.textSec + ';margin-bottom:16px">Describe your ' + esc(config.label.toLowerCase()) + ' for an AI macro estimate:</div>';
-  html += textInput({ value: wiz.aiDesc, placeholder: 'e.g. "thick cut, about palm-sized"', bind: "wizardAiDesc", style: "margin-bottom:12px" });
+  html += textInput({ value: wiz.aiDesc, placeholder: 'e.g. "thick cut, about palm-sized"', bind: "wizardAiDesc", enter: "wizardAiEstimate", style: "margin-bottom:12px" });
   if (wiz.aiError) html += '<div style="padding:10px;background:' + C.danger + '15;border-radius:8px;color:' + C.danger + ';font-size:13px;margin-bottom:12px">' + esc(wiz.aiError) + '</div>';
   html += '<div class="row">' +
     btn({ label: "Back", action: "wizardAiBack", outline: true, full: true }) +
@@ -1941,7 +2164,7 @@ function renderWeightTab() {
     '<h3 class="cardTitle" style="margin-bottom:4px">Log Weight</h3>' +
     '<div style="color:' + C.textMut + ';font-size:13px;margin-bottom:16px">' + (todayWeight ? "Logged: " + todayWeight.weight + " " + todayWeight.unit : "No weight logged today") + '</div>' +
     '<div class="row" style="align-items:center">' +
-      textInput({ id: "weightLogInput", value: wu.input, type: "number", placeholder: todayWeight ? String(todayWeight.weight) : "Enter weight", bind: "weightInput", style: "flex:1" }) +
+      textInput({ id: "weightLogInput", value: wu.input, type: "number", placeholder: todayWeight ? String(todayWeight.weight) : "Enter weight", bind: "weightInput", enter: "logWeight", style: "flex:1" }) +
       '<span style="color:' + C.textMut + ';font-size:14px;align-self:center;min-width:24px">' + unit + '</span>' +
       btn({ label: "Log", action: "logWeight" }) +
     '</div>' +
@@ -1972,8 +2195,8 @@ function renderWeightTab() {
   if (wu.editingStart) {
     html += card(
       '<h3 class="cardTitle" style="margin-bottom:12px">Starting Point</h3>' +
-      '<div style="margin-bottom:12px"><label class="label">Starting Date</label>' + textInput({ value: wu.startInputDate, type: "date", bind: "startInputDate" }) + '</div>' +
-      '<div style="margin-bottom:16px"><label class="label">Starting Weight (' + unit + ')</label>' + textInput({ value: wu.startInputWeight, type: "number", bind: "startInputWeight" }) + '</div>' +
+      '<div style="margin-bottom:12px"><label class="label">Starting Date</label>' + textInput({ value: wu.startInputDate, type: "date", bind: "startInputDate", enter: "saveStartPoint" }) + '</div>' +
+      '<div style="margin-bottom:16px"><label class="label">Starting Weight (' + unit + ')</label>' + textInput({ value: wu.startInputWeight, type: "number", bind: "startInputWeight", enter: "saveStartPoint" }) + '</div>' +
       '<div class="row">' +
         btn({ label: "Reset to Auto", action: "clearStartPoint", outline: true, small: true }) +
         btn({ label: "Cancel", action: "toggleStartEdit", outline: true, small: true }) +
@@ -2501,7 +2724,7 @@ function renderDataSection() {
 }
 
 actions.exportData = function() {
-  const exportObj = { settings: state.settings, foodLogs: state.foodLogs, weights: state.weights, favorites: state.favorites, recentFoods: state.recentFoods, recipes: state.recipes, exportDate: new Date().toISOString(), version: "1.0" };
+  const exportObj = { settings: state.settings, foodLogs: state.foodLogs, weights: state.weights, favorites: state.favorites, recentFoods: state.recentFoods, recipes: state.recipes, customBarcodes: state.customBarcodes, exportDate: new Date().toISOString(), version: "1.0" };
   const blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -2522,6 +2745,7 @@ changeActions.importData = function(el) {
       if (data.favorites) { state.favorites = data.favorites; saveFavorites(); }
       if (data.recentFoods) { state.recentFoods = data.recentFoods; saveRecentFoods(); }
       if (data.recipes) { state.recipes = data.recipes; saveRecipes(); }
+      if (data.customBarcodes) { state.customBarcodes = data.customBarcodes; saveCustomBarcodes(); }
       alert("Data imported successfully!");
       rerender();
     } catch (e) { alert("Error importing data. Check file format."); }
@@ -2533,8 +2757,8 @@ actions.askConfirmClear = function() { strategyUi().confirmClear = true; rerende
 actions.cancelConfirmClear = function() { strategyUi().confirmClear = false; rerender(); };
 actions.clearAllData = function() {
   state.settings = Object.assign({}, DEFAULT_SETTINGS);
-  state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {}; state.recipes = [];
-  saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache(); saveRecipes();
+  state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {}; state.recipes = []; state.customBarcodes = {};
+  saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache(); saveRecipes(); saveCustomBarcodes();
   strategyUi().confirmClear = false;
   rerender();
 };
@@ -2545,6 +2769,24 @@ actions.clearAllData = function() {
 // ============================================================
 cleanExpiredPhotos();
 render();
+
+// If the app has been backgrounded for a while (not just a quick app-switch), treat
+// coming back to it like reopening it: land on Dashboard / today, not wherever it was left.
+let hiddenSinceMs = null;
+document.addEventListener("visibilitychange", function() {
+  if (document.hidden) {
+    hiddenSinceMs = Date.now();
+  } else {
+    if (hiddenSinceMs && (Date.now() - hiddenSinceMs) > 10 * 60 * 1000) {
+      stopBarcodeCamera();
+      state.tab = "dashboard";
+      state.date = todayStr();
+      state.ui = {};
+      rerender();
+    }
+    hiddenSinceMs = null;
+  }
+});
 
 </script>
 <script>
