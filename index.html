@@ -232,6 +232,41 @@ function cleanExpiredPhotos() {
 // ============================================================
 // API HELPERS
 // ============================================================
+// USDA only returns real serving-size metadata (servingSize/servingSizeUnit/householdServingFullText)
+// for Branded/Survey data types; Foundation/SR Legacy items have none. When present, surface it as
+// the top option (it's what's actually on the label), ahead of the generic weight shortcuts.
+function usdaServingSizes(f) {
+  const sizes = [];
+  if (f.servingSize && f.servingSizeUnit) {
+    const unit = String(f.servingSizeUnit).toLowerCase();
+    let grams = null;
+    if (unit.indexOf("g") === 0 || unit === "grm") grams = f.servingSize;
+    else if (unit.indexOf("ml") === 0) grams = f.servingSize;
+    else if (unit.indexOf("oz") === 0 || unit.indexOf("ounce") === 0) grams = f.servingSize * 28.3495;
+    if (grams) {
+      grams = Math.round(grams);
+      const label = f.householdServingFullText ? f.householdServingFullText + " (" + grams + "g)" : grams + "g serving";
+      sizes.push({ label: label, grams: grams });
+    }
+  }
+  sizes.push({ label: "100g", grams: 100 });
+  sizes.push({ label: "1 oz (28g)", grams: 28 });
+  sizes.push({ label: "4 oz (113g)", grams: 113 });
+  sizes.push({ label: "6 oz (170g)", grams: 170 });
+  sizes.push({ label: "8 oz (227g)", grams: 227 });
+  return sizes;
+}
+
+function offServingSizes(p) {
+  const sizes = [];
+  if (p.serving_quantity) {
+    const grams = parseFloat(p.serving_quantity);
+    if (grams) sizes.push({ label: p.serving_size ? p.serving_size : "1 serving (" + grams + "g)", grams: grams });
+  }
+  sizes.push({ label: "100g", grams: 100 });
+  return sizes;
+}
+
 async function searchUSDA(query) {
   try {
     const r = await fetch("https://api.nal.usda.gov/fdc/v1/foods/search?query=" + encodeURIComponent(query) + "&pageSize=15&api_key=DEMO_KEY");
@@ -249,13 +284,7 @@ async function searchUSDA(query) {
         calories: get("Energy"), protein: get("Protein"), carbs: get("Carbohydrate, by difference"),
         fat: get("Total lipid (fat)"), fiber: get("Fiber, total dietary"),
         state: cooked ? "Cooked" : (desc.indexOf("raw") >= 0 ? "Raw" : "\u2014"),
-        servingSizes: [
-          { label: "100g", grams: 100 },
-          { label: "1 oz (28g)", grams: 28 },
-          { label: "4 oz (113g)", grams: 113 },
-          { label: "6 oz (170g)", grams: 170 },
-          { label: "8 oz (227g)", grams: 227 },
-        ],
+        servingSizes: usdaServingSizes(f),
       };
     });
   } catch (e) { return []; }
@@ -268,8 +297,6 @@ async function searchOpenFoodFacts(query) {
     return (d.products || []).filter(function(p){ return p.nutriments; }).map(function(p) {
       const n = p.nutriments;
       const name = p.product_name || "Unknown";
-      const sizes = [{ label: "100g", grams: 100 }];
-      if (p.serving_quantity) sizes.push({ label: "1 serving (" + p.serving_quantity + "g)", grams: parseFloat(p.serving_quantity) });
       return {
         id: "off_" + (p._id || p.code), name: name, brand: p.brands || "",
         source: "Open Food Facts", per100g: true,
@@ -279,7 +306,7 @@ async function searchOpenFoodFacts(query) {
         fat: round1(n.fat_100g || 0),
         fiber: round1(n.fiber_100g || 0),
         state: "\u2014",
-        servingSizes: sizes,
+        servingSizes: offServingSizes(p),
       };
     });
   } catch (e) { return []; }
@@ -291,8 +318,6 @@ async function searchBarcode(code) {
     const d = await r.json();
     if (d.status !== 1) return null;
     const p = d.product, n = p.nutriments;
-    const sizes = [{ label: "100g", grams: 100 }];
-    if (p.serving_quantity) sizes.push({ label: "1 serving (" + p.serving_quantity + "g)", grams: parseFloat(p.serving_quantity) });
     return {
       id: "off_" + p.code, name: p.product_name || "Unknown", brand: p.brands || "",
       source: "Open Food Facts (Barcode)", per100g: true,
@@ -302,7 +327,7 @@ async function searchBarcode(code) {
       fat: round1(n.fat_100g || 0),
       fiber: round1(n.fiber_100g || 0),
       state: "\u2014",
-      servingSizes: sizes,
+      servingSizes: offServingSizes(p),
     };
   } catch (e) { return null; }
 }
@@ -1133,7 +1158,7 @@ actions.doFoodSearch = async function() {
   rerender();
 };
 
-actions.openWizard = function(type) { foodUi().wizardType = type; foodUi().wizard = { step: 0, selections: {}, weight: "100", showAI: false, aiDesc: "", aiLoading: false, aiError: null, searchResults: [], searching: false, selectedFood: null }; rerender(); };
+actions.openWizard = function(type) { foodUi().wizardType = type; foodUi().wizard = { step: 0, selections: {}, weight: "", showAI: false, aiDesc: "", aiLoading: false, aiError: null, searchResults: [], searching: false, selectedFood: null }; rerender(); };
 actions.closeWizard = function() { foodUi().wizardType = null; rerender(); };
 
 actions.openAIScreen = function() { foodUi().showAI = true; rerender(); };
@@ -1231,7 +1256,8 @@ async function handleBarcodeDetected(code) {
   if (remembered) {
     fu.scanningBarcode = false;
     fu.addingFood = remembered;
-    fu.addWeight = String(remembered.loggedWeight || (remembered.servingSizes && remembered.servingSizes[0] && remembered.servingSizes[0].grams) || 100);
+    fu.addWeight = String(remembered.loggedWeight || (remembered.servingSizes && remembered.servingSizes[0] && remembered.servingSizes[0].grams) || "");
+    pendingFocusId = "addWeightInput";
     rerender();
     return;
   }
@@ -1248,7 +1274,8 @@ async function handleBarcodeDetected(code) {
   }
   fu.scanningBarcode = false;
   fu.addingFood = food;
-  fu.addWeight = String((food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams) || 100);
+  fu.addWeight = "";
+  pendingFocusId = "addWeightInput";
   rerender();
 }
 
@@ -1461,10 +1488,17 @@ actions.selectIngredientFood = function(foodId, srcTab) {
   if (!food && srcTab === "favorites") food = state.favorites.find(function(f){ return f.id === foodId; });
   if (!food) return;
   pk.selecting = food;
-  pk.weight = String((food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams) || 100);
+  pk.weight = "";
+  pendingFocusId = "ingredientWeightInput";
   rerender();
 };
-inputActions.ingredientWeight = function(val) { const rb = foodUi().recipeBuilder; if (rb && rb.picker) rb.picker.weight = val; };
+inputActions.ingredientWeight = function(val) {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker) return;
+  rb.picker.weight = val;
+  const btnEl = document.getElementById("confirmAddIngredientBtn");
+  if (btnEl) btnEl.disabled = !(parseFloat(val) > 0);
+};
 actions.setIngredientWeight = function(grams) {
   const rb = foodUi().recipeBuilder;
   if (rb && rb.picker) { rb.picker.weight = grams; rerender(); }
@@ -1473,7 +1507,8 @@ actions.confirmAddIngredient = function() {
   const rb = foodUi().recipeBuilder;
   if (!rb || !rb.picker || !rb.picker.selecting) return;
   const food = rb.picker.selecting;
-  const w = parseFloat(rb.picker.weight) || 0;
+  const w = parseFloat(rb.picker.weight);
+  if (!w || w <= 0) return;
   const m = calcMacrosForWeight(food, w);
   rb.ingredients.push({ id: "ing_" + Date.now() + "_" + Math.random().toString(36).slice(2,7), name: food.name, weight: w, calories: m.calories, protein: m.protein, carbs: m.carbs, fat: m.fat, fiber: m.fiber || 0 });
   rb.picker = null;
@@ -1515,11 +1550,11 @@ function renderIngredientPickerScreen(fu, rb) {
       }).join('') +
     '</div>';
     inner += '<div class="row" style="align-items:center;margin-bottom:20px">' +
-      textInput({ value: pk.weight, type: "number", bind: "ingredientWeight", enter: "confirmAddIngredient", style: "flex:1" }) +
+      textInput({ id: "ingredientWeightInput", value: pk.weight, type: "number", bind: "ingredientWeight", enter: "confirmAddIngredient", style: "flex:1" }) +
       '<span style="color:' + C.textMut + '">grams</span></div>';
     inner += '<div style="text-align:center;margin-bottom:16px"><div style="font-size:28px;font-weight:800;color:' + C.calories + '">' + m.calories + ' kcal</div></div>';
     inner += '<div style="display:flex;justify-content:space-around;margin-bottom:20px">' + macroStat("Protein", m.protein, C.protein) + macroStat("Carbs", m.carbs, C.carbs) + macroStat("Fat", m.fat, C.fat) + '</div>';
-    inner += btn({ label: "Add Ingredient", action: "confirmAddIngredient", full: true });
+    inner += btn({ id: "confirmAddIngredientBtn", label: "Add Ingredient", action: "confirmAddIngredient", full: true, disabled: !(parseFloat(pk.weight) > 0) });
     html += card(inner);
     return html;
   }
@@ -1633,7 +1668,8 @@ actions.selectFoodForAdd = function(foodId, srcTab) {
   if (!food) food = state.foodCache[foodId];
   if (!food) return;
   fu.addingFood = food;
-  fu.addWeight = String(food.loggedWeight || (food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams) || 100);
+  fu.addWeight = food.loggedWeight ? String(food.loggedWeight) : "";
+  pendingFocusId = "addWeightInput";
   rerender();
 };
 
@@ -1663,7 +1699,7 @@ function renderAddingFoodScreen(fu) {
     '</div>' +
     '<div class="row">' +
       btn({ label: isFav ? "\u2605" : "\u2606", action: "toggleFavorite", arg: food.id }) +
-      btn({ label: "Add to Log", action: "confirmAddFood", full: true }) +
+      btn({ id: "confirmAddBtn", label: "Add to Log", action: "confirmAddFood", full: true, disabled: !(w > 0) }) +
     '</div>'
   );
   return html;
@@ -1673,14 +1709,20 @@ function macroStat(label, value, color) {
   return '<div style="text-align:center"><div style="color:' + color + ';font-size:20px;font-weight:700">' + value + 'g</div><div style="color:' + C.textMut + ';font-size:12px">' + label + '</div></div>';
 }
 
-inputActions.addWeight = function(val) { foodUi().addWeight = val; };
+inputActions.addWeight = function(val) {
+  const fu = foodUi();
+  fu.addWeight = val;
+  const btnEl = document.getElementById("confirmAddBtn");
+  if (btnEl) btnEl.disabled = !(parseFloat(val) > 0);
+};
 actions.setAddWeight = function(grams) { foodUi().addWeight = grams; rerender(); };
 
 actions.confirmAddFood = function() {
   const fu = foodUi();
   const food = fu.addingFood;
   if (!food) return;
-  const w = parseFloat(fu.addWeight) || 100;
+  const w = parseFloat(fu.addWeight);
+  if (!w || w <= 0) return;
   const m = calcMacrosForWeight(food, w);
   addFoodToLog(Object.assign({}, food, { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString() }));
   fu.addingFood = null; fu.query = ""; fu.results = [];
@@ -2025,7 +2067,7 @@ function renderWizardResults(config, wiz) {
         }).join('') +
       '</div>' +
       '<div class="row" style="align-items:center;margin-bottom:16px">' +
-        textInput({ value: wiz.weight, type: "number", bind: "wizardWeight", style: "flex:1" }) +
+        textInput({ id: "wizardWeightInput", value: wiz.weight, type: "number", bind: "wizardWeight", enter: "wizardConfirmAdd", style: "flex:1" }) +
         '<span style="color:' + C.textMut + ';font-size:14px;align-self:center">grams</span>' +
       '</div>' +
       '<div style="margin-bottom:8px"><span style="color:' + C.calories + ';font-weight:700;font-size:18px">' + m.calories + ' kcal</span></div>' +
@@ -2039,7 +2081,7 @@ function renderWizardResults(config, wiz) {
 
   html += '<div class="row" style="margin-top:16px">' +
     btn({ label: "Cancel", action: "closeWizard", outline: true, full: true }) +
-    btn({ label: "Add to Log", action: "wizardConfirmAdd", full: true, disabled: !wiz.selectedFood }) +
+    btn({ id: "wizardConfirmBtn", label: "Add to Log", action: "wizardConfirmAdd", full: true, disabled: !wiz.selectedFood || !(parseFloat(wiz.weight) > 0) }) +
   '</div>';
   return html;
 }
@@ -2071,7 +2113,7 @@ actions.wizardSelect = async function(option) {
     const merged = deduplicateFoods(usda.concat(off));
     wiz.searchResults = merged;
     wiz.searching = false;
-    if (merged.length > 0) wiz.selectedFood = merged[0];
+    if (merged.length > 0) { wiz.selectedFood = merged[0]; wiz.weight = ""; pendingFocusId = "wizardWeightInput"; }
     rerender();
   } else {
     wiz.step += 1;
@@ -2087,12 +2129,17 @@ inputActions.wizardAiDesc = function(val) {
   const btnEl = document.getElementById("wizardAiEstimateBtn");
   if (btnEl) btnEl.disabled = wiz.aiLoading || !wiz.aiDesc.trim();
 };
-inputActions.wizardWeight = function(val) { foodUi().wizard.weight = val; };
+inputActions.wizardWeight = function(val) {
+  const wiz = foodUi().wizard;
+  wiz.weight = val;
+  const btnEl = document.getElementById("wizardConfirmBtn");
+  if (btnEl) btnEl.disabled = !wiz.selectedFood || !(parseFloat(val) > 0);
+};
 actions.wizardSetWeight = function(grams) { foodUi().wizard.weight = grams; rerender(); };
 actions.wizardSelectFood = function(foodId) {
   const wiz = foodUi().wizard;
   const f = wiz.searchResults.find(function(x){ return x.id === foodId; });
-  if (f) wiz.selectedFood = f;
+  if (f) { wiz.selectedFood = f; wiz.weight = ""; pendingFocusId = "wizardWeightInput"; }
   rerender();
 };
 
@@ -2137,7 +2184,8 @@ actions.wizardConfirmAdd = function() {
   const fu = foodUi();
   const wiz = fu.wizard;
   if (!wiz.selectedFood) return;
-  const w = parseFloat(wiz.weight) || 100;
+  const w = parseFloat(wiz.weight);
+  if (!w || w <= 0) return;
   const m = calcMacrosForWeight(wiz.selectedFood, w);
   addFoodToLog(Object.assign({}, wiz.selectedFood, { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString(), wizardUsed: true }));
   fu.wizardType = null;
