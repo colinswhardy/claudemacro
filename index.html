@@ -807,7 +807,7 @@ async function estimateWithClaude(description, photoBase64, model, apiKey) {
 
 async function estimateWithGemini(description, apiKey) {
   try {
-    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey, {
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=" + apiKey, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: 'Estimate macronutrients for: "' + description + '". Return ONLY valid JSON array: [{"name":"food name","quantity_grams":number,"calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number}].' }] }],
