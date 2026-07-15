@@ -214,11 +214,11 @@ const state = {
 function saveSettings() { db.set("settings", state.settings); scheduleCloudSync("settings", pushSettingsToCloud); }
 function saveFoodLogs() { db.set("foodLogs", state.foodLogs); scheduleCloudSync("foodLogs", pushFoodLogsToCloud); }
 function saveWeights() { db.set("weights", state.weights); scheduleCloudSync("weights", pushWeightsToCloud); }
-function saveFavorites() { db.set("favorites", state.favorites); }
-function saveRecentFoods() { db.set("recentFoods", state.recentFoods); }
-function saveFoodCache() { db.set("foodCache", state.foodCache); }
-function saveRecipes() { db.set("recipes", state.recipes); }
-function saveCustomBarcodes() { db.set("customBarcodes", state.customBarcodes); }
+function saveFavorites() { db.set("favorites", state.favorites); scheduleCloudSync("favorites", pushFavoritesToCloud); }
+function saveRecentFoods() { db.set("recentFoods", state.recentFoods); scheduleCloudSync("recentFoods", pushRecentFoodsToCloud); }
+function saveFoodCache() { db.set("foodCache", state.foodCache); scheduleCloudSync("foodCache", pushFoodCacheToCloud); }
+function saveRecipes() { db.set("recipes", state.recipes); scheduleCloudSync("recipes", pushRecipesToCloud); }
+function saveCustomBarcodes() { db.set("customBarcodes", state.customBarcodes); scheduleCloudSync("customBarcodes", pushCustomBarcodesToCloud); }
 
 function cleanExpiredPhotos() {
   const now = new Date().toISOString();
@@ -458,6 +458,122 @@ function mergeSettingsFromCloud(cloudData) {
   return true;
 }
 
+// Fire-and-forget row delete; doesn't block or retry. If it fails while offline the row
+// resurfaces on the next pull -- an acceptable edge case at this scale rather than building
+// a full delete queue for a personal app used from one active device at a time.
+function scheduleCloudDelete(table, idColumn, idValue) {
+  if (!state.session) return;
+  supabaseTable(table + "?" + idColumn + "=eq." + encodeURIComponent(idValue), { method: "DELETE" });
+}
+
+// ---- Generic key/blob sync for favorites, recentFoods, foodCache (all stored as one
+// JSON blob per user in user_app_data, keyed by name -- whole-blob replace on push, so
+// removals are handled automatically without needing per-item delete calls). ----
+async function pushAppDataToCloud(key, data) {
+  if (!state.session) return { error: "Not signed in" };
+  return supabaseTable("user_app_data?on_conflict=user_id,key", {
+    method: "POST", headers: { "Prefer": "resolution=merge-duplicates" },
+    body: { user_id: state.session.userId, key: key, data: data, updated_at: new Date().toISOString() },
+  });
+}
+async function pullAppDataFromCloud(key) {
+  if (!state.session) return { error: "Not signed in" };
+  return supabaseTable("user_app_data?user_id=eq." + state.session.userId + "&key=eq." + key + "&select=data");
+}
+
+async function pushFavoritesToCloud() { return pushAppDataToCloud("favorites", state.favorites); }
+async function pullFavoritesFromCloud() { return pullAppDataFromCloud("favorites"); }
+function mergeFavoritesFromCloud(cloudArr) {
+  if (!cloudArr) return 0;
+  const localIds = new Set(state.favorites.map(function(f){ return f.id; }));
+  let added = 0;
+  const merged = state.favorites.slice();
+  cloudArr.forEach(function(f) { if (!localIds.has(f.id)) { merged.push(f); added++; } });
+  state.favorites = merged;
+  db.set("favorites", state.favorites);
+  return added;
+}
+
+async function pushRecentFoodsToCloud() { return pushAppDataToCloud("recentFoods", state.recentFoods); }
+async function pullRecentFoodsFromCloud() { return pullAppDataFromCloud("recentFoods"); }
+function mergeRecentFoodsFromCloud(cloudArr) {
+  if (!cloudArr) return 0;
+  const localIds = new Set(state.recentFoods.map(function(f){ return f.id; }));
+  let added = 0;
+  const merged = state.recentFoods.slice();
+  cloudArr.forEach(function(f) { if (!localIds.has(f.id)) { merged.push(f); added++; } });
+  state.recentFoods = merged;
+  db.set("recentFoods", state.recentFoods);
+  return added;
+}
+
+async function pushFoodCacheToCloud() { return pushAppDataToCloud("foodCache", state.foodCache); }
+async function pullFoodCacheFromCloud() { return pullAppDataFromCloud("foodCache"); }
+function mergeFoodCacheFromCloud(cloudDict) {
+  if (!cloudDict) return 0;
+  let added = 0;
+  const merged = Object.assign({}, state.foodCache);
+  Object.keys(cloudDict).forEach(function(id) { if (!merged[id]) { merged[id] = cloudDict[id]; added++; } });
+  state.foodCache = merged;
+  db.set("foodCache", state.foodCache);
+  return added;
+}
+
+// ---- Recipes: one row per recipe, upsert on push, explicit delete on removal ----
+function flattenRecipesForSync() {
+  return state.recipes.map(function(r) {
+    return { id: r.id, user_id: state.session.userId, name: r.name, ingredients: r.ingredients, created_at: r.createdAt || new Date().toISOString() };
+  });
+}
+async function pushRecipesToCloud() {
+  if (!state.session) return { error: "Not signed in" };
+  const rows = flattenRecipesForSync();
+  if (rows.length === 0) return { data: [] };
+  return supabaseTable("recipes?on_conflict=id", { method: "POST", headers: { "Prefer": "resolution=merge-duplicates" }, body: rows });
+}
+async function pullRecipesFromCloud() {
+  if (!state.session) return { error: "Not signed in" };
+  return supabaseTable("recipes?user_id=eq." + state.session.userId + "&select=id,name,ingredients,created_at");
+}
+function mergeRecipesFromCloud(cloudRows) {
+  const localIds = new Set(state.recipes.map(function(r){ return r.id; }));
+  let added = 0;
+  const merged = state.recipes.slice();
+  (cloudRows || []).forEach(function(row) {
+    if (localIds.has(row.id)) return;
+    merged.push({ id: row.id, name: row.name, ingredients: row.ingredients, createdAt: row.created_at });
+    added++;
+  });
+  state.recipes = merged;
+  db.set("recipes", state.recipes);
+  return added;
+}
+
+// ---- Custom barcodes: one row per barcode, upsert on push (no delete UI exists for these) ----
+function flattenCustomBarcodesForSync() {
+  return Object.keys(state.customBarcodes).map(function(code) {
+    return { barcode: code, user_id: state.session.userId, food: state.customBarcodes[code], created_at: new Date().toISOString() };
+  });
+}
+async function pushCustomBarcodesToCloud() {
+  if (!state.session) return { error: "Not signed in" };
+  const rows = flattenCustomBarcodesForSync();
+  if (rows.length === 0) return { data: [] };
+  return supabaseTable("custom_barcodes?on_conflict=user_id,barcode", { method: "POST", headers: { "Prefer": "resolution=merge-duplicates" }, body: rows });
+}
+async function pullCustomBarcodesFromCloud() {
+  if (!state.session) return { error: "Not signed in" };
+  return supabaseTable("custom_barcodes?user_id=eq." + state.session.userId + "&select=barcode,food");
+}
+function mergeCustomBarcodesFromCloud(cloudRows) {
+  const merged = Object.assign({}, state.customBarcodes);
+  let added = 0;
+  (cloudRows || []).forEach(function(row) { if (!merged[row.barcode]) { merged[row.barcode] = row.food; added++; } });
+  state.customBarcodes = merged;
+  db.set("customBarcodes", state.customBarcodes);
+  return added;
+}
+
 // Safe to call anytime (login, or periodically in the background).
 async function pullAndMergeAll() {
   if (!state.session) return { error: "Not signed in" };
@@ -473,14 +589,26 @@ async function pullAndMergeAll() {
     await pushSettingsToCloud();
   }
 
-  // Food logs and weights are id/date-keyed additive merges, so push-then-pull is safe:
-  // pushing first just ensures whatever's local is already in the set we pull back.
-  await Promise.all([pushFoodLogsToCloud(), pushWeightsToCloud()]);
-  const [logsPull, weightsPull] = await Promise.all([pullFoodLogsFromCloud(), pullWeightsFromCloud()]);
-  if (logsPull.error || weightsPull.error) return { error: logsPull.error || weightsPull.error };
+  // Everything else is either an id-keyed additive merge or a whole-blob replace, so
+  // push-then-pull is safe: pushing first just ensures local is already in what we pull back.
+  await Promise.all([
+    pushFoodLogsToCloud(), pushWeightsToCloud(), pushRecipesToCloud(), pushCustomBarcodesToCloud(),
+    pushFavoritesToCloud(), pushRecentFoodsToCloud(), pushFoodCacheToCloud(),
+  ]);
+  const [logsPull, weightsPull, recipesPull, barcodesPull, favsPull, recentPull, cachePull] = await Promise.all([
+    pullFoodLogsFromCloud(), pullWeightsFromCloud(), pullRecipesFromCloud(), pullCustomBarcodesFromCloud(),
+    pullFavoritesFromCloud(), pullRecentFoodsFromCloud(), pullFoodCacheFromCloud(),
+  ]);
+  const firstError = logsPull.error || weightsPull.error || recipesPull.error || barcodesPull.error || favsPull.error || recentPull.error || cachePull.error;
+  if (firstError) return { error: firstError };
 
   const logsAdded = mergeFoodLogsFromCloud(logsPull.data);
   const weightsAdded = mergeWeightsFromCloud(weightsPull.data);
+  mergeRecipesFromCloud(recipesPull.data);
+  mergeCustomBarcodesFromCloud(barcodesPull.data);
+  mergeFavoritesFromCloud(favsPull.data && favsPull.data[0] && favsPull.data[0].data);
+  mergeRecentFoodsFromCloud(recentPull.data && recentPull.data[0] && recentPull.data[0].data);
+  mergeFoodCacheFromCloud(cachePull.data && cachePull.data[0] && cachePull.data[0].data);
   state.lastSyncedAt = Date.now();
   return { data: { logsAdded: logsAdded, weightsAdded: weightsAdded } };
 }
@@ -777,32 +905,12 @@ actions.testFullSync = async function() {
   const su = strategyUi();
   su.syncTesting = true; su.syncTestMsg = null;
   rerender();
-
-  const steps = [
-    ["Settings push", pushSettingsToCloud],
-    ["Food log push", pushFoodLogsToCloud],
-    ["Weight push", pushWeightsToCloud],
-  ];
-  for (let i = 0; i < steps.length; i++) {
-    const result = await steps[i][1]();
-    if (result.error) {
-      su.syncTesting = false;
-      su.syncTestMsg = { ok: false, text: steps[i][0] + " failed: " + result.error };
-      rerender();
-      return;
-    }
-  }
-
-  const logsPull = await pullFoodLogsFromCloud();
-  const weightsPull = await pullWeightsFromCloud();
+  const result = await pullAndMergeAll();
   su.syncTesting = false;
-
-  if (logsPull.error || weightsPull.error) {
-    su.syncTestMsg = { ok: false, text: "Pushed OK, but pull-back failed: " + (logsPull.error || weightsPull.error) };
+  if (result.error) {
+    su.syncTestMsg = { ok: false, text: "Sync failed: " + result.error };
   } else {
-    const logCount = (logsPull.data || []).length;
-    const weightCount = (weightsPull.data || []).length;
-    su.syncTestMsg = { ok: true, text: "Success — synced settings, " + logCount + " food log entries, and " + weightCount + " weight entries. Check Table Editor to confirm." };
+    su.syncTestMsg = { ok: true, text: "Success — everything pushed and pulled (" + result.data.logsAdded + " food entries and " + result.data.weightsAdded + " weight entries merged in from elsewhere, if any). Check Table Editor to confirm." };
   }
   rerender();
 };
@@ -1004,6 +1112,7 @@ function addFoodToLog(food) {
 function removeFoodFromLog(entryId) {
   state.foodLogs[state.date] = (state.foodLogs[state.date] || []).filter(function(e){ return e.id !== entryId; });
   saveFoodLogs();
+  scheduleCloudDelete("food_log_entries", "id", entryId);
 }
 
 function updateFoodEntry(entryId, updates) {
@@ -1684,6 +1793,7 @@ actions.cancelRecipeBuilder = function() { foodUi().recipeBuilder = null; rerend
 actions.deleteRecipe = function(id) {
   state.recipes = state.recipes.filter(function(r){ return r.id !== id; });
   saveRecipes();
+  scheduleCloudDelete("recipes", "id", id);
   rerender();
 };
 actions.deleteRecipeFromBuilder = function() {
@@ -1691,6 +1801,7 @@ actions.deleteRecipeFromBuilder = function() {
   if (!rb || !rb.editingId) return;
   state.recipes = state.recipes.filter(function(r){ return r.id !== rb.editingId; });
   saveRecipes();
+  scheduleCloudDelete("recipes", "id", rb.editingId);
   foodUi().recipeBuilder = null;
   rerender();
 };
