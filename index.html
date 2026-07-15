@@ -1455,6 +1455,16 @@ function renderFoodTab() {
     '</div>';
 
   if (fu.subTab === "search") {
+    const dayTotals = getDayTotals(state.date);
+    const dailySet = state.settings;
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:' + C.inputBg + ';border-radius:10px;margin-bottom:12px;font-size:12px">' +
+      '<div style="display:flex;gap:10px">' +
+        '<span style="color:' + C.protein + '">P: ' + Math.round(dayTotals.protein) + '/' + dailySet.proteinTarget + 'g</span>' +
+        '<span style="color:' + C.carbs + '">C: ' + Math.round(dayTotals.carbs) + '/' + dailySet.carbsTarget + 'g</span>' +
+        '<span style="color:' + C.fat + '">F: ' + Math.round(dayTotals.fat) + '/' + dailySet.fatTarget + 'g</span>' +
+      '</div>' +
+      '<span style="color:' + C.calories + ';font-weight:600">' + Math.round(dayTotals.calories) + '/' + dailySet.calorieTarget + ' kcal</span>' +
+    '</div>';
     html += '<div class="row" style="margin-bottom:12px">' +
       textInput({ id: "foodSearchInput", value: fu.query, placeholder: "Search foods...", bind: "foodQuery", enter: "doFoodSearch", enterHint: "search", style: "flex:1" }) +
       btn({ label: fu.searching ? "..." : "\u{1F50D}", action: "doFoodSearch", disabled: fu.searching }) +
