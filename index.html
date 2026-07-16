@@ -173,7 +173,7 @@ const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
 const DEFAULT_SETTINGS = {
   calorieTarget: 1876, proteinTarget: 163, carbsTarget: 153, fatTarget: 68,
   weightUnit: "lbs", carbsDisplay: "total",
-  goalWeight: 150, goalDate: "2026-09-14",
+  goalWeight: 150, goalDate: "2026-09-14", goalRatePerWeek: "",
   startWeight: null, startDate: null,
   aiProvider: "claude-sonnet", aiEnabled: true, geminiApiKey: "", claudeApiKey: "", compareWithGemini: false,
   macroPreset: "Custom",
@@ -3716,6 +3716,125 @@ root.addEventListener("input", function(e) {
   }
 });
 
+const KCAL_PER_WEIGHT_UNIT = { lbs: 3500, kg: 7700 };
+
+// Maintenance (TDEE) estimated from Colin's own history instead of a Mifflin-type formula --
+// the app never collects height/age/sex, but it does have months of logged intake and daily
+// weigh-ins, which is strictly better data: over the last 28 full days, maintenance = average
+// logged intake minus the energy equivalent of the weight actually gained/lost across that
+// window. Days under 800 kcal are treated as incompletely logged and skipped (a partial day
+// would drag the average down and understate maintenance). Needs >= 10 usable food days and
+// two weigh-ins spanning >= 14 days; returns null rather than a garbage number below that.
+// The intake average (complete food days only) and the weight trend (first/last weigh-in in
+// the window) cover slightly different day sets -- inherent to the heuristic, fine at this
+// precision.
+function estimateMaintenanceCalories() {
+  const unit = state.settings.weightUnit || "lbs";
+  const kcalPerUnit = KCAL_PER_WEIGHT_UNIT[unit] || 3500;
+  const today = todayStr();
+  const cutoff = fmtDate(new Date(Date.now() - 28 * 86400000));
+  const calDays = [];
+  Object.keys(state.foodLogs).forEach(function(d) {
+    if (d >= cutoff && d < today) { // exclude today: it's usually mid-logging
+      const cals = (state.foodLogs[d] || []).reduce(function(s, e){ return s + (e.macros.calories || 0); }, 0);
+      if (cals >= 800) calDays.push(cals);
+    }
+  });
+  const weighDates = Object.keys(state.weights).filter(function(d){ return d >= cutoff && d <= today; }).sort();
+  if (calDays.length < 10 || weighDates.length < 2) return null;
+  const first = weighDates[0], last = weighDates[weighDates.length - 1];
+  const daysSpan = (parseDateStr(last) - parseDateStr(first)) / 86400000;
+  if (daysSpan < 14) return null;
+  const trendPerDay = (state.weights[last].weight - state.weights[first].weight) / daysSpan;
+  const avgIntake = calDays.reduce(function(a, b){ return a + b; }, 0) / calDays.length;
+  return { maintenance: Math.round(avgIntake - trendPerDay * kcalPerUnit), daysUsed: calDays.length };
+}
+
+// Two independent daily-calorie answers from the same maintenance estimate: what it takes to
+// land the goal weight ON the target date, and what the chosen change-per-week pace implies
+// (plus when that pace finishes). remaining is signed -- negative means cutting, so both
+// recommendations naturally come out below maintenance on a cut and above on a bulk.
+function computeGoalPlan(maintenance) {
+  const set = state.settings;
+  const unit = set.weightUnit || "lbs";
+  const kcalPerUnit = KCAL_PER_WEIGHT_UNIT[unit] || 3500;
+  const allDates = Object.keys(state.weights).sort();
+  const current = allDates.length ? state.weights[allDates[allDates.length - 1]].weight : null;
+  const goal = parseFloat(set.goalWeight);
+  if (current == null || !goal) return null;
+  const remaining = goal - current;
+  const plan = { current: current, goal: goal, remaining: round1(remaining), unit: unit };
+  if (set.goalDate) {
+    const days = (parseDateStr(set.goalDate) - parseDateStr(todayStr())) / 86400000;
+    if (days > 0) {
+      const ratePerWeek = remaining / (days / 7);
+      plan.byDate = { date: set.goalDate, ratePerWeek: round1(ratePerWeek), calories: Math.round(maintenance + (ratePerWeek / 7) * kcalPerUnit) };
+    }
+  }
+  const rate = Math.abs(parseFloat(set.goalRatePerWeek));
+  if (rate > 0 && remaining !== 0) {
+    const signedRate = remaining < 0 ? -rate : rate;
+    const weeks = Math.abs(remaining) / rate;
+    plan.byRate = {
+      ratePerWeek: signedRate,
+      calories: Math.round(maintenance + (signedRate / 7) * kcalPerUnit),
+      finishDate: fmtDate(new Date(Date.now() + weeks * 7 * 86400000)),
+      weeks: round1(weeks),
+    };
+  }
+  return (plan.byDate || plan.byRate) ? plan : null;
+}
+
+function goalPlanRow(calories, headline, detail) {
+  const tooLow = calories < 1200;
+  return '<div style="padding:12px 14px;background:' + C.inputBg + ';border-radius:12px;margin-top:10px">' +
+    '<div style="display:flex;justify-content:space-between;align-items:center">' +
+      '<div style="color:' + C.textSec + ';font-size:13px">' + headline + '</div>' +
+      '<div style="font-size:20px;font-weight:800;color:' + (tooLow ? C.warning : C.calories) + '">' + calories.toLocaleString() + ' <span style="font-size:12px;font-weight:400;color:' + C.textMut + '">kcal/day</span></div>' +
+    '</div>' +
+    '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">' + detail + '</div>' +
+    (tooLow ? '<div style="color:' + C.warning + ';font-size:11px;margin-top:4px">⚠ Very aggressive — consider a slower pace or later date.</div>' : '') +
+  '</div>';
+}
+
+function renderGoalPlanBlock() {
+  const unit = state.settings.weightUnit || "lbs";
+  const est = estimateMaintenanceCalories();
+  if (!est) {
+    return '<div style="color:' + C.textMut + ';font-size:12px;margin-top:12px">Calorie recommendations need more recent data — about 2+ weeks of logged food days and weigh-ins within the last 28 days.</div>';
+  }
+  let html = '<div style="margin-top:12px">' + statCard("Est. Maintenance", est.maintenance.toLocaleString() + " kcal/day") + '</div>';
+  html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px">Measured from your own last ' + est.daysUsed + ' fully-logged days vs. your actual weight change — not a formula estimate.</div>';
+  const plan = computeGoalPlan(est.maintenance);
+  if (!plan) {
+    html += '<div style="color:' + C.textMut + ';font-size:12px;margin-top:10px">Set a goal weight (and a target date or weekly pace) to get a recommended daily calorie target.</div>';
+    return html;
+  }
+  const dirWord = plan.remaining < 0 ? "lose" : "gain";
+  const fullDate = function(d) { return parseDateStr(d).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); };
+  if (plan.byDate) {
+    html += goalPlanRow(
+      plan.byDate.calories,
+      "To hit " + plan.goal + " " + unit + " by " + fullDate(plan.byDate.date),
+      "Requires " + (plan.byDate.ratePerWeek > 0 ? "+" : "") + plan.byDate.ratePerWeek + " " + unit + "/week from your current " + plan.current + " " + unit + "."
+    );
+  }
+  if (plan.byRate) {
+    html += goalPlanRow(
+      plan.byRate.calories,
+      "At " + Math.abs(plan.byRate.ratePerWeek) + " " + unit + "/week " + (plan.byRate.ratePerWeek < 0 ? "lost" : "gained"),
+      "You'd " + dirWord + " " + Math.abs(plan.remaining) + " " + unit + " in about " + plan.byRate.weeks + " weeks — done around " + fullDate(plan.byRate.finishDate) + "."
+    );
+  }
+  html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:8px">Recommendations shift automatically as your logged intake and weight trend change — check back after a week or two of new data.</div>';
+  return html;
+}
+
+function patchGoalPlanBlock() {
+  const el = document.getElementById("goalPlanBlock");
+  if (el) el.innerHTML = renderGoalPlanBlock();
+}
+
 function renderWeightGoalsSection() {
   const set = state.settings;
   const allWeights = Object.keys(state.weights).sort().map(function(d){ return [d, state.weights[d]]; });
@@ -3740,6 +3859,7 @@ function renderWeightGoalsSection() {
   if (latestWeight != null) html += statCard("Current Weight", latestWeight + " " + set.weightUnit, C.text);
   html += '<div style="margin-top:16px"><label class="label">Goal Weight (' + set.weightUnit + ')</label>' + textInput({ value: set.goalWeight, type: "number", bind: "goalWeight" }) + '</div>';
   html += '<div style="margin-top:12px"><label class="label">Target Date</label>' + textInput({ value: set.goalDate, type: "date", bind: "goalDate" }) + '</div>';
+  html += '<div style="margin-top:12px"><label class="label">Desired Change Per Week (' + set.weightUnit + ', optional)</label>' + textInput({ value: set.goalRatePerWeek, type: "number", placeholder: "e.g. 1", bind: "goalRatePerWeek" }) + '</div>';
   if (remaining != null) {
     html += '<div class="row" style="margin-top:16px">' +
       statCard("Remaining", remaining.toFixed(1) + " " + set.weightUnit) +
@@ -3749,6 +3869,10 @@ function renderWeightGoalsSection() {
   if (estGoalDate) {
     html += '<div style="margin-top:10px">' + statCard("Estimated Goal Date", estGoalDate.toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"}), C.success) + '</div>';
   }
+
+  html += '<div style="border-top:1px solid ' + C.border + ';margin:20px 0 16px"></div>';
+  html += '<div class="label" style="margin-bottom:4px;text-transform:uppercase;font-weight:600;letter-spacing:0.5px">Recommended Calories</div>';
+  html += '<div id="goalPlanBlock">' + renderGoalPlanBlock() + '</div>';
 
   html += '<div style="border-top:1px solid ' + C.border + ';margin:20px 0 16px"></div>';
   html += '<div class="label" style="margin-bottom:12px;text-transform:uppercase;font-weight:600;letter-spacing:0.5px">Starting Point</div>';
@@ -3762,8 +3886,9 @@ function renderWeightGoalsSection() {
   return card(html);
 }
 
-inputActions.goalWeight = function(v) { state.settings.goalWeight = v; saveSettings(); };
-inputActions.goalDate = function(v) { state.settings.goalDate = v; saveSettings(); };
+inputActions.goalWeight = function(v) { state.settings.goalWeight = v; saveSettings(); patchGoalPlanBlock(); };
+inputActions.goalDate = function(v) { state.settings.goalDate = v; saveSettings(); patchGoalPlanBlock(); };
+inputActions.goalRatePerWeek = function(v) { state.settings.goalRatePerWeek = v; saveSettings(); patchGoalPlanBlock(); };
 inputActions.goalsStartDate = function(v) { state.settings.startDate = v || null; saveSettings(); };
 inputActions.goalsStartWeight = function(v) { state.settings.startWeight = v ? parseFloat(v) : null; saveSettings(); };
 

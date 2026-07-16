@@ -96,6 +96,7 @@ const exportLine =
   "computeQtyWeight: computeQtyWeight, calcCaloriesFromMacros: calcCaloriesFromMacros, localFoodMatches: localFoodMatches, " +
   "mergeCustomBarcodesFromCloud: mergeCustomBarcodesFromCloud, filterFoodsByName: filterFoodsByName, " +
   "isAnimalProteinFood: isAnimalProteinFood, getDayTotals: getDayTotals, " +
+  "estimateMaintenanceCalories: estimateMaintenanceCalories, computeGoalPlan: computeGoalPlan, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -193,6 +194,84 @@ test("getDayTotals: a mixed-keyword dish is attributed fully to animal protein (
 test("getDayTotals: an empty day has zero plant-protein total, not NaN/undefined", function () {
   M.state.foodLogs = {};
   assertEqual(M.getDayTotals("2026-07-16").plantProtein, 0, "zero for a day with no entries");
+});
+
+// ==== estimateMaintenanceCalories / computeGoalPlan ====
+// Both are relative to the real current date (they window over "the last 28 days"), so the
+// synthetic logs are built with date offsets from today rather than fixed dates.
+function daysAgoStr(n) { return M.fmtDate(new Date(Date.now() - n * 86400000)); }
+function seedMaintenanceData(opts) {
+  // opts: { intake, foodDays, firstWeight, lastWeight, weightSpanDays }
+  M.state.settings = Object.assign({}, M.DEFAULT_SETTINGS, { weightUnit: "lbs" });
+  M.state.foodLogs = {};
+  for (let i = 1; i <= opts.foodDays; i++) {
+    M.state.foodLogs[daysAgoStr(i)] = [{ id: "e" + i, name: "Meal", macros: { calories: opts.intake, protein: 0, carbs: 0, fat: 0, fiber: 0 } }];
+  }
+  M.state.weights = {};
+  M.state.weights[daysAgoStr(opts.weightSpanDays)] = { weight: opts.firstWeight, unit: "lbs", timestamp: "", updatedAt: "" };
+  M.state.weights[daysAgoStr(0)] = { weight: opts.lastWeight, unit: "lbs", timestamp: "", updatedAt: "" };
+}
+test("estimateMaintenanceCalories: flat weight means maintenance equals average intake", function () {
+  seedMaintenanceData({ intake: 2000, foodDays: 20, firstWeight: 180, lastWeight: 180, weightSpanDays: 20 });
+  const est = M.estimateMaintenanceCalories();
+  assertEqual(est.maintenance, 2000, "no weight change: burning exactly what's eaten");
+  assertEqual(est.daysUsed, 20, "all complete days counted");
+});
+test("estimateMaintenanceCalories: losing weight means maintenance is above intake", function () {
+  // 2 lbs lost over 14 days while eating 2000/day: deficit was 2*3500/14 = 500/day, so TDEE ~2500
+  seedMaintenanceData({ intake: 2000, foodDays: 14, firstWeight: 182, lastWeight: 180, weightSpanDays: 14 });
+  assertEqual(M.estimateMaintenanceCalories().maintenance, 2500, "intake + measured deficit");
+});
+test("estimateMaintenanceCalories: sub-800-kcal days are treated as incomplete and skipped", function () {
+  seedMaintenanceData({ intake: 2000, foodDays: 15, firstWeight: 180, lastWeight: 180, weightSpanDays: 20 });
+  M.state.foodLogs[daysAgoStr(16)] = [{ id: "partial", name: "Snack", macros: { calories: 300, protein: 0, carbs: 0, fat: 0, fiber: 0 } }];
+  const est = M.estimateMaintenanceCalories();
+  assertEqual(est.daysUsed, 15, "the 300-kcal day is excluded");
+  assertEqual(est.maintenance, 2000, "average is not dragged down by the partial day");
+});
+test("estimateMaintenanceCalories: returns null with too few logged days", function () {
+  seedMaintenanceData({ intake: 2000, foodDays: 5, firstWeight: 180, lastWeight: 180, weightSpanDays: 20 });
+  assertEqual(M.estimateMaintenanceCalories(), null, "5 food days is below the 10-day minimum");
+});
+test("estimateMaintenanceCalories: returns null when weigh-ins span under 14 days", function () {
+  seedMaintenanceData({ intake: 2000, foodDays: 20, firstWeight: 180, lastWeight: 180, weightSpanDays: 7 });
+  assertEqual(M.estimateMaintenanceCalories(), null, "a 7-day weight window is too noisy to trust");
+});
+test("computeGoalPlan: by-date recommendation puts a cut below maintenance", function () {
+  seedMaintenanceData({ intake: 2000, foodDays: 20, firstWeight: 180, lastWeight: 180, weightSpanDays: 20 });
+  M.state.settings.goalWeight = 170;
+  M.state.settings.goalDate = daysAgoStr(-70); // 70 days out = 10 weeks
+  M.state.settings.goalRatePerWeek = "";
+  const plan = M.computeGoalPlan(2500);
+  assertEqual(plan.byDate.ratePerWeek, -1, "10 lbs over 10 weeks = 1 lb/week loss");
+  assertEqual(plan.byDate.calories, 2000, "maintenance 2500 minus a 500/day deficit");
+  assertEqual(plan.byRate, undefined, "no rate chosen, no by-rate row");
+});
+test("computeGoalPlan: by-rate recommendation includes pace, calories, and projected weeks", function () {
+  seedMaintenanceData({ intake: 2000, foodDays: 20, firstWeight: 180, lastWeight: 180, weightSpanDays: 20 });
+  M.state.settings.goalWeight = 170;
+  M.state.settings.goalDate = "";
+  M.state.settings.goalRatePerWeek = "2";
+  const plan = M.computeGoalPlan(2500);
+  assertEqual(plan.byRate.ratePerWeek, -2, "direction inferred from goal being below current");
+  assertEqual(plan.byRate.calories, 1500, "maintenance 2500 minus a 1000/day deficit");
+  assertEqual(plan.byRate.weeks, 5, "10 lbs at 2/week");
+});
+test("computeGoalPlan: a bulk goal comes out above maintenance", function () {
+  seedMaintenanceData({ intake: 2000, foodDays: 20, firstWeight: 180, lastWeight: 180, weightSpanDays: 20 });
+  M.state.settings.goalWeight = 190;
+  M.state.settings.goalDate = "";
+  M.state.settings.goalRatePerWeek = "1";
+  const plan = M.computeGoalPlan(2500);
+  assertEqual(plan.byRate.ratePerWeek, 1, "positive rate for a bulk");
+  assertEqual(plan.byRate.calories, 3000, "maintenance 2500 plus a 500/day surplus");
+});
+test("computeGoalPlan: a target date in the past yields no by-date row (and null with no rate either)", function () {
+  seedMaintenanceData({ intake: 2000, foodDays: 20, firstWeight: 180, lastWeight: 180, weightSpanDays: 20 });
+  M.state.settings.goalWeight = 170;
+  M.state.settings.goalDate = daysAgoStr(5); // already passed
+  M.state.settings.goalRatePerWeek = "";
+  assertEqual(M.computeGoalPlan(2500), null, "nothing actionable to recommend");
 });
 
 // ==== parseCsvLine ====
