@@ -95,6 +95,7 @@ const exportLine =
   "computeNavDepth: computeNavDepth, collapseOneNavLevel: collapseOneNavLevel, showToast: showToast, fmtDate: fmtDate, " +
   "computeQtyWeight: computeQtyWeight, calcCaloriesFromMacros: calcCaloriesFromMacros, localFoodMatches: localFoodMatches, " +
   "mergeCustomBarcodesFromCloud: mergeCustomBarcodesFromCloud, filterFoodsByName: filterFoodsByName, " +
+  "isAnimalProteinFood: isAnimalProteinFood, getDayTotals: getDayTotals, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -144,6 +145,54 @@ test("round1: rounds to one decimal place", function () {
   assertEqual(M.round1(1.24), 1.2, "round down");
   assertEqual(M.round1(1.25), 1.3, "round half up");
   assertEqual(M.round1(1.26), 1.3, "round up");
+});
+
+// ==== isAnimalProteinFood / getDayTotals plant-protein rollup ====
+test("isAnimalProteinFood: matches an obvious meat food", function () {
+  assertEqual(M.isAnimalProteinFood("Grilled Chicken Breast"), true, "chicken matches");
+  assertEqual(M.isAnimalProteinFood("Beef Steak"), true, "beef matches");
+});
+test("isAnimalProteinFood: matches dairy, egg, and fish/seafood", function () {
+  assertEqual(M.isAnimalProteinFood("Greek Yogurt"), true, "dairy matches");
+  assertEqual(M.isAnimalProteinFood("Scrambled Eggs"), true, "egg matches");
+  assertEqual(M.isAnimalProteinFood("Grilled Salmon"), true, "fish matches");
+});
+test("isAnimalProteinFood: plant foods with no animal keyword are not flagged", function () {
+  assertEqual(M.isAnimalProteinFood("Lentil Soup"), false, "lentils");
+  assertEqual(M.isAnimalProteinFood("Black Beans"), false, "beans");
+  assertEqual(M.isAnimalProteinFood("Tofu Stir Fry"), false, "tofu");
+});
+test("isAnimalProteinFood: word-boundary guards against substring false positives", function () {
+  assertEqual(M.isAnimalProteinFood("Roasted Eggplant Curry"), false, "\"egg\" inside \"eggplant\" must not match (Eggplant Parmesan would legitimately match on \"parmesan\" instead, so it's not a clean test case)");
+  assertEqual(M.isAnimalProteinFood("Hamster Food"), false, "\"ham\" inside \"hamster\" must not match (contrived, but guards the regex)");
+});
+test("isAnimalProteinFood: compound words without a natural boundary are still caught", function () {
+  assertEqual(M.isAnimalProteinFood("Hamburger"), true, "\"ham\" alone wouldn't match inside \"hamburger\" without the explicit compound entry");
+  assertEqual(M.isAnimalProteinFood("Cheeseburger"), true, "same issue for \"cheese\" inside \"cheeseburger\"");
+});
+test("isAnimalProteinFood: case-insensitive", function () {
+  assertEqual(M.isAnimalProteinFood("CHICKEN BREAST"), true, "matches regardless of case");
+});
+test("getDayTotals: plant-protein total only counts entries without an animal keyword", function () {
+  M.state.foodLogs = { "2026-07-16": [
+    { id: "e1", name: "Chicken Breast", macros: { calories: 200, protein: 40, carbs: 0, fat: 4, fiber: 0 } },
+    { id: "e2", name: "Black Beans", macros: { calories: 150, protein: 10, carbs: 27, fat: 1, fiber: 8 } },
+    { id: "e3", name: "Almonds", macros: { calories: 170, protein: 6, carbs: 6, fat: 15, fiber: 3 } },
+  ] };
+  const totals = M.getDayTotals("2026-07-16");
+  assertEqual(totals.protein, 56, "protein still sums everything");
+  assertEqual(totals.plantProtein, 16, "plant-protein total excludes the chicken entry's 40g");
+});
+test("getDayTotals: a mixed-keyword dish is attributed fully to animal protein (floor, not exact)", function () {
+  M.state.foodLogs = { "2026-07-16": [
+    { id: "e1", name: "Chicken and Black Bean Burrito", macros: { calories: 400, protein: 30, carbs: 40, fat: 10, fiber: 6 } },
+  ] };
+  const totals = M.getDayTotals("2026-07-16");
+  assertEqual(totals.plantProtein, 0, "any animal keyword match attributes the whole entry to animal protein");
+});
+test("getDayTotals: an empty day has zero plant-protein total, not NaN/undefined", function () {
+  M.state.foodLogs = {};
+  assertEqual(M.getDayTotals("2026-07-16").plantProtein, 0, "zero for a day with no entries");
 });
 
 // ==== parseCsvLine ====

@@ -1214,17 +1214,44 @@ actions.goToday = function() {
 // ============================================================
 // DATA HELPERS
 // ============================================================
+// No food database (USDA, Open Food Facts) reports protein "by source" -- this is a best-effort
+// guess from the food's name, not real nutrition data. Meat, dairy, egg, and fish/seafood
+// keywords all count as animal protein (eggs and fish aren't literally meat or dairy, but
+// Colin confirmed they should count the same way, making the complement effectively "plant
+// protein"). Word-boundary matching (\b) specifically to avoid false positives like "egg"
+// matching inside "eggplant" or "ham" matching inside "hamster"/"shame". A handful of solid
+// compound words (milkshake, cheeseburger, eggnog) are listed explicitly since \b wouldn't
+// otherwise catch them (no boundary between "milk" and "shake" in "milkshake").
+// Mixed dishes (e.g. "Chicken and Black Bean Burrito") are attributed entirely to animal
+// protein if ANY animal keyword matches -- meaning the plant-protein total is a floor, not
+// exact, and skews low on mixed dishes rather than high.
+const ANIMAL_PROTEIN_RE = new RegExp(
+  "\\b(chicken|turkey|beef|steak|pork|ham|bacon|sausage|lamb|veal|duck|meat|jerky|salami|" +
+  "pepperoni|prosciutto|chorizo|brisket|ribs|meatball|ground beef|mince|" +
+  "fish|salmon|tuna|shrimp|prawn|crab|lobster|cod|tilapia|sardine|anchovy|trout|halibut|" +
+  "mahi|scallop|oyster|mussel|clam|seafood|calamari|squid|" +
+  "milk|cheese|yogurt|yoghurt|cream|butter|ghee|whey|casein|kefir|mozzarella|cheddar|" +
+  "parmesan|ricotta|custard|" +
+  "egg|eggs|omelet|omelette|frittata|" +
+  "milkshake|cheeseburger|hamburger|eggnog|buttermilk)\\b", "i"
+);
+function isAnimalProteinFood(name) {
+  return ANIMAL_PROTEIN_RE.test(name || "");
+}
+
 function getDayTotals(date) {
   const entries = state.foodLogs[date] || [];
   return entries.reduce(function(acc, e) {
+    const protein = e.macros.protein || 0;
     return {
       calories: acc.calories + (e.macros.calories || 0),
-      protein: acc.protein + (e.macros.protein || 0),
+      protein: acc.protein + protein,
       carbs: acc.carbs + (e.macros.carbs || 0),
       fat: acc.fat + (e.macros.fat || 0),
       fiber: acc.fiber + (e.macros.fiber || 0),
+      plantProtein: acc.plantProtein + (isAnimalProteinFood(e.name) ? 0 : protein),
     };
-  }, { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 });
+  }, { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0, plantProtein: 0 });
 }
 
 function addFoodToLog(food) {
@@ -1296,7 +1323,7 @@ function renderDashboard() {
       '</div>' +
     '</div>' +
     progressBar(totals.calories, set.calorieTarget, C.calories, "Calories", "", " kcal") +
-    progressBar(totals.protein, set.proteinTarget, C.protein, "Protein") +
+    progressBar(totals.protein, set.proteinTarget, C.protein, "Protein", totals.plantProtein > 0 ? "(" + Math.round(totals.plantProtein) + "g plant-based)" : "") +
     progressBar(totals.carbs, set.carbsTarget, C.carbs, "Carbs", totals.fiber > 0 ? "(" + Math.round(totals.fiber) + "g fiber)" : "") +
     progressBar(totals.fat, set.fatTarget, C.fat, "Fat")
   );
