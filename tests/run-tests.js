@@ -93,7 +93,7 @@ const exportLine =
   "mergeFoodLogsFromCloud: mergeFoodLogsFromCloud, mergeWeightsFromCloud: mergeWeightsFromCloud, mergeRecipesFromCloud: mergeRecipesFromCloud, " +
   "wasRecentlyDeleted: wasRecentlyDeleted, markRecentlyDeleted: markRecentlyDeleted, recentlyDeletedIds: recentlyDeletedIds, " +
   "computeNavDepth: computeNavDepth, collapseOneNavLevel: collapseOneNavLevel, showToast: showToast, fmtDate: fmtDate, " +
-  "computeQtyWeight: computeQtyWeight, " +
+  "computeQtyWeight: computeQtyWeight, calcCaloriesFromMacros: calcCaloriesFromMacros, localFoodMatches: localFoodMatches, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -286,6 +286,46 @@ test("computeQtyWeight: fractional quantity rounds to one decimal", function () 
 test("computeQtyWeight: blank/invalid quantity treated as zero", function () {
   assertEqual(M.computeQtyWeight("", 33), 0, "empty string");
   assertEqual(M.computeQtyWeight("abc", 33), 0, "non-numeric");
+});
+
+// ==== calcCaloriesFromMacros (auto-calculated calories in Manual Entry / custom barcode) ====
+test("calcCaloriesFromMacros: applies Atwater factors (4/4/9)", function () {
+  assertEqual(M.calcCaloriesFromMacros(20, 10, 5), 165, "20p*4 + 10c*4 + 5f*9 = 80+40+45");
+});
+test("calcCaloriesFromMacros: blank fields treated as zero, no crash", function () {
+  assertEqual(M.calcCaloriesFromMacros("", "10", ""), 40, "only carbs counted");
+  assertEqual(M.calcCaloriesFromMacros("", "", ""), 0, "all blank is zero, not NaN");
+});
+
+// ==== localFoodMatches (instant recent/favorites/cache matches while typing) ====
+test("localFoodMatches: matches a previously-logged food by substring, case-insensitively", function () {
+  M.state.recentFoods = [{ id: "r1", name: "Ice Cream", source: "USDA", calories: 200, protein: 4, carbs: 24, fat: 11 }];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+  const matches = M.localFoodMatches("ice");
+  assertEqual(matches.length, 1, "one recent match");
+  assertEqual(matches[0].name, "Ice Cream", "matched the recent item");
+});
+test("localFoodMatches: does not duplicate a food present in both recentFoods and favorites", function () {
+  const food = { id: "f1", name: "Almonds", source: "USDA", calories: 579, protein: 21, carbs: 22, fat: 50 };
+  M.state.recentFoods = [food];
+  M.state.favorites = [food];
+  M.state.foodCache = {};
+  assertEqual(M.localFoodMatches("almond").length, 1, "de-duplicated by id across lists");
+});
+test("localFoodMatches: tags a foodCache-only hit as Cached without mutating the cached entry", function () {
+  M.state.recentFoods = [];
+  M.state.favorites = [];
+  M.state.foodCache = { c1: { id: "c1", name: "Quinoa", source: "USDA", calories: 120, protein: 4, carbs: 21, fat: 2 } };
+  const matches = M.localFoodMatches("quinoa");
+  assertEqual(matches[0].source, "USDA (Cached)", "cached source suffix applied");
+  assertEqual(M.state.foodCache.c1.source, "USDA", "original cache entry left untouched");
+});
+test("localFoodMatches: no match returns an empty array", function () {
+  M.state.recentFoods = [{ id: "r1", name: "Ice Cream", source: "USDA", calories: 200, protein: 4, carbs: 24, fat: 11 }];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+  assertEqual(M.localFoodMatches("zzz").length, 0, "no substring match");
 });
 
 // ==== navigation depth (back-button model) ====

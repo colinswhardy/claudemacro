@@ -1614,7 +1614,7 @@ function renderFoodTab() {
     '</div>';
     html += '<div class="row" style="margin-bottom:12px">' +
       textInput({ id: "foodSearchInput", value: fu.query, placeholder: "Search foods...", bind: "foodQuery", enter: "doFoodSearch", enterHint: "search", style: "flex:1" }) +
-      btn({ label: fu.searching ? "..." : "\u{1F50D}", action: "doFoodSearch", disabled: fu.searching }) +
+      btn({ id: "foodSearchBtn", label: fu.searching ? "..." : "\u{1F50D}", action: "doFoodSearch", disabled: fu.searching }) +
       '</div>';
     html += '<input type="file" accept="image/*" capture="environment" id="aiPhotoInput" data-change="aiPhoto" style="display:none">';
     html += '<div class="rowWrap" style="margin-bottom:16px">';
@@ -1624,33 +1624,7 @@ function renderFoodTab() {
     if (state.settings.aiEnabled) html += btn({ label: "\u{1F4F8} Photo", action: "clickPhotoInput", small: true, outline: true });
     html += '</div>';
 
-    if (fu.wizardSuggestion && fu.results.length > 0) {
-      const wc = WIZARD_CONFIGS[fu.wizardSuggestion];
-      html += '<div style="padding:12px;background:' + C.primary + '11;border:1px solid ' + C.primary + '33;border-radius:12px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">' +
-        '<span style="color:' + C.textSec + ';font-size:13px">' + wc.icon + ' Use ' + esc(wc.label) + ' Selection?</span>' +
-        btn({ label: "Open", action: "openWizard", arg: fu.wizardSuggestion, small: true }) +
-        '</div>';
-    }
-
-    fu.results.forEach(function(food) {
-      html += '<div class="foodResult" data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '">' +
-        '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
-          '<div style="flex:1;min-width:0">' +
-            '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(food.name) + '</div>' +
-            (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px">' + esc(food.brand) + '</div>' : '') +
-            '<div class="rowWrap" style="margin-top:6px">' + badge(food.state, food.state === "Cooked" ? C.warning : food.state === "Raw" ? C.success : C.textMut) + badge(food.source) + '</div>' +
-          '</div>' +
-          '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + food.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">kcal/100g</div></div>' +
-        '</div>' +
-        '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
-          '<span style="color:' + C.protein + '">P: ' + food.protein + 'g</span>' +
-          '<span style="color:' + C.carbs + '">C: ' + food.carbs + 'g</span>' +
-          '<span style="color:' + C.fat + '">F: ' + food.fat + 'g</span>' +
-        '</div></div>';
-    });
-
-    if (fu.searching) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">Searching databases...</div>';
-    else if (fu.results.length === 0 && fu.query) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No results. Try AI estimation or manual entry.</div>';
+    html += '<div id="foodResultsBlock">' + renderFoodResultsBlock(fu) + '</div>';
   }
 
   if (fu.subTab === "history") {
@@ -1728,24 +1702,125 @@ function subTabBtn(key, label) {
   return '<button class="subTabBtn' + (foodUi().subTab === key ? ' active' : '') + '" data-action="setFoodSubTab" data-arg="' + key + '">' + label + '</button>';
 }
 
+// Split out of renderFoodTab so it can be patched into #foodResultsBlock directly as the user
+// types, instead of a full rerender() -- rerendering the whole #app mid-keystroke would blur
+// the search input and, on mobile, can dismiss the keyboard.
+function renderFoodResultsBlock(fu) {
+  let html = '';
+  if (fu.wizardSuggestion && fu.results.length > 0) {
+    const wc = WIZARD_CONFIGS[fu.wizardSuggestion];
+    html += '<div style="padding:12px;background:' + C.primary + '11;border:1px solid ' + C.primary + '33;border-radius:12px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">' +
+      '<span style="color:' + C.textSec + ';font-size:13px">' + wc.icon + ' Use ' + esc(wc.label) + ' Selection?</span>' +
+      btn({ label: "Open", action: "openWizard", arg: fu.wizardSuggestion, small: true }) +
+      '</div>';
+  }
+
+  fu.results.forEach(function(food) {
+    html += '<div class="foodResult" data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '">' +
+      '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+        '<div style="flex:1;min-width:0">' +
+          '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(food.name) + '</div>' +
+          (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px">' + esc(food.brand) + '</div>' : '') +
+          '<div class="rowWrap" style="margin-top:6px">' + badge(food.state, food.state === "Cooked" ? C.warning : food.state === "Raw" ? C.success : C.textMut) + badge(food.source) + '</div>' +
+        '</div>' +
+        '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + food.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">kcal/100g</div></div>' +
+      '</div>' +
+      '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
+        '<span style="color:' + C.protein + '">P: ' + food.protein + 'g</span>' +
+        '<span style="color:' + C.carbs + '">C: ' + food.carbs + 'g</span>' +
+        '<span style="color:' + C.fat + '">F: ' + food.fat + 'g</span>' +
+      '</div></div>';
+  });
+
+  if (fu.searching) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">Searching databases...</div>';
+  else if (fu.results.length === 0 && fu.query) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No results. Try AI estimation or manual entry.</div>';
+  return html;
+}
+function patchFoodResultsBlock() {
+  const fu = foodUi();
+  const el = document.getElementById("foodResultsBlock");
+  if (el) el.innerHTML = renderFoodResultsBlock(fu);
+  const btnEl = document.getElementById("foodSearchBtn");
+  if (btnEl) { btnEl.disabled = fu.searching; btnEl.textContent = fu.searching ? "..." : "\u{1F50D}"; }
+}
+
+// Instant, synchronous matches against foods already logged, favorited, or fetched before --
+// shown immediately as the user types (e.g. "ice-" surfaces a previously-added "Ice Cream")
+// with no network round trip. The debounced live database search below layers remote hits on
+// top of this once the user pauses typing.
+function localFoodMatches(q) {
+  const seen = new Set();
+  const out = [];
+  function addFrom(list, cached) {
+    list.forEach(function(f) {
+      if (seen.has(f.id) || f.name.toLowerCase().indexOf(q) < 0) return;
+      seen.add(f.id);
+      out.push(cached ? Object.assign({}, f, { source: f.source + " (Cached)" }) : f);
+    });
+  }
+  addFrom(state.recentFoods, false);
+  addFrom(state.favorites, false);
+  addFrom(Object.values(state.foodCache), true);
+  return out;
+}
+
 actions.setFoodSubTab = function(key) { foodUi().subTab = key; rerender(); };
-inputActions.foodQuery = function(val) { foodUi().query = val; };
+
+let foodSearchDebounceTimer = null;
+let foodSearchSeq = 0;
+
+inputActions.foodQuery = function(val) {
+  const fu = foodUi();
+  fu.query = val;
+  fu.wizardSuggestion = detectWizard(val);
+  foodSearchSeq++; // invalidate any live search still in flight from an earlier keystroke
+  clearTimeout(foodSearchDebounceTimer);
+
+  const q = val.trim().toLowerCase();
+  fu.results = q.length >= 2 ? localFoodMatches(q) : [];
+  fu.searching = false;
+  patchFoodResultsBlock();
+
+  if (q.length < 3) return; // too short to bother the (rate-limited) remote databases
+  const mySeq = foodSearchSeq;
+  foodSearchDebounceTimer = setTimeout(function() { liveFoodSearch(q, mySeq); }, 450);
+};
+
+// Debounced as-you-type database search, fired from inputActions.foodQuery after a pause in
+// typing so a fast typist doesn't send a USDA + Open Food Facts request per keystroke -- USDA
+// in particular runs on a shared, rate-limited demo key (see CLAUDE.md). mySeq guards against
+// an older, slower request resolving after a newer one and clobbering fresher results with
+// stale ones -- a real risk once searches can overlap, unlike the old tap/Enter-only flow.
+async function liveFoodSearch(q, mySeq) {
+  const fu = foodUi();
+  fu.searching = true;
+  patchFoodResultsBlock();
+  const usdaP = searchUSDA(q);
+  const offP = searchOpenFoodFacts(q);
+  const usda = await usdaP, off = await offP;
+  if (mySeq !== foodSearchSeq) return; // superseded by further typing or an explicit search
+  fu.results = deduplicateFoods(localFoodMatches(q).concat(usda, off));
+  fu.searching = false;
+  patchFoodResultsBlock();
+}
 
 actions.doFoodSearch = async function() {
   const fu = foodUi();
-  if (!fu.query.trim()) return;
+  const q = fu.query.trim();
+  if (!q) return;
+  clearTimeout(foodSearchDebounceTimer);
+  const mySeq = ++foodSearchSeq;
+  const qLower = q.toLowerCase();
   fu.searching = true;
   fu.wizardSuggestion = detectWizard(fu.query);
-  const cacheResults = Object.values(state.foodCache).filter(function(f){
-    return f.name.toLowerCase().indexOf(fu.query.toLowerCase()) >= 0;
-  }).map(function(f){ return Object.assign({}, f, { source: f.source + " (Cached)" }); });
-  fu.results = cacheResults;
+  fu.results = localFoodMatches(qLower);
   rerender();
 
-  const usdaP = searchUSDA(fu.query);
-  const offP = searchOpenFoodFacts(fu.query);
+  const usdaP = searchUSDA(q);
+  const offP = searchOpenFoodFacts(q);
   const usda = await usdaP, off = await offP;
-  fu.results = deduplicateFoods(cacheResults.concat(usda, off));
+  if (mySeq !== foodSearchSeq) return; // superseded by further typing or another explicit search
+  fu.results = deduplicateFoods(localFoodMatches(qLower).concat(usda, off));
   fu.searching = false;
   rerender();
 };
@@ -1775,11 +1850,12 @@ function renderBarcodeScanScreen(fu) {
         '<div><label class="label">Food Name</label>' + textInput({ value: m.name, placeholder: "e.g. Trail Mix", bind: "customBarcodeName", enter: "saveCustomBarcode" }) + '</div>' +
         '<div><label class="label">Weight (g)</label>' + textInput({ value: m.weight, type: "number", bind: "customBarcodeWeight", enter: "saveCustomBarcode" }) + '</div>' +
         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
-          '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' + textInput({ value: m.calories, type: "number", bind: "customBarcodeCalories", enter: "saveCustomBarcode" }) + '</div>' +
+          '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' + textInput({ id: "customBarcodeCaloriesInput", value: m.calories, type: "number", bind: "customBarcodeCalories", enter: "saveCustomBarcode" }) + '</div>' +
           '<div><label class="label" style="color:' + C.protein + '">Protein (g)</label>' + textInput({ value: m.protein, type: "number", bind: "customBarcodeProtein", enter: "saveCustomBarcode" }) + '</div>' +
           '<div><label class="label" style="color:' + C.carbs + '">Carbs (g)</label>' + textInput({ value: m.carbs, type: "number", bind: "customBarcodeCarbs", enter: "saveCustomBarcode" }) + '</div>' +
           '<div><label class="label" style="color:' + C.fat + '">Fat (g)</label>' + textInput({ value: m.fat, type: "number", bind: "customBarcodeFat", enter: "saveCustomBarcode" }) + '</div>' +
         '</div>' +
+        '<div style="color:' + C.textMut + ';font-size:11px">Calories auto-calculate from protein/carbs/fat — edit it directly to override.</div>' +
       '</div>';
     inner += '<div class="row" style="margin-top:16px">' +
       btn({ label: "Cancel", action: "cancelCustomBarcode", outline: true, full: true }) +
@@ -1905,6 +1981,15 @@ actions.lookupManualBarcode = async function() {
 
 ["Name","Weight","Calories","Protein","Carbs","Fat"].forEach(function(f) {
   inputActions["customBarcode" + f] = function(val) { foodUi().customBarcodeManual[f.toLowerCase()] = val; };
+});
+["Protein","Carbs","Fat"].forEach(function(f) {
+  inputActions["customBarcode" + f] = function(val) {
+    const m = foodUi().customBarcodeManual;
+    m[f.toLowerCase()] = val;
+    m.calories = String(calcCaloriesFromMacros(m.protein, m.carbs, m.fat));
+    const el = document.getElementById("customBarcodeCaloriesInput");
+    if (el) el.value = m.calories;
+  };
 });
 actions.cancelCustomBarcode = function() {
   const fu = foodUi();
@@ -2452,11 +2537,12 @@ function renderManualEntryScreen(fu) {
       '<div><label class="label">Food Name</label>' + textInput({ value: m.name, placeholder: "e.g. Chicken Breast", bind: "manualName", enter: "addManualEntry" }) + '</div>' +
       '<div><label class="label">Weight (g)</label>' + textInput({ value: m.weight, type: "number", bind: "manualWeight", enter: "addManualEntry" }) + '</div>' +
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
-        manualField("calories", "Calories (kcal)", m.calories, C.calories) +
+        manualField("calories", "Calories (kcal)", m.calories, C.calories, "manualCaloriesInput") +
         manualField("protein", "Protein (g)", m.protein, C.protein) +
         manualField("carbs", "Carbs (g)", m.carbs, C.carbs) +
         manualField("fat", "Fat (g)", m.fat, C.fat) +
       '</div>' +
+      '<div style="color:' + C.textMut + ';font-size:11px">Calories auto-calculate from protein/carbs/fat (4/4/9 kcal per gram) — edit it directly to override.</div>' +
     '</div>' +
     '<div class="row" style="margin-top:16px">' +
       btn({ label: "Cancel", action: "closeManualEntry", outline: true, full: true }) +
@@ -2464,12 +2550,28 @@ function renderManualEntryScreen(fu) {
     '</div>'
   );
 }
-function manualField(key, label, value, color) {
-  return '<div><label class="label" style="color:' + color + '">' + label + '</label>' + textInput({ value: value, type: "number", bind: "manual_" + key, enter: "addManualEntry" }) + '</div>';
+function manualField(key, label, value, color, id) {
+  return '<div><label class="label" style="color:' + color + '">' + label + '</label>' + textInput({ id: id, value: value, type: "number", bind: "manual_" + key, enter: "addManualEntry" }) + '</div>';
+}
+// protein/carbs/fat -> calories, shared by Manual Entry and the "barcode not found" custom entry
+// screen (both let you type raw macros for a food that isn't in any database). Atwater factors
+// (4/4/9) match the ones already used for recipe-ingredient scaling and the Strategy tab's
+// calorie<->macro target math.
+function calcCaloriesFromMacros(protein, carbs, fat) {
+  return Math.round((parseFloat(protein) || 0) * 4 + (parseFloat(carbs) || 0) * 4 + (parseFloat(fat) || 0) * 9);
 }
 ["name","weight","calories","protein","carbs","fat","fiber"].forEach(function(key) {
   inputActions["manual" + key.charAt(0).toUpperCase() + key.slice(1)] = function(val) { foodUi().manual[key] = val; };
   inputActions["manual_" + key] = function(val) { foodUi().manual[key] = val; };
+});
+["protein","carbs","fat"].forEach(function(key) {
+  inputActions["manual_" + key] = function(val) {
+    const m = foodUi().manual;
+    m[key] = val;
+    m.calories = String(calcCaloriesFromMacros(m.protein, m.carbs, m.fat));
+    const el = document.getElementById("manualCaloriesInput");
+    if (el) el.value = m.calories;
+  };
 });
 
 actions.addManualEntry = function() {
