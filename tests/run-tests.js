@@ -93,6 +93,7 @@ const exportLine =
   "mergeFoodLogsFromCloud: mergeFoodLogsFromCloud, mergeWeightsFromCloud: mergeWeightsFromCloud, mergeRecipesFromCloud: mergeRecipesFromCloud, " +
   "wasRecentlyDeleted: wasRecentlyDeleted, markRecentlyDeleted: markRecentlyDeleted, recentlyDeletedIds: recentlyDeletedIds, " +
   "computeNavDepth: computeNavDepth, collapseOneNavLevel: collapseOneNavLevel, showToast: showToast, fmtDate: fmtDate, " +
+  "computeQtyWeight: computeQtyWeight, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -273,6 +274,18 @@ test("calorieTarget: all-locked leaves nothing to redistribute into (no crash)",
   assertEqual(M.state.settings.proteinTarget, 150, "locked protein unchanged");
   assertEqual(M.state.settings.carbsTarget, 150, "locked carbs unchanged");
   assertEqual(M.state.settings.fatTarget, 50, "locked fat unchanged");
+});
+
+// ==== computeQtyWeight (portion-size quantity selection) ====
+test("computeQtyWeight: multiplies quantity by a serving's grams", function () {
+  assertEqual(M.computeQtyWeight("2", 33), 66, "2 cookies at 33g each");
+});
+test("computeQtyWeight: fractional quantity rounds to one decimal", function () {
+  assertEqual(M.computeQtyWeight("1.5", 33), 49.5, "1.5 servings");
+});
+test("computeQtyWeight: blank/invalid quantity treated as zero", function () {
+  assertEqual(M.computeQtyWeight("", 33), 0, "empty string");
+  assertEqual(M.computeQtyWeight("abc", 33), 0, "non-numeric");
 });
 
 // ==== navigation depth (back-button model) ====

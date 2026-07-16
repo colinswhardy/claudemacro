@@ -1572,7 +1572,7 @@ actions.moveEntryCustomDate = function() {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100" };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100" };
   return state.ui.food;
 }
 
@@ -1750,7 +1750,7 @@ actions.doFoodSearch = async function() {
   rerender();
 };
 
-actions.openWizard = function(type) { foodUi().wizardType = type; foodUi().wizard = { step: 0, selections: {}, weight: "", showAI: false, aiDesc: "", aiLoading: false, aiError: null, searchResults: [], searching: false, selectedFood: null }; rerender(); };
+actions.openWizard = function(type) { foodUi().wizardType = type; foodUi().wizard = { step: 0, selections: {}, weight: "", servingBasis: null, qty: "1", showAI: false, aiDesc: "", aiLoading: false, aiError: null, searchResults: [], searching: false, selectedFood: null }; rerender(); };
 actions.closeWizard = function() { stepBackOneLevel(); };
 
 actions.openAIScreen = function() {
@@ -1854,6 +1854,7 @@ async function handleBarcodeDetected(code) {
     fu.scanningBarcode = false;
     fu.addingFood = remembered;
     fu.addWeight = String(remembered.loggedWeight || (remembered.servingSizes && remembered.servingSizes[0] && remembered.servingSizes[0].grams) || "");
+    fu.addServingBasis = null; fu.addQty = "1";
     pendingFocusId = "addWeightInput";
     rerender();
     return;
@@ -1872,6 +1873,7 @@ async function handleBarcodeDetected(code) {
   fu.scanningBarcode = false;
   fu.addingFood = food;
   fu.addWeight = "";
+  fu.addServingBasis = null; fu.addQty = "1";
   pendingFocusId = "addWeightInput";
   rerender();
 }
@@ -1929,6 +1931,7 @@ actions.saveCustomBarcode = function() {
   fu.scanNotFoundCode = null;
   fu.addingFood = food;
   fu.addWeight = String(weight);
+  fu.addServingBasis = null; fu.addQty = "1";
   rerender();
 };
 
@@ -2059,7 +2062,7 @@ function renderRecipeBuilderScreen(fu) {
 actions.openIngredientPicker = function() {
   const rb = foodUi().recipeBuilder;
   if (!rb) return;
-  rb.picker = { mode: "search", query: "", results: [], searching: false, selecting: null, weight: "100", manual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" } };
+  rb.picker = { mode: "search", query: "", results: [], searching: false, selecting: null, weight: "100", servingBasis: null, qty: "1", manual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" } };
   rerender();
 };
 actions.closeIngredientPicker = function() {
@@ -2095,6 +2098,7 @@ actions.selectIngredientFood = function(foodId, srcTab) {
   if (!food) return;
   pk.selecting = food;
   pk.weight = "";
+  pk.servingBasis = null; pk.qty = "1";
   pendingFocusId = "ingredientWeightInput";
   rerender();
 };
@@ -2104,10 +2108,32 @@ inputActions.ingredientWeight = function(val) {
   rb.picker.weight = val;
   const btnEl = document.getElementById("confirmAddIngredientBtn");
   if (btnEl) btnEl.disabled = !(parseFloat(val) > 0);
+  if (rb.picker.selecting) patchMacroPreview("ingredientPreview", rb.picker.selecting, parseFloat(val) || 0);
 };
 actions.setIngredientWeight = function(grams) {
   const rb = foodUi().recipeBuilder;
-  if (rb && rb.picker) { rb.picker.weight = grams; rerender(); }
+  if (!rb || !rb.picker) return;
+  const g = parseFloat(grams);
+  rb.picker.servingBasis = g; rb.picker.qty = "1"; rb.picker.weight = String(g);
+  rerender();
+};
+actions.ingredientUseGrams = function() {
+  const rb = foodUi().recipeBuilder;
+  if (rb && rb.picker) { rb.picker.servingBasis = null; rerender(); }
+};
+inputActions.ingredientQty = function(val) {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker) return;
+  const pk = rb.picker;
+  pk.qty = val;
+  if (pk.servingBasis == null) return;
+  const weight = computeQtyWeight(val, pk.servingBasis);
+  pk.weight = String(weight);
+  const btnEl = document.getElementById("confirmAddIngredientBtn");
+  if (btnEl) btnEl.disabled = !(weight > 0);
+  const readout = document.getElementById("ingredientQtyReadout");
+  if (readout) readout.textContent = "× " + round1(pk.servingBasis) + "g each = " + weight + "g";
+  if (pk.selecting) patchMacroPreview("ingredientPreview", pk.selecting, weight);
 };
 actions.confirmAddIngredient = function() {
   const rb = foodUi().recipeBuilder;
@@ -2150,16 +2176,14 @@ function renderIngredientPickerScreen(fu, rb) {
     const w = parseFloat(pk.weight) || 0;
     const m = calcMacrosForWeight(food, w);
     let inner = '<h3 class="cardTitle" style="margin-bottom:12px">' + esc(food.name) + '</h3>';
-    inner += '<div class="rowWrap" style="margin-bottom:16px">' +
-      (food.servingSizes || []).map(function(s) {
-        return '<button class="chip' + (parseFloat(pk.weight) === s.grams ? ' active' : '') + '" data-action="setIngredientWeight" data-arg="' + s.grams + '">' + esc(s.label) + '</button>';
-      }).join('') +
-    '</div>';
-    inner += '<div class="row" style="align-items:center;margin-bottom:20px">' +
-      textInput({ id: "ingredientWeightInput", value: pk.weight, type: "number", bind: "ingredientWeight", enter: "confirmAddIngredient", style: "flex:1" }) +
-      '<span style="color:' + C.textMut + '">grams</span></div>';
-    inner += '<div style="text-align:center;margin-bottom:16px"><div style="font-size:28px;font-weight:800;color:' + C.calories + '">' + m.calories + ' kcal</div></div>';
-    inner += '<div style="display:flex;justify-content:space-around;margin-bottom:20px">' + macroStat("Protein", m.protein, C.protein) + macroStat("Carbs", m.carbs, C.carbs) + macroStat("Fat", m.fat, C.fat) + '</div>';
+    inner += renderServingControls({
+      food: food, weight: pk.weight, servingBasis: pk.servingBasis, qty: pk.qty,
+      chipAction: "setIngredientWeight", weightInputId: "ingredientWeightInput", weightBind: "ingredientWeight",
+      qtyInputId: "ingredientQtyInput", qtyBind: "ingredientQty", qtyReadoutId: "ingredientQtyReadout",
+      enterAction: "confirmAddIngredient", useGramsAction: "ingredientUseGrams", compact: true,
+    });
+    inner += '<div style="text-align:center;margin-bottom:16px"><span id="ingredientPreviewCal" style="font-size:28px;font-weight:800;color:' + C.calories + '">' + m.calories + '</span> <span style="font-size:28px;font-weight:800;color:' + C.calories + '">kcal</span></div>';
+    inner += '<div style="display:flex;justify-content:space-around;margin-bottom:20px">' + macroStat("Protein", m.protein, C.protein, "ingredientPreviewPro") + macroStat("Carbs", m.carbs, C.carbs, "ingredientPreviewCarb") + macroStat("Fat", m.fat, C.fat, "ingredientPreviewFat") + '</div>';
     inner += btn({ id: "confirmAddIngredientBtn", label: "Add Ingredient", action: "confirmAddIngredient", full: true, disabled: !(parseFloat(pk.weight) > 0) });
     html += card(inner);
     return html;
@@ -2277,6 +2301,7 @@ actions.selectFoodForAdd = function(foodId, srcTab) {
   if (!food) return;
   fu.addingFood = food;
   fu.addWeight = food.loggedWeight ? String(food.loggedWeight) : "";
+  fu.addServingBasis = null; fu.addQty = "1";
   pendingFocusId = "addWeightInput";
   rerender();
 };
@@ -2292,18 +2317,15 @@ function renderAddingFoodScreen(fu) {
   html += card(
     '<h3 class="cardTitle" style="margin-bottom:4px">' + esc(food.name) + '</h3>' +
     '<div class="rowWrap" style="margin-bottom:16px">' + badge(food.state, food.state === "Cooked" ? C.warning : food.state === "Raw" ? C.success : C.textMut) + badge(food.source) + (food.brand ? '<span style="color:' + C.textMut + ';font-size:12px">' + esc(food.brand) + '</span>' : '') + '</div>' +
-    '<div class="rowWrap" style="margin-bottom:16px">' +
-      (food.servingSizes || []).map(function(s) {
-        return '<button class="chip' + (parseFloat(fu.addWeight) === s.grams ? ' active' : '') + '" data-action="setAddWeight" data-arg="' + s.grams + '">' + esc(s.label) + '</button>';
-      }).join('') +
-    '</div>' +
-    '<div class="row" style="align-items:center;margin-bottom:20px">' +
-      textInput({ id: "addWeightInput", value: fu.addWeight, type: "number", bind: "addWeight", enter: "confirmAddFood", style: "flex:1" }) +
-      '<span style="color:' + C.textMut + ';align-self:center">grams</span>' +
-    '</div>' +
-    '<div style="text-align:center;margin-bottom:16px"><div style="font-size:32px;font-weight:800;color:' + C.calories + '">' + m.calories + ' <span style="font-size:16px;font-weight:400">kcal</span></div></div>' +
+    renderServingControls({
+      food: food, weight: fu.addWeight, servingBasis: fu.addServingBasis, qty: fu.addQty,
+      chipAction: "setAddWeight", weightInputId: "addWeightInput", weightBind: "addWeight",
+      qtyInputId: "addQtyInput", qtyBind: "addQty", qtyReadoutId: "addQtyReadout",
+      enterAction: "confirmAddFood", useGramsAction: "addUseGrams",
+    }) +
+    '<div style="text-align:center;margin-bottom:16px"><span id="addPreviewCal" style="font-size:32px;font-weight:800;color:' + C.calories + '">' + m.calories + '</span> <span style="font-size:16px;font-weight:400;color:' + C.calories + '">kcal</span></div>' +
     '<div style="display:flex;justify-content:space-around;margin-bottom:20px">' +
-      macroStat("Protein", m.protein, C.protein) + macroStat("Carbs", m.carbs, C.carbs) + macroStat("Fat", m.fat, C.fat) +
+      macroStat("Protein", m.protein, C.protein, "addPreviewPro") + macroStat("Carbs", m.carbs, C.carbs, "addPreviewCarb") + macroStat("Fat", m.fat, C.fat, "addPreviewFat") +
     '</div>' +
     '<div class="row">' +
       btn({ label: isFav ? "\u2605" : "\u2606", action: "toggleFavorite", arg: food.id }) +
@@ -2313,8 +2335,57 @@ function renderAddingFoodScreen(fu) {
   return html;
 }
 
-function macroStat(label, value, color) {
-  return '<div style="text-align:center"><div style="color:' + color + ';font-size:20px;font-weight:700">' + value + 'g</div><div style="color:' + C.textMut + ';font-size:12px">' + label + '</div></div>';
+function macroStat(label, value, color, id) {
+  return '<div style="text-align:center"><div' + (id ? ' id="' + id + '"' : '') + ' style="color:' + color + ';font-size:20px;font-weight:700">' + value + 'g</div><div style="color:' + C.textMut + ';font-size:12px">' + label + '</div></div>';
+}
+
+// Shared by the three "pick a serving size, then dial in quantity or grams" screens (adding a
+// food from search, picking a recipe ingredient, and the wizard's result screen): tapping a
+// serving chip like "1 cookie (33g)" lets you type a quantity ("2") instead of calculating
+// grams yourself. Each screen keeps its own weight/servingBasis/qty state (different
+// containers), but the math and the calorie-preview DOM patching are identical, so they're
+// factored out here instead of tripled. Patching (not a full rerender) matters because a
+// rerender mid-keystroke would blur the input the user is actively typing into.
+function computeQtyWeight(qty, basisGrams) {
+  return round1((parseFloat(qty) || 0) * basisGrams);
+}
+function patchMacroPreview(idPrefix, food, weight) {
+  const m = calcMacrosForWeight(food, weight);
+  const calEl = document.getElementById(idPrefix + "Cal");
+  if (calEl) calEl.textContent = m.calories;
+  const proEl = document.getElementById(idPrefix + "Pro");
+  if (proEl) proEl.textContent = m.protein + "g";
+  const carbEl = document.getElementById(idPrefix + "Carb");
+  if (carbEl) carbEl.textContent = m.carbs + "g";
+  const fatEl = document.getElementById(idPrefix + "Fat");
+  if (fatEl) fatEl.textContent = m.fat + "g";
+  return m;
+}
+// Renders the serving-size chips plus, depending on mode, either a quantity input ("2" x this
+// serving) or a plain grams input. cfg: { food, weight, servingBasis, qty, chipAction,
+// weightInputId, weightBind, qtyInputId, qtyBind, qtyReadoutId, enterAction, useGramsAction,
+// compact (tighter spacing for the ingredient picker's smaller card) }.
+function renderServingControls(cfg) {
+  const gapBottom = cfg.compact ? "12px" : "16px";
+  let html = '<div class="rowWrap" style="margin-bottom:' + gapBottom + '">' +
+    (cfg.food.servingSizes || []).map(function(s) {
+      const active = cfg.servingBasis === s.grams;
+      return '<button class="chip' + (active ? ' active' : '') + '" data-action="' + cfg.chipAction + '" data-arg="' + s.grams + '">' + esc(s.label) + '</button>';
+    }).join('') +
+  '</div>';
+  if (cfg.servingBasis) {
+    html += '<div class="row" style="align-items:center;margin-bottom:8px">' +
+      textInput({ id: cfg.qtyInputId, value: cfg.qty, type: "number", bind: cfg.qtyBind, enter: cfg.enterAction, style: "width:90px" }) +
+      '<span id="' + cfg.qtyReadoutId + '" style="color:' + C.textMut + ';font-size:13px;align-self:center">× ' + round1(cfg.servingBasis) + 'g each = ' + round1(cfg.weight) + 'g</span>' +
+    '</div>';
+    html += '<div style="margin-bottom:' + (cfg.compact ? "12px" : "20px") + '">' + btn({ label: "Enter grams instead", action: cfg.useGramsAction, outline: true, small: true }) + '</div>';
+  } else {
+    html += '<div class="row" style="align-items:center;margin-bottom:' + (cfg.compact ? "12px" : "20px") + '">' +
+      textInput({ id: cfg.weightInputId, value: cfg.weight, type: "number", bind: cfg.weightBind, enter: cfg.enterAction, style: "flex:1" }) +
+      '<span style="color:' + C.textMut + (cfg.compact ? ';font-size:13px' : '') + ';align-self:center">grams</span>' +
+    '</div>';
+  }
+  return html;
 }
 
 inputActions.addWeight = function(val) {
@@ -2322,8 +2393,27 @@ inputActions.addWeight = function(val) {
   fu.addWeight = val;
   const btnEl = document.getElementById("confirmAddBtn");
   if (btnEl) btnEl.disabled = !(parseFloat(val) > 0);
+  if (fu.addingFood) patchMacroPreview("addPreview", fu.addingFood, parseFloat(val) || 0);
 };
-actions.setAddWeight = function(grams) { foodUi().addWeight = grams; rerender(); };
+actions.setAddWeight = function(grams) {
+  const fu = foodUi();
+  const g = parseFloat(grams);
+  fu.addServingBasis = g; fu.addQty = "1"; fu.addWeight = String(g);
+  rerender();
+};
+actions.addUseGrams = function() { foodUi().addServingBasis = null; rerender(); };
+inputActions.addQty = function(val) {
+  const fu = foodUi();
+  fu.addQty = val;
+  if (fu.addServingBasis == null) return;
+  const weight = computeQtyWeight(val, fu.addServingBasis);
+  fu.addWeight = String(weight);
+  const btnEl = document.getElementById("confirmAddBtn");
+  if (btnEl) btnEl.disabled = !(weight > 0);
+  const readout = document.getElementById("addQtyReadout");
+  if (readout) readout.textContent = "× " + round1(fu.addServingBasis) + "g each = " + weight + "g";
+  if (fu.addingFood) patchMacroPreview("addPreview", fu.addingFood, weight);
+};
 
 actions.confirmAddFood = function() {
   const fu = foodUi();
@@ -2750,20 +2840,17 @@ function renderWizardResults(config, wiz) {
     html += '<div class="card" style="background:' + C.inputBg + ';margin-bottom:0">' +
       '<div style="color:' + C.text + ';font-weight:600;margin-bottom:' + (f.reason ? '4px' : '12px') + '">' + esc(f.name) + '</div>' +
       (f.reason ? '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:12px;font-style:italic">' + esc(f.reason) + '</div>' : '') +
-      '<div class="rowWrap" style="margin-bottom:12px">' +
-        (f.servingSizes || []).map(function(s) {
-          return '<button class="chip' + (parseFloat(wiz.weight) === s.grams ? ' active' : '') + '" data-action="wizardSetWeight" data-arg="' + s.grams + '">' + esc(s.label) + '</button>';
-        }).join('') +
-      '</div>' +
-      '<div class="row" style="align-items:center;margin-bottom:16px">' +
-        textInput({ id: "wizardWeightInput", value: wiz.weight, type: "number", bind: "wizardWeight", enter: "wizardConfirmAdd", style: "flex:1" }) +
-        '<span style="color:' + C.textMut + ';font-size:14px;align-self:center">grams</span>' +
-      '</div>' +
-      '<div style="margin-bottom:8px"><span style="color:' + C.calories + ';font-weight:700;font-size:18px">' + m.calories + ' kcal</span></div>' +
+      renderServingControls({
+        food: f, weight: wiz.weight, servingBasis: wiz.servingBasis, qty: wiz.qty,
+        chipAction: "wizardSetWeight", weightInputId: "wizardWeightInput", weightBind: "wizardWeight",
+        qtyInputId: "wizardQtyInput", qtyBind: "wizardQty", qtyReadoutId: "wizardQtyReadout",
+        enterAction: "wizardConfirmAdd", useGramsAction: "wizardUseGrams", compact: true,
+      }) +
+      '<div style="margin-bottom:8px"><span id="wizardPreviewCal" style="color:' + C.calories + ';font-weight:700;font-size:18px">' + m.calories + '</span><span style="color:' + C.calories + ';font-weight:700;font-size:18px"> kcal</span></div>' +
       '<div class="row" style="gap:12px;font-size:13px">' +
-        '<span style="color:' + C.protein + '">P: ' + m.protein + 'g</span>' +
-        '<span style="color:' + C.carbs + '">C: ' + m.carbs + 'g</span>' +
-        '<span style="color:' + C.fat + '">F: ' + m.fat + 'g</span>' +
+        '<span style="color:' + C.protein + '">P: <span id="wizardPreviewPro">' + m.protein + 'g</span></span>' +
+        '<span style="color:' + C.carbs + '">C: <span id="wizardPreviewCarb">' + m.carbs + 'g</span></span>' +
+        '<span style="color:' + C.fat + '">F: <span id="wizardPreviewFat">' + m.fat + 'g</span></span>' +
         (m.fiber > 0 ? '<span style="color:' + C.textMut + '">Fiber: ' + m.fiber + 'g</span>' : '') +
       '</div></div>';
   }
@@ -2802,7 +2889,7 @@ actions.wizardSelect = async function(option) {
     const merged = deduplicateFoods(usda.concat(off));
     wiz.searchResults = merged;
     wiz.searching = false;
-    if (merged.length > 0) { wiz.selectedFood = merged[0]; wiz.weight = ""; pendingFocusId = "wizardWeightInput"; }
+    if (merged.length > 0) { wiz.selectedFood = merged[0]; wiz.weight = ""; wiz.servingBasis = null; wiz.qty = "1"; pendingFocusId = "wizardWeightInput"; }
     rerender();
   } else {
     wiz.step += 1;
@@ -2823,12 +2910,31 @@ inputActions.wizardWeight = function(val) {
   wiz.weight = val;
   const btnEl = document.getElementById("wizardConfirmBtn");
   if (btnEl) btnEl.disabled = !wiz.selectedFood || !(parseFloat(val) > 0);
+  if (wiz.selectedFood) patchMacroPreview("wizardPreview", wiz.selectedFood, parseFloat(val) || 0);
 };
-actions.wizardSetWeight = function(grams) { foodUi().wizard.weight = grams; rerender(); };
+actions.wizardSetWeight = function(grams) {
+  const wiz = foodUi().wizard;
+  const g = parseFloat(grams);
+  wiz.servingBasis = g; wiz.qty = "1"; wiz.weight = String(g);
+  rerender();
+};
+actions.wizardUseGrams = function() { foodUi().wizard.servingBasis = null; rerender(); };
+inputActions.wizardQty = function(val) {
+  const wiz = foodUi().wizard;
+  wiz.qty = val;
+  if (wiz.servingBasis == null) return;
+  const weight = computeQtyWeight(val, wiz.servingBasis);
+  wiz.weight = String(weight);
+  const btnEl = document.getElementById("wizardConfirmBtn");
+  if (btnEl) btnEl.disabled = !wiz.selectedFood || !(weight > 0);
+  const readout = document.getElementById("wizardQtyReadout");
+  if (readout) readout.textContent = "× " + round1(wiz.servingBasis) + "g each = " + weight + "g";
+  if (wiz.selectedFood) patchMacroPreview("wizardPreview", wiz.selectedFood, weight);
+};
 actions.wizardSelectFood = function(foodId) {
   const wiz = foodUi().wizard;
   const f = wiz.searchResults.find(function(x){ return x.id === foodId; });
-  if (f) { wiz.selectedFood = f; wiz.weight = ""; pendingFocusId = "wizardWeightInput"; }
+  if (f) { wiz.selectedFood = f; wiz.weight = ""; wiz.servingBasis = null; wiz.qty = "1"; pendingFocusId = "wizardWeightInput"; }
   rerender();
 };
 
@@ -2879,6 +2985,7 @@ actions.wizardAiEstimate = async function() {
       per100g: false, reason: primaryEst.reason || "",
     };
     wiz.weight = String(primaryEst.quantity_grams || 100);
+    wiz.servingBasis = null; wiz.qty = "1";
     wiz.searchResults = [];
   } else {
     // Both providers came back -- reuse the wizard's existing "pick from a list of candidate
