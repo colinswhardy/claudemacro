@@ -88,10 +88,22 @@ a{color:inherit;}
 .presetGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
 .toast{position:fixed;bottom:130px;left:50%;transform:translateX(-50%);background:#22C55E;color:#fff;padding:10px 22px;border-radius:20px;font-size:14px;font-weight:600;z-index:200;box-shadow:0 4px 16px rgba(0,0,0,0.35);pointer-events:none;white-space:nowrap;animation:toastPop 0.9s ease forwards;}
 @keyframes toastPop{0%{opacity:0;transform:translateX(-50%) translateY(10px);}15%{opacity:1;transform:translateX(-50%) translateY(0);}78%{opacity:1;}100%{opacity:0;}}
+.landscapeBlock{display:none;}
+/* Phones/small tablets turned sideways (short viewport height is what distinguishes this from
+   a desktop browser window, which is also landscape-shaped but never this short) get a "please
+   rotate" overlay instead of the app -- this single-column layout was never designed for
+   landscape and isn't worth building a second layout for on a personal one-user app. */
+@media (orientation: landscape) and (max-height: 500px) {
+  #app{display:none;}
+  .landscapeBlock{display:flex;position:fixed;inset:0;background:#0B0E18;color:#E2E8F0;align-items:center;justify-content:center;text-align:center;padding:32px;z-index:9999;flex-direction:column;gap:10px;}
+  .landscapeBlock .icon{font-size:40px;}
+  .landscapeBlock .msg{color:#94A3B8;font-size:14px;max-width:280px;}
+}
 </style>
 </head>
 <body>
 <div id="app"><div class="loading">Loading...</div></div>
+<div class="landscapeBlock"><div class="icon">&#128241;</div><div style="font-weight:600;font-size:16px">Rotate to Portrait</div><div class="msg">MacroLog is designed for portrait mode. Rotate your device to keep using it.</div></div>
 <script>
 "use strict";
 
@@ -171,7 +183,13 @@ const DEFAULT_SETTINGS = {
 // ============================================================
 // UTILS
 // ============================================================
-const fmtDate = (d) => d.toISOString().split("T")[0];
+// Local calendar date, not UTC -- d.toISOString() is always UTC, so in any timezone behind
+// UTC this would report tomorrow's date for several hours every evening (the bug that sent
+// the app straight to "Thursday" while it was still Wednesday locally).
+const fmtDate = (d) => {
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), day = String(d.getDate()).padStart(2, "0");
+  return y + "-" + m + "-" + day;
+};
 const todayStr = () => fmtDate(new Date());
 const parseDateStr = (s) => { const p = s.split("-").map(Number); return new Date(p[0], p[1]-1, p[2]); };
 const dayLabel = (s) => parseDateStr(s).toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
@@ -785,7 +803,7 @@ async function estimateWithClaude(description, photoBase64, model, apiKey) {
   if (desc && photoBase64) promptText = 'Estimate the macronutrients for this food: "' + desc + '". A photo is attached for additional context.';
   else if (photoBase64) promptText = 'Estimate the macronutrients for the food shown in this photo.';
   else promptText = 'Estimate the macronutrients for this food: "' + desc + '".';
-  promptText += ' Return ONLY valid JSON (no markdown fences) as an array: [{"name":"food name","quantity_grams":number,"calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number}]. Estimate realistic portion sizes. Be as accurate as possible.';
+  promptText += ' Return ONLY valid JSON (no markdown fences) as an array: [{"name":"food name","quantity_grams":number,"calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number,"reason":"one short sentence on how you arrived at this estimate, e.g. the assumed cut/portion/preparation"}]. Estimate realistic portion sizes. Be as accurate as possible.';
   content.push({ type: "text", text: promptText });
   try {
     const modelId = model === "claude-sonnet" ? "claude-sonnet-5" : "claude-haiku-4-5-20251001";
@@ -797,7 +815,7 @@ async function estimateWithClaude(description, photoBase64, model, apiKey) {
         "anthropic-version": "2023-06-01",
         "anthropic-dangerous-direct-browser-access": "true"
       },
-      body: JSON.stringify({ model: modelId, max_tokens: 1000, messages: [{ role: "user", content: content }] }),
+      body: JSON.stringify({ model: modelId, max_tokens: 1200, messages: [{ role: "user", content: content }] }),
     });
     const d = await r.json();
     if (d.error) { console.error("Claude API error:", d.error); return { error: d.error.message || "API error" }; }
@@ -812,7 +830,7 @@ async function estimateWithGemini(description, apiKey) {
     const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=" + apiKey, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: 'Estimate macronutrients for: "' + description + '". Return ONLY valid JSON array: [{"name":"food name","quantity_grams":number,"calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number}].' }] }],
+        contents: [{ parts: [{ text: 'Estimate macronutrients for: "' + description + '". Return ONLY valid JSON array: [{"name":"food name","quantity_grams":number,"calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number,"reason":"one short sentence on how you arrived at this estimate, e.g. the assumed cut/portion/preparation"}].' }] }],
       }),
     });
     const d = await r.json();
@@ -2519,6 +2537,7 @@ function renderAiResultsBlock(label, labelColor, items, addAction, addAllAction)
         '<span style="color:' + C.carbs + '">C: ' + item.carbs + 'g</span>' +
         '<span style="color:' + C.fat + '">F: ' + item.fat + 'g</span>' +
       '</div>' +
+      (item.reason ? '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px;font-style:italic">' + esc(item.reason) + '</div>' : '') +
       btn({ label: "Add to Log", action: addAction, arg: String(i), small: true, extraStyle: "margin-top:8px" }) +
     '</div>';
   });
@@ -2718,6 +2737,7 @@ function renderWizardResults(config, wiz) {
       html += '<div data-action="wizardSelectFood" data-arg="' + esc_attr(f.id) + '" style="padding:10px 12px;border-radius:10px;margin-bottom:4px;cursor:pointer;background:' + (sel ? C.primary + "22" : "transparent") + ';border:1px solid ' + (sel ? C.primary + "44" : "transparent") + '">' +
         '<div style="color:' + C.text + ';font-size:14px;font-weight:500">' + esc(f.name) + '</div>' +
         '<div class="rowWrap" style="margin-top:4px">' + badge(f.state, f.state === "Cooked" ? C.warning : f.state === "Raw" ? C.success : C.textMut) + badge(f.source) + '<span style="color:' + C.textMut + ';font-size:12px;align-self:center">' + f.calories + ' kcal/100g</span></div>' +
+        (f.reason ? '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px;font-style:italic">' + esc(f.reason) + '</div>' : '') +
       '</div>';
     });
     html += '</div>';
@@ -2728,7 +2748,8 @@ function renderWizardResults(config, wiz) {
     const g = parseFloat(wiz.weight) || 0;
     const m = calcMacrosForWeight(f, g);
     html += '<div class="card" style="background:' + C.inputBg + ';margin-bottom:0">' +
-      '<div style="color:' + C.text + ';font-weight:600;margin-bottom:12px">' + esc(f.name) + '</div>' +
+      '<div style="color:' + C.text + ';font-weight:600;margin-bottom:' + (f.reason ? '4px' : '12px') + '">' + esc(f.name) + '</div>' +
+      (f.reason ? '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:12px;font-style:italic">' + esc(f.reason) + '</div>' : '') +
       '<div class="rowWrap" style="margin-bottom:12px">' +
         (f.servingSizes || []).map(function(s) {
           return '<button class="chip' + (parseFloat(wiz.weight) === s.grams ? ' active' : '') + '" data-action="wizardSetWeight" data-arg="' + s.grams + '">' + esc(s.label) + '</button>';
@@ -2822,27 +2843,66 @@ actions.wizardAiEstimate = async function() {
   Object.keys(wiz.selections).forEach(function(k) { if (wiz.selections[k] !== "Other") parts.push(wiz.selections[k]); });
   const fullDesc = parts.join(", ") + ": " + wiz.aiDesc;
 
-  let result;
-  if (state.settings.aiProvider === "gemini" && state.settings.geminiApiKey) {
-    result = await estimateWithGemini(fullDesc, state.settings.geminiApiKey);
-  } else if (!state.settings.claudeApiKey) {
-    result = { error: "No Claude API key set. Add one in Strategy \u2192 AI Settings." };
+  const set = state.settings;
+  const isClaudePrimary = set.aiProvider === "claude-haiku" || set.aiProvider === "claude-sonnet";
+  const doCompare = isClaudePrimary && set.compareWithGemini && !!set.geminiApiKey;
+
+  let primaryP;
+  if (set.aiProvider === "gemini" && set.geminiApiKey) {
+    primaryP = estimateWithGemini(fullDesc, set.geminiApiKey);
+  } else if (!set.claudeApiKey) {
+    primaryP = Promise.resolve({ error: "No Claude API key set. Add one in Strategy \u2192 AI Settings." });
   } else {
-    result = await estimateWithClaude(fullDesc, null, state.settings.aiProvider, state.settings.claudeApiKey);
+    primaryP = estimateWithClaude(fullDesc, null, set.aiProvider, set.claudeApiKey);
   }
+  const comparePromise = doCompare ? estimateWithGemini(fullDesc, set.geminiApiKey) : Promise.resolve(null);
+
+  const results = await Promise.all([primaryP, comparePromise]);
+  const result = results[0];
+  const compareResult = results[1];
   wiz.aiLoading = false;
   if (result.error) { wiz.aiError = result.error; rerender(); return; }
-  if (result.data && result.data.length > 0) {
-    const est = result.data[0];
+  if (!result.data || result.data.length === 0) { wiz.aiError = "No estimate returned."; rerender(); return; }
+
+  const primaryEst = result.data[0];
+  // Only treated as a real second candidate if it actually came back clean -- a compare
+  // failure (missing key, network error, etc.) just silently falls back to the single-result
+  // flow below rather than blocking on or surfacing a secondary error in this compact screen.
+  const compareEst = (compareResult && !compareResult.error && compareResult.data && compareResult.data.length > 0) ? compareResult.data[0] : null;
+
+  if (!compareEst) {
     wiz.selectedFood = {
-      id: "ai_" + Date.now(), name: est.name || fullDesc, source: "AI Estimate",
-      calories: est.calories, protein: est.protein, carbs: est.carbs, fat: est.fat, fiber: est.fiber || 0,
+      id: "ai_" + Date.now(), name: primaryEst.name || fullDesc, source: "AI Estimate",
+      calories: primaryEst.calories, protein: primaryEst.protein, carbs: primaryEst.carbs, fat: primaryEst.fat, fiber: primaryEst.fiber || 0,
       state: wiz.selections.prep || "\u2014",
-      servingSizes: [{ label: est.quantity_grams + "g", grams: est.quantity_grams }],
-      per100g: false,
+      servingSizes: [{ label: primaryEst.quantity_grams + "g", grams: primaryEst.quantity_grams }],
+      per100g: false, reason: primaryEst.reason || "",
     };
-    wiz.weight = String(est.quantity_grams || 100);
+    wiz.weight = String(primaryEst.quantity_grams || 100);
     wiz.searchResults = [];
+  } else {
+    // Both providers came back -- reuse the wizard's existing "pick from a list of candidate
+    // foods" screen (the same one regular database search results use) instead of building
+    // new UI. That list renders each candidate's calories as a per-100g rate, so convert each
+    // estimate to one instead of leaving it as an absolute value for the estimated portion.
+    const toPer100gFood = function(est, providerLabel) {
+      const grams = est.quantity_grams || 100;
+      const scale = 100 / grams;
+      return {
+        id: "ai_" + Date.now() + "_" + providerLabel,
+        name: (est.name || fullDesc) + " (" + providerLabel + ")",
+        source: "AI Estimate", state: wiz.selections.prep || "\u2014",
+        calories: Math.round(est.calories * scale), protein: round1(est.protein * scale),
+        carbs: round1(est.carbs * scale), fat: round1(est.fat * scale), fiber: round1((est.fiber || 0) * scale),
+        per100g: true, reason: est.reason || "",
+        servingSizes: [{ label: Math.round(grams) + "g (estimated)", grams: grams }],
+      };
+    };
+    wiz.searchResults = [
+      toPer100gFood(primaryEst, aiProviderLabel(set.aiProvider)),
+      toPer100gFood(compareEst, "Gemini"),
+    ];
+    wiz.selectedFood = null;
   }
   wiz.showAI = false;
   rerender();
@@ -3517,6 +3577,15 @@ actions.clearAllData = async function() {
 cleanExpiredPhotos();
 if (!state.session) pendingFocusId = "loginEmailInput";
 render();
+
+// Best-effort real orientation lock (mainly Android, only works once installed/standalone --
+// the manifest's "orientation":"portrait" hint covers the same case more reliably on its own).
+// Neither this nor the manifest hint does anything on iOS Safari, which doesn't support locking
+// web content's orientation at all -- the CSS landscape-block overlay above is what actually
+// guarantees portrait-only there, and works everywhere regardless of API support.
+if (screen.orientation && screen.orientation.lock) {
+  screen.orientation.lock("portrait").catch(function() {});
+}
 
 // On boot, if already signed in, catch up with anything changed elsewhere (another device,
 // a future companion app) and flush anything local that hasn't synced yet. This also keeps

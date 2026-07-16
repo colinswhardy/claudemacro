@@ -79,6 +79,7 @@ const sandbox = {
   history: historyStub,
   addEventListener: function () {},
   removeEventListener: function () {},
+  screen: { orientation: null },
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
@@ -91,7 +92,7 @@ const exportLine =
   "\n;globalThis.__t = { calcMacrosForWeight: calcMacrosForWeight, round1: round1, parseCsvLine: parseCsvLine, " +
   "mergeFoodLogsFromCloud: mergeFoodLogsFromCloud, mergeWeightsFromCloud: mergeWeightsFromCloud, mergeRecipesFromCloud: mergeRecipesFromCloud, " +
   "wasRecentlyDeleted: wasRecentlyDeleted, markRecentlyDeleted: markRecentlyDeleted, recentlyDeletedIds: recentlyDeletedIds, " +
-  "computeNavDepth: computeNavDepth, collapseOneNavLevel: collapseOneNavLevel, showToast: showToast, " +
+  "computeNavDepth: computeNavDepth, collapseOneNavLevel: collapseOneNavLevel, showToast: showToast, fmtDate: fmtDate, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -155,6 +156,19 @@ test("parseCsvLine: escaped double-quote inside a quoted field", function () {
 });
 test("parseCsvLine: empty fields are preserved", function () {
   assertEqual(M.parseCsvLine("a,,c"), ["a", "", "c"], "empty middle field");
+});
+
+// ==== fmtDate ====
+test("fmtDate: uses local calendar-date components, not UTC", function () {
+  // Constructed via the (year, month, day, ...) form, which the JS spec always interprets as
+  // local time -- unlike toISOString(), which is always UTC and is exactly what caused the
+  // app to open to the wrong day for hours every evening in a timezone behind UTC.
+  const d = new Date(2026, 6, 15, 23, 30, 0); // July 15, 2026, 11:30 PM local
+  assertEqual(M.fmtDate(d), "2026-07-15", "matches the local Y-M-D regardless of the test runner's own timezone");
+});
+test("fmtDate: pads single-digit month and day", function () {
+  const d = new Date(2026, 0, 5, 8, 0, 0); // January 5, 2026
+  assertEqual(M.fmtDate(d), "2026-01-05", "zero-padded");
 });
 
 // ==== mergeFoodLogsFromCloud ====
