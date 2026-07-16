@@ -94,6 +94,7 @@ const exportLine =
   "wasRecentlyDeleted: wasRecentlyDeleted, markRecentlyDeleted: markRecentlyDeleted, recentlyDeletedIds: recentlyDeletedIds, " +
   "computeNavDepth: computeNavDepth, collapseOneNavLevel: collapseOneNavLevel, showToast: showToast, fmtDate: fmtDate, " +
   "computeQtyWeight: computeQtyWeight, calcCaloriesFromMacros: calcCaloriesFromMacros, localFoodMatches: localFoodMatches, " +
+  "mergeCustomBarcodesFromCloud: mergeCustomBarcodesFromCloud, filterFoodsByName: filterFoodsByName, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -237,6 +238,105 @@ test("mergeWeightsFromCloud: keeps a newer local value over an older cloud value
   const changed = M.mergeWeightsFromCloud([{ log_date: "2026-07-10", weight: 999, unit: "lbs", logged_at: "2026-07-10T01:00:00.000Z", updated_at: "2026-07-10T01:00:00.000Z" }]);
   assertEqual(changed, 0, "no change");
   assertEqual(M.state.weights["2026-07-10"].weight, 179, "local weight kept");
+});
+test("mergeWeightsFromCloud: does not resurrect a recently-deleted weight entry", function () {
+  M.state.weights = {};
+  M.recentlyDeletedIds.weight_entries.clear();
+  M.markRecentlyDeleted("weight_entries", "2026-07-10");
+  const changed = M.mergeWeightsFromCloud([{ log_date: "2026-07-10", weight: 179, unit: "lbs", logged_at: "2026-07-10T00:00:00.000Z", updated_at: "2026-07-10T00:00:00.000Z" }]);
+  assertEqual(changed, 0, "tombstoned date is not re-added");
+  assertEqual(M.state.weights["2026-07-10"], undefined, "weights stays empty for that date");
+});
+test("actions.deleteWeight: removes the local entry and tombstones it against a racing pull", function () {
+  M.state.session = null; // no network call attempted, only the local + tombstone effects are checked
+  M.state.weights = { "2026-07-11": { weight: 180, unit: "lbs", timestamp: "2026-07-11T00:00:00.000Z", updatedAt: "2026-07-11T00:00:00.000Z" } };
+  M.state.ui = { weight: { selectedPoint: "2026-07-11", confirmDeleteDate: "2026-07-11" } };
+  M.actions.deleteWeight("2026-07-11");
+  assertEqual(M.state.weights["2026-07-11"], undefined, "entry removed locally");
+  assertEqual(M.wasRecentlyDeleted("weight_entries", "2026-07-11"), true, "tombstoned so a racing pull can't resurrect it");
+  assertEqual(M.state.ui.weight.selectedPoint, null, "chart selection cleared");
+  assertEqual(M.state.ui.weight.confirmDeleteDate, null, "confirm state cleared");
+});
+
+// ==== mergeCustomBarcodesFromCloud ====
+test("mergeCustomBarcodesFromCloud: adds a genuinely new barcode", function () {
+  M.state.customBarcodes = {};
+  M.recentlyDeletedIds.custom_barcodes.clear();
+  const added = M.mergeCustomBarcodesFromCloud([{ barcode: "111", food: { id: "barcode_111", name: "Trail Mix", calories: 400 } }]);
+  assertEqual(added, 1, "one barcode added");
+  assertEqual(M.state.customBarcodes["111"].name, "Trail Mix", "food data present");
+});
+test("mergeCustomBarcodesFromCloud: does not resurrect a recently-deleted barcode", function () {
+  M.state.customBarcodes = {};
+  M.recentlyDeletedIds.custom_barcodes.clear();
+  M.markRecentlyDeleted("custom_barcodes", "222");
+  const added = M.mergeCustomBarcodesFromCloud([{ barcode: "222", food: { id: "barcode_222", name: "Deleted Snack", calories: 200 } }]);
+  assertEqual(added, 0, "tombstoned barcode is not re-added");
+  assertEqual(M.state.customBarcodes["222"], undefined, "customBarcodes stays empty for that code");
+});
+test("actions.deleteBarcode: removes the local entry and tombstones it against a racing pull", function () {
+  M.state.session = null;
+  M.state.customBarcodes = { "333": { id: "barcode_333", name: "Snack", calories: 150 } };
+  M.state.ui = { strategy: { editingBarcodeCode: null, editBarcodeManual: null, confirmDeleteBarcodeCode: "333" } };
+  M.actions.deleteBarcode("333");
+  assertEqual(M.state.customBarcodes["333"], undefined, "entry removed locally");
+  assertEqual(M.wasRecentlyDeleted("custom_barcodes", "333"), true, "tombstoned so a racing pull can't resurrect it");
+  assertEqual(M.state.ui.strategy.confirmDeleteBarcodeCode, null, "confirm state cleared");
+});
+
+// ==== filterFoodsByName (History/Favorites live search) ====
+test("filterFoodsByName: substring match is case-insensitive", function () {
+  const list = [{ name: "Ice Cream" }, { name: "Ice Water" }, { name: "Bread" }];
+  assertEqual(M.filterFoodsByName(list, "ice").length, 2, "matches both ice- foods");
+  assertEqual(M.filterFoodsByName(list, "ICE-CREAM".slice(0,3)).length, 2, "case-insensitive");
+});
+test("filterFoodsByName: blank query returns the full list unfiltered", function () {
+  const list = [{ name: "Ice Cream" }, { name: "Bread" }];
+  assertEqual(M.filterFoodsByName(list, "").length, 2, "empty query is a no-op filter");
+  assertEqual(M.filterFoodsByName(list, "   ").length, 2, "whitespace-only query is a no-op filter");
+});
+test("filterFoodsByName: no match returns an empty array", function () {
+  const list = [{ name: "Ice Cream" }];
+  assertEqual(M.filterFoodsByName(list, "zzz").length, 0, "no substring match");
+});
+
+// ==== two-step delete confirmation (recipes, log entries) ====
+test("askDeleteRecipe: arms the confirm state but does not delete yet", function () {
+  M.state.recipes = [{ id: "r1", name: "Chili", ingredients: [] }];
+  M.state.ui = { food: { confirmDeleteRecipeId: null } };
+  M.actions.askDeleteRecipe("r1");
+  assertEqual(M.state.recipes.length, 1, "recipe still present after just arming");
+  assertEqual(M.state.ui.food.confirmDeleteRecipeId, "r1", "confirm state now points at the recipe");
+});
+test("cancelDeleteRecipe: disarms without deleting", function () {
+  M.state.recipes = [{ id: "r1", name: "Chili", ingredients: [] }];
+  M.state.ui = { food: { confirmDeleteRecipeId: "r1" } };
+  M.actions.cancelDeleteRecipe();
+  assertEqual(M.state.recipes.length, 1, "recipe untouched");
+  assertEqual(M.state.ui.food.confirmDeleteRecipeId, null, "confirm state cleared");
+});
+test("deleteRecipe: actually removes the recipe (the confirmed step)", function () {
+  M.state.recipes = [{ id: "r1", name: "Chili", ingredients: [] }];
+  M.state.ui = { food: { confirmDeleteRecipeId: "r1" } };
+  M.actions.deleteRecipe("r1");
+  assertEqual(M.state.recipes.length, 0, "recipe removed");
+  assertEqual(M.state.ui.food.confirmDeleteRecipeId, null, "confirm state cleared");
+});
+test("askRemoveFood: arms the confirm state but does not remove the log entry yet", function () {
+  M.state.date = "2026-07-15";
+  M.state.foodLogs = { "2026-07-15": [{ id: "e1", name: "Toast", weight: 50, macros: { calories: 100, protein: 3, carbs: 20, fat: 1, fiber: 1 } }] };
+  M.state.ui = { confirmRemoveEntryId: null };
+  M.actions.askRemoveFood("e1");
+  assertEqual(M.state.foodLogs["2026-07-15"].length, 1, "entry still present after just arming");
+  assertEqual(M.state.ui.confirmRemoveEntryId, "e1", "confirm state now points at the entry");
+});
+test("removeFood: actually removes the entry (the confirmed step)", function () {
+  M.state.date = "2026-07-15";
+  M.state.foodLogs = { "2026-07-15": [{ id: "e1", name: "Toast", weight: 50, macros: { calories: 100, protein: 3, carbs: 20, fat: 1, fiber: 1 } }] };
+  M.state.ui = { confirmRemoveEntryId: "e1" };
+  M.actions.removeFood("e1");
+  assertEqual(M.state.foodLogs["2026-07-15"].length, 0, "entry removed");
+  assertEqual(M.state.ui.confirmRemoveEntryId, null, "confirm state cleared");
 });
 
 // ==== mergeRecipesFromCloud ====

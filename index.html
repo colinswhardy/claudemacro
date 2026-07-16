@@ -488,6 +488,7 @@ function mergeFoodLogsFromCloud(cloudRows) {
 function mergeWeightsFromCloud(cloudRows) {
   let changed = 0;
   (cloudRows || []).forEach(function(row) {
+    if (wasRecentlyDeleted("weight_entries", row.log_date)) return;
     const existing = state.weights[row.log_date];
     const entry = { weight: row.weight, unit: row.unit || "lbs", timestamp: row.logged_at, updatedAt: row.updated_at || row.logged_at };
     if (existing) {
@@ -518,7 +519,7 @@ function mergeSettingsFromCloud(cloudData) {
 // which can race ahead of the DELETE below actually landing in Supabase -- doesn't silently
 // resurrect a row the user just removed by treating it as "new from the cloud."
 const RECENTLY_DELETED_TTL_MS = 30000;
-const recentlyDeletedIds = { food_log_entries: new Map(), recipes: new Map() };
+const recentlyDeletedIds = { food_log_entries: new Map(), recipes: new Map(), weight_entries: new Map(), custom_barcodes: new Map() };
 function markRecentlyDeleted(table, id) {
   if (recentlyDeletedIds[table]) recentlyDeletedIds[table].set(id, Date.now());
 }
@@ -637,7 +638,10 @@ async function pullCustomBarcodesFromCloud() {
 }
 function mergeCustomBarcodesFromCloud(cloudRows) {
   let added = 0;
-  (cloudRows || []).forEach(function(row) { if (!state.customBarcodes[row.barcode]) { state.customBarcodes[row.barcode] = row.food; added++; } });
+  (cloudRows || []).forEach(function(row) {
+    if (wasRecentlyDeleted("custom_barcodes", row.barcode)) return;
+    if (!state.customBarcodes[row.barcode]) { state.customBarcodes[row.barcode] = row.food; added++; }
+  });
   db.set("customBarcodes", state.customBarcodes);
   return added;
 }
@@ -1333,6 +1337,7 @@ function renderDashboard() {
 
 function renderFoodEntry(entry) {
   const editing = state.ui.editingEntryId === entry.id;
+  const confirmingRemove = state.ui.confirmRemoveEntryId === entry.id;
   let html = '<div class="foodEntry">' +
     '<div data-action="toggleEntryEditor" data-arg="' + entry.id + '" style="cursor:pointer;display:flex;justify-content:space-between;align-items:flex-start">' +
       '<div style="flex:1;min-width:0">' +
@@ -1342,7 +1347,7 @@ function renderFoodEntry(entry) {
       '<div style="text-align:right;display:flex;align-items:center;gap:8px">' +
         '<span style="color:' + C.calories + ';font-weight:700;font-size:16px">' + entry.macros.calories + '</span>' +
         '<span style="color:' + C.textMut + ';font-size:12px">kcal</span>' +
-        '<button data-action="removeFood" data-arg="' + entry.id + '" style="background:none;border:none;color:' + C.textMut + ';cursor:pointer;font-size:16px;padding:2px">\u{1F5D1}</button>' +
+        '<button data-action="askRemoveFood" data-arg="' + entry.id + '" style="background:none;border:none;color:' + C.textMut + ';cursor:pointer;font-size:16px;padding:2px">\u{1F5D1}</button>' +
       '</div>' +
     '</div>' +
     '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
@@ -1351,6 +1356,12 @@ function renderFoodEntry(entry) {
       '<span style="color:' + C.fat + '">F: ' + entry.macros.fat + 'g</span>' +
     '</div>';
 
+  if (confirmingRemove) {
+    html += '<div class="row" style="margin-top:8px">' +
+      btn({ label: "Cancel", action: "cancelRemoveFood", small: true, outline: true, full: true }) +
+      btn({ label: "Remove Entry?", action: "removeFood", arg: entry.id, small: true, full: true, color: "danger" }) +
+    '</div>';
+  }
   if (editing) html += renderEntryEditor(entry);
   html += '</div>';
   return html;
@@ -1441,7 +1452,14 @@ actions.toggleEntryEditor = function(entryId) {
   rerender();
 };
 actions.setEntrySection = function(section) { state.ui.entrySection = section; rerender(); };
-actions.removeFood = function(entryId) { removeFoodFromLog(entryId); rerender(); };
+actions.askRemoveFood = function(entryId) { state.ui.confirmRemoveEntryId = entryId; rerender(); };
+actions.cancelRemoveFood = function() { state.ui.confirmRemoveEntryId = null; rerender(); };
+actions.removeFood = function(entryId) {
+  state.ui.confirmRemoveEntryId = null;
+  if (state.ui.editingEntryId === entryId) closeEntryEditor();
+  removeFoodFromLog(entryId);
+  rerender();
+};
 
 inputActions.entryWeightInput = function(val) { state.ui.entryWeightInput = val; };
 actions.setEntryWeight = function(grams) { state.ui.entryWeightInput = grams; rerender(); };
@@ -1572,7 +1590,7 @@ actions.moveEntryCustomDate = function() {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100" };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null };
   return state.ui.food;
 }
 
@@ -1628,44 +1646,21 @@ function renderFoodTab() {
   }
 
   if (fu.subTab === "history") {
-    if (state.recentFoods.length === 0) {
-      html += card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No food history yet</div>');
-    } else {
-      state.recentFoods.forEach(function(food) {
-        const m = food.loggedMacros || { calories: food.calories, protein: food.protein, carbs: food.carbs, fat: food.fat };
-        const w = food.loggedWeight;
-        html += '<div class="foodResult" data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '" data-arg2="history">' +
-          '<div style="display:flex;justify-content:space-between">' +
-            '<div style="color:' + C.text + ';font-weight:500;font-size:14px">' + esc(food.name) + '</div>' +
-            '<span style="color:' + C.calories + ';font-weight:600">' + m.calories + ' kcal</span>' +
-          '</div>' +
-          '<div style="display:flex;gap:10px;margin-top:4px;font-size:12px">' +
-            '<span style="color:' + C.protein + '">P: ' + m.protein + 'g</span>' +
-            '<span style="color:' + C.carbs + '">C: ' + m.carbs + 'g</span>' +
-            '<span style="color:' + C.fat + '">F: ' + m.fat + 'g</span>' +
-            (w ? '<span style="color:' + C.textMut + ';margin-left:auto">last: ' + w + 'g</span>' : '') +
-          '</div></div>';
-      });
+    if (state.recentFoods.length > 0) {
+      html += '<div class="row" style="margin-bottom:12px">' +
+        textInput({ id: "historyQueryInput", value: fu.historyQuery, placeholder: "Search history...", bind: "historyQuery", style: "flex:1" }) +
+      '</div>';
     }
+    html += '<div id="historyListBlock">' + renderHistoryListBlock(fu) + '</div>';
   }
 
   if (fu.subTab === "favorites") {
-    if (state.favorites.length === 0) {
-      html += card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No favorites yet. Star foods to add them here.</div>');
-    } else {
-      state.favorites.forEach(function(food) {
-        html += '<div class="foodEntry" style="cursor:default;display:flex;justify-content:space-between;align-items:center">' +
-          '<div data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '" data-arg2="favorites" style="flex:1;cursor:pointer">' +
-            '<div style="color:' + C.text + ';font-weight:500;font-size:14px">' + esc(food.name) + '</div>' +
-            '<div style="display:flex;gap:10px;margin-top:4px;font-size:12px">' +
-              '<span style="color:' + C.protein + '">P: ' + food.protein + 'g</span>' +
-              '<span style="color:' + C.carbs + '">C: ' + food.carbs + 'g</span>' +
-              '<span style="color:' + C.fat + '">F: ' + food.fat + 'g</span>' +
-            '</div></div>' +
-          '<button data-action="toggleFavorite" data-arg="' + esc_attr(food.id) + '" style="background:none;border:none;color:' + C.warning + ';font-size:18px;cursor:pointer">\u2605</button>' +
-          '</div>';
-      });
+    if (state.favorites.length > 0) {
+      html += '<div class="row" style="margin-bottom:12px">' +
+        textInput({ id: "favoritesQueryInput", value: fu.favoritesQuery, placeholder: "Search favorites...", bind: "favoritesQuery", style: "flex:1" }) +
+      '</div>';
     }
+    html += '<div id="favoritesListBlock">' + renderFavoritesListBlock(fu) + '</div>';
   }
 
   if (fu.subTab === "recipes") {
@@ -1686,11 +1681,18 @@ function renderFoodTab() {
             '<span style="color:' + C.carbs + '">C: ' + round1(totals.carbs) + 'g</span>' +
             '<span style="color:' + C.fat + '">F: ' + round1(totals.fat) + 'g</span>' +
           '</div>' +
-          '<div class="row" style="margin-top:10px">' +
-            btn({ label: "Log", action: "logRecipe", arg: recipe.id, small: true }) +
-            btn({ label: "Edit", action: "editRecipe", arg: recipe.id, small: true, outline: true }) +
-            btn({ label: "\u{1F5D1}", action: "deleteRecipe", arg: recipe.id, small: true, outline: true, color: "danger" }) +
-          '</div></div>';
+          (fu.confirmDeleteRecipeId === recipe.id ?
+            '<div class="row" style="margin-top:10px">' +
+              btn({ label: "Cancel", action: "cancelDeleteRecipe", small: true, outline: true, full: true }) +
+              btn({ label: "Delete Recipe?", action: "deleteRecipe", arg: recipe.id, small: true, full: true, color: "danger" }) +
+            '</div>'
+          :
+            '<div class="row" style="margin-top:10px">' +
+              btn({ label: "Log", action: "logRecipe", arg: recipe.id, small: true }) +
+              btn({ label: "Edit", action: "editRecipe", arg: recipe.id, small: true, outline: true }) +
+              btn({ label: "\u{1F5D1}", action: "askDeleteRecipe", arg: recipe.id, small: true, outline: true, color: "danger" }) +
+            '</div>'
+          ) + '</div>';
       });
     }
   }
@@ -1763,6 +1765,75 @@ function localFoodMatches(q) {
   addFrom(Object.values(state.foodCache), true);
   return out;
 }
+
+function filterFoodsByName(list, query) {
+  const q = (query || "").trim().toLowerCase();
+  if (!q) return list;
+  return list.filter(function(f){ return f.name.toLowerCase().indexOf(q) >= 0; });
+}
+
+// Split out of renderFoodTab, same reason as renderFoodResultsBlock above: patched into
+// #historyListBlock/#favoritesListBlock directly as the user types a filter, instead of a full
+// rerender() that would blur the search box mid-keystroke.
+function renderHistoryListBlock(fu) {
+  if (state.recentFoods.length === 0) {
+    return card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No food history yet</div>');
+  }
+  const list = filterFoodsByName(state.recentFoods, fu.historyQuery);
+  if (list.length === 0) {
+    return '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No matches for “' + esc(fu.historyQuery) + '”</div>';
+  }
+  let html = '';
+  list.forEach(function(food) {
+    const m = food.loggedMacros || { calories: food.calories, protein: food.protein, carbs: food.carbs, fat: food.fat };
+    const w = food.loggedWeight;
+    html += '<div class="foodResult" data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '" data-arg2="history">' +
+      '<div style="display:flex;justify-content:space-between">' +
+        '<div style="color:' + C.text + ';font-weight:500;font-size:14px">' + esc(food.name) + '</div>' +
+        '<span style="color:' + C.calories + ';font-weight:600">' + m.calories + ' kcal</span>' +
+      '</div>' +
+      '<div style="display:flex;gap:10px;margin-top:4px;font-size:12px">' +
+        '<span style="color:' + C.protein + '">P: ' + m.protein + 'g</span>' +
+        '<span style="color:' + C.carbs + '">C: ' + m.carbs + 'g</span>' +
+        '<span style="color:' + C.fat + '">F: ' + m.fat + 'g</span>' +
+        (w ? '<span style="color:' + C.textMut + ';margin-left:auto">last: ' + w + 'g</span>' : '') +
+      '</div></div>';
+  });
+  return html;
+}
+function renderFavoritesListBlock(fu) {
+  if (state.favorites.length === 0) {
+    return card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No favorites yet. Star foods to add them here.</div>');
+  }
+  const list = filterFoodsByName(state.favorites, fu.favoritesQuery);
+  if (list.length === 0) {
+    return '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No matches for “' + esc(fu.favoritesQuery) + '”</div>';
+  }
+  let html = '';
+  list.forEach(function(food) {
+    html += '<div class="foodEntry" style="cursor:default;display:flex;justify-content:space-between;align-items:center">' +
+      '<div data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '" data-arg2="favorites" style="flex:1;cursor:pointer">' +
+        '<div style="color:' + C.text + ';font-weight:500;font-size:14px">' + esc(food.name) + '</div>' +
+        '<div style="display:flex;gap:10px;margin-top:4px;font-size:12px">' +
+          '<span style="color:' + C.protein + '">P: ' + food.protein + 'g</span>' +
+          '<span style="color:' + C.carbs + '">C: ' + food.carbs + 'g</span>' +
+          '<span style="color:' + C.fat + '">F: ' + food.fat + 'g</span>' +
+        '</div></div>' +
+      '<button data-action="toggleFavorite" data-arg="' + esc_attr(food.id) + '" style="background:none;border:none;color:' + C.warning + ';font-size:18px;cursor:pointer">★</button>' +
+      '</div>';
+  });
+  return html;
+}
+inputActions.historyQuery = function(val) {
+  foodUi().historyQuery = val;
+  const el = document.getElementById("historyListBlock");
+  if (el) el.innerHTML = renderHistoryListBlock(foodUi());
+};
+inputActions.favoritesQuery = function(val) {
+  foodUi().favoritesQuery = val;
+  const el = document.getElementById("favoritesListBlock");
+  if (el) el.innerHTML = renderFavoritesListBlock(foodUi());
+};
 
 actions.setFoodSubTab = function(key) { foodUi().subTab = key; rerender(); };
 
@@ -1854,6 +1925,7 @@ function renderBarcodeScanScreen(fu) {
           '<div><label class="label" style="color:' + C.protein + '">Protein (g)</label>' + textInput({ value: m.protein, type: "number", bind: "customBarcodeProtein", enter: "saveCustomBarcode" }) + '</div>' +
           '<div><label class="label" style="color:' + C.carbs + '">Carbs (g)</label>' + textInput({ value: m.carbs, type: "number", bind: "customBarcodeCarbs", enter: "saveCustomBarcode" }) + '</div>' +
           '<div><label class="label" style="color:' + C.fat + '">Fat (g)</label>' + textInput({ value: m.fat, type: "number", bind: "customBarcodeFat", enter: "saveCustomBarcode" }) + '</div>' +
+          '<div><label class="label" style="color:' + C.textMut + '">Fiber (g)</label>' + textInput({ value: m.fiber, type: "number", bind: "customBarcodeFiber", enter: "saveCustomBarcode" }) + '</div>' +
         '</div>' +
         '<div style="color:' + C.textMut + ';font-size:11px">Calories auto-calculate from protein/carbs/fat — edit it directly to override.</div>' +
       '</div>';
@@ -1979,7 +2051,7 @@ actions.lookupManualBarcode = async function() {
   await handleBarcodeDetected(code);
 };
 
-["Name","Weight","Calories","Protein","Carbs","Fat"].forEach(function(f) {
+["Name","Weight","Calories","Protein","Carbs","Fat","Fiber"].forEach(function(f) {
   inputActions["customBarcode" + f] = function(val) { foodUi().customBarcodeManual[f.toLowerCase()] = val; };
 });
 ["Protein","Carbs","Fat"].forEach(function(f) {
@@ -2045,7 +2117,10 @@ actions.editRecipe = function(id) {
   rerender();
 };
 actions.cancelRecipeBuilder = function() { stepBackOneLevel(); };
+actions.askDeleteRecipe = function(id) { foodUi().confirmDeleteRecipeId = id; rerender(); };
+actions.cancelDeleteRecipe = function() { foodUi().confirmDeleteRecipeId = null; rerender(); };
 actions.deleteRecipe = function(id) {
+  foodUi().confirmDeleteRecipeId = null;
   state.recipes = state.recipes.filter(function(r){ return r.id !== id; });
   saveRecipes();
   scheduleCloudDelete("recipes", "id", id);
@@ -2231,10 +2306,21 @@ actions.confirmAddIngredient = function() {
   rb.picker = null;
   rerender();
 };
-["Name","Weight","Calories","Protein","Carbs","Fat"].forEach(function(f) {
+["Name","Weight","Calories","Protein","Carbs","Fat","Fiber"].forEach(function(f) {
   inputActions["ingManual" + f] = function(val) {
     const rb = foodUi().recipeBuilder;
     if (rb && rb.picker) rb.picker.manual[f.toLowerCase()] = val;
+  };
+});
+["Protein","Carbs","Fat"].forEach(function(f) {
+  inputActions["ingManual" + f] = function(val) {
+    const rb = foodUi().recipeBuilder;
+    if (!rb || !rb.picker) return;
+    const m = rb.picker.manual;
+    m[f.toLowerCase()] = val;
+    m.calories = String(calcCaloriesFromMacros(m.protein, m.carbs, m.fat));
+    const el = document.getElementById("ingManualCaloriesInput");
+    if (el) el.value = m.calories;
   };
 });
 actions.confirmAddManualIngredient = function() {
@@ -2314,11 +2400,13 @@ function renderIngredientPickerScreen(fu, rb) {
       '<div><label class="label">Ingredient Name</label>' + textInput({ value: m.name, placeholder: "e.g. Olive Oil", bind: "ingManualName", enter: "confirmAddManualIngredient" }) + '</div>' +
       '<div><label class="label">Weight (g)</label>' + textInput({ value: m.weight, type: "number", bind: "ingManualWeight", enter: "confirmAddManualIngredient" }) + '</div>' +
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
-        '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' + textInput({ value: m.calories, type: "number", bind: "ingManualCalories", enter: "confirmAddManualIngredient" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' + textInput({ id: "ingManualCaloriesInput", value: m.calories, type: "number", bind: "ingManualCalories", enter: "confirmAddManualIngredient" }) + '</div>' +
         '<div><label class="label" style="color:' + C.protein + '">Protein (g)</label>' + textInput({ value: m.protein, type: "number", bind: "ingManualProtein", enter: "confirmAddManualIngredient" }) + '</div>' +
         '<div><label class="label" style="color:' + C.carbs + '">Carbs (g)</label>' + textInput({ value: m.carbs, type: "number", bind: "ingManualCarbs", enter: "confirmAddManualIngredient" }) + '</div>' +
         '<div><label class="label" style="color:' + C.fat + '">Fat (g)</label>' + textInput({ value: m.fat, type: "number", bind: "ingManualFat", enter: "confirmAddManualIngredient" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.textMut + '">Fiber (g)</label>' + textInput({ value: m.fiber, type: "number", bind: "ingManualFiber", enter: "confirmAddManualIngredient" }) + '</div>' +
       '</div>' +
+      '<div style="color:' + C.textMut + ';font-size:11px">Calories auto-calculate from protein/carbs/fat — edit it directly to override.</div>' +
     '</div>';
     inner += btn({ label: "Add Ingredient", action: "confirmAddManualIngredient", full: true, extraStyle: "margin-top:16px" });
   }
@@ -2541,6 +2629,7 @@ function renderManualEntryScreen(fu) {
         manualField("protein", "Protein (g)", m.protein, C.protein) +
         manualField("carbs", "Carbs (g)", m.carbs, C.carbs) +
         manualField("fat", "Fat (g)", m.fat, C.fat) +
+        manualField("fiber", "Fiber (g)", m.fiber, C.textMut) +
       '</div>' +
       '<div style="color:' + C.textMut + ';font-size:11px">Calories auto-calculate from protein/carbs/fat (4/4/9 kcal per gram) — edit it directly to override.</div>' +
     '</div>' +
@@ -3137,7 +3226,7 @@ actions.wizardConfirmAdd = function() {
 // WEIGHT TAB
 // ============================================================
 function weightUi() {
-  if (!state.ui.weight) state.ui.weight = { input: "", timeRange: "30d", importMsg: "", editingStart: false, startInputDate: "", startInputWeight: "", selectedPoint: null };
+  if (!state.ui.weight) state.ui.weight = { input: "", timeRange: "30d", importMsg: "", editingStart: false, startInputDate: "", startInputWeight: "", selectedPoint: null, confirmDeleteDate: null };
   return state.ui.weight;
 }
 
@@ -3220,10 +3309,22 @@ function renderWeightTab() {
       renderWeightChart(chartData, set.goalWeight, wu.selectedPoint);
     const selPoint = wu.selectedPoint ? chartData.find(function(d){ return d.date === wu.selectedPoint; }) : null;
     if (selPoint) {
-      histInner += '<div style="margin-top:12px;padding:12px 14px;background:' + C.inputBg + ';border:1px solid ' + C.border + ';border-radius:12px;display:flex;justify-content:space-between;align-items:center">' +
-        '<div><div style="color:' + C.textMut + ';font-size:12px">' + esc(dayLabel(selPoint.date)) + '</div>' +
-        '<div style="font-size:18px;font-weight:700;margin-top:2px;color:' + C.text + '">' + selPoint.weight + ' ' + unit + '</div></div>' +
-        '<button data-action="selectWeightPoint" data-arg="" style="background:none;border:none;color:' + C.textMut + ';font-size:18px;cursor:pointer;padding:4px">✕</button>' +
+      const confirmingDeleteWeight = wu.confirmDeleteDate === selPoint.date;
+      histInner += '<div style="margin-top:12px;padding:12px 14px;background:' + C.inputBg + ';border:1px solid ' + C.border + ';border-radius:12px">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center">' +
+          '<div><div style="color:' + C.textMut + ';font-size:12px">' + esc(dayLabel(selPoint.date)) + '</div>' +
+          '<div style="font-size:18px;font-weight:700;margin-top:2px;color:' + C.text + '">' + selPoint.weight + ' ' + unit + '</div></div>' +
+          '<div style="display:flex;align-items:center;gap:4px">' +
+            '<button data-action="askDeleteWeight" data-arg="' + selPoint.date + '" style="background:none;border:none;color:' + C.textMut + ';font-size:16px;cursor:pointer;padding:4px">\u{1F5D1}</button>' +
+            '<button data-action="selectWeightPoint" data-arg="" style="background:none;border:none;color:' + C.textMut + ';font-size:18px;cursor:pointer;padding:4px">✕</button>' +
+          '</div>' +
+        '</div>' +
+        (confirmingDeleteWeight ?
+          '<div class="row" style="margin-top:10px">' +
+            btn({ label: "Cancel", action: "cancelDeleteWeight", small: true, outline: true, full: true }) +
+            btn({ label: "Delete Entry?", action: "deleteWeight", arg: selPoint.date, small: true, full: true, color: "danger" }) +
+          '</div>'
+        : '') +
       '</div>';
     }
     html += card(histInner);
@@ -3311,6 +3412,18 @@ actions.setWeightRange = function(r) { weightUi().timeRange = r; rerender(); };
 actions.selectWeightPoint = function(date) {
   const wu = weightUi();
   wu.selectedPoint = (!date || wu.selectedPoint === date) ? null : date;
+  wu.confirmDeleteDate = null;
+  rerender();
+};
+actions.askDeleteWeight = function(date) { weightUi().confirmDeleteDate = date; rerender(); };
+actions.cancelDeleteWeight = function() { weightUi().confirmDeleteDate = null; rerender(); };
+actions.deleteWeight = function(date) {
+  const wu = weightUi();
+  delete state.weights[date];
+  saveWeights();
+  scheduleCloudDelete("weight_entries", "log_date", date);
+  wu.confirmDeleteDate = null;
+  if (wu.selectedPoint === date) wu.selectedPoint = null;
   rerender();
 };
 
@@ -3423,7 +3536,7 @@ changeActions.renphoImport = function(el) {
 // STRATEGY TAB
 // ============================================================
 function strategyUi() {
-  if (!state.ui.strategy) state.ui.strategy = { section: "targets", inputMode: "grams", confirmClear: false, syncTesting: false, syncTestMsg: null };
+  if (!state.ui.strategy) state.ui.strategy = { section: "targets", inputMode: "grams", confirmClear: false, syncTesting: false, syncTestMsg: null, editingBarcodeCode: null, editBarcodeManual: null, confirmDeleteBarcodeCode: null };
   return state.ui.strategy;
 }
 
@@ -3718,8 +3831,131 @@ function renderDataSection() {
   }
   html += '</div>';
   html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:16px;text-align:center">MacroLog v1.0</div>';
+  return card(html) + renderCustomBarcodesSection();
+}
+
+// Custom barcodes previously had no way to view, fix, or remove after saving them once from
+// the "barcode not found" flow -- this gives that data a home in Data Management instead of
+// requiring a re-scan (to overwrite) or Clear All Data (to remove) to correct a typo.
+function renderCustomBarcodesSection() {
+  const su = strategyUi();
+  const codes = Object.keys(state.customBarcodes);
+  let html = '<h3 class="cardTitle" style="margin-bottom:4px">Custom Barcodes</h3>';
+  html += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:16px">Foods you’ve entered by hand after a barcode scan found no match.</div>';
+  if (codes.length === 0) {
+    html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">None saved yet.</div>';
+  } else {
+    codes.forEach(function(code) {
+      const food = state.customBarcodes[code];
+      const editing = su.editingBarcodeCode === code;
+      const confirming = su.confirmDeleteBarcodeCode === code;
+      html += '<div class="foodEntry">' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+          '<div style="flex:1;min-width:0">' +
+            '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(food.name) + '</div>' +
+            '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">' + esc(code) + '</div>' +
+          '</div>' +
+          '<div style="text-align:right"><span style="color:' + C.calories + ';font-weight:700">' + food.calories + '</span><span style="color:' + C.textMut + ';font-size:11px"> kcal</span></div>' +
+        '</div>' +
+        '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
+          '<span style="color:' + C.protein + '">P: ' + food.protein + 'g</span>' +
+          '<span style="color:' + C.carbs + '">C: ' + food.carbs + 'g</span>' +
+          '<span style="color:' + C.fat + '">F: ' + food.fat + 'g</span>' +
+        '</div>';
+      if (confirming) {
+        html += '<div class="row" style="margin-top:10px">' +
+          btn({ label: "Cancel", action: "cancelDeleteBarcode", small: true, outline: true, full: true }) +
+          btn({ label: "Delete?", action: "deleteBarcode", arg: code, small: true, full: true, color: "danger" }) +
+        '</div>';
+      } else if (editing) {
+        html += renderBarcodeEditForm(su);
+      } else {
+        html += '<div class="row" style="margin-top:10px">' +
+          btn({ label: "Edit", action: "askEditBarcode", arg: code, small: true, outline: true }) +
+          btn({ label: "\u{1F5D1}", action: "askDeleteBarcode", arg: code, small: true, outline: true, color: "danger" }) +
+        '</div>';
+      }
+      html += '</div>';
+    });
+  }
   return card(html);
 }
+
+function renderBarcodeEditForm(su) {
+  const m = su.editBarcodeManual;
+  return '<div style="margin-top:10px;padding:10px;background:' + C.bg + ';border-radius:10px">' +
+    '<div style="display:flex;flex-direction:column;gap:10px">' +
+      '<div><label class="label">Food Name</label>' + textInput({ value: m.name, bind: "editBarcodeName", enter: "saveEditBarcode" }) + '</div>' +
+      '<div><label class="label">Weight (g)</label>' + textInput({ value: m.weight, type: "number", bind: "editBarcodeWeight", enter: "saveEditBarcode" }) + '</div>' +
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
+        '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' + textInput({ id: "editBarcodeCaloriesInput", value: m.calories, type: "number", bind: "editBarcodeCalories", enter: "saveEditBarcode" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.protein + '">Protein (g)</label>' + textInput({ value: m.protein, type: "number", bind: "editBarcodeProtein", enter: "saveEditBarcode" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.carbs + '">Carbs (g)</label>' + textInput({ value: m.carbs, type: "number", bind: "editBarcodeCarbs", enter: "saveEditBarcode" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.fat + '">Fat (g)</label>' + textInput({ value: m.fat, type: "number", bind: "editBarcodeFat", enter: "saveEditBarcode" }) + '</div>' +
+        '<div><label class="label" style="color:' + C.textMut + '">Fiber (g)</label>' + textInput({ value: m.fiber, type: "number", bind: "editBarcodeFiber", enter: "saveEditBarcode" }) + '</div>' +
+      '</div>' +
+      '<div style="color:' + C.textMut + ';font-size:11px">Calories auto-calculate from protein/carbs/fat — edit it directly to override.</div>' +
+    '</div>' +
+    '<div class="row" style="margin-top:12px">' +
+      btn({ label: "Cancel", action: "cancelEditBarcode", small: true, outline: true, full: true }) +
+      btn({ label: "Save", action: "saveEditBarcode", small: true, full: true }) +
+    '</div>' +
+  '</div>';
+}
+
+actions.askEditBarcode = function(code) {
+  const su = strategyUi();
+  const food = state.customBarcodes[code];
+  if (!food) return;
+  su.editingBarcodeCode = code;
+  su.confirmDeleteBarcodeCode = null;
+  const grams = (food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams) || 100;
+  su.editBarcodeManual = { name: food.name, weight: String(grams), calories: String(food.calories), protein: String(food.protein), carbs: String(food.carbs), fat: String(food.fat), fiber: String(food.fiber || 0) };
+  rerender();
+};
+actions.cancelEditBarcode = function() { const su = strategyUi(); su.editingBarcodeCode = null; su.editBarcodeManual = null; rerender(); };
+actions.saveEditBarcode = function() {
+  const su = strategyUi();
+  const code = su.editingBarcodeCode;
+  const m = su.editBarcodeManual;
+  if (!code || !m || !m.name.trim()) return;
+  const weightParsed = parseFloat(m.weight);
+  const weight = isNaN(weightParsed) ? 100 : Math.max(0, weightParsed);
+  const food = {
+    id: "barcode_" + code, name: m.name.trim(), brand: "", source: "Custom Barcode Entry",
+    per100g: false, calories: Math.max(0, parseFloat(m.calories) || 0), protein: Math.max(0, parseFloat(m.protein) || 0),
+    carbs: Math.max(0, parseFloat(m.carbs) || 0), fat: Math.max(0, parseFloat(m.fat) || 0), fiber: Math.max(0, parseFloat(m.fiber) || 0),
+    state: "—", servingSizes: [{ label: weight + "g", grams: weight }],
+  };
+  state.customBarcodes[code] = food;
+  saveCustomBarcodes();
+  if (state.foodCache["barcode_" + code]) { state.foodCache["barcode_" + code] = food; saveFoodCache(); }
+  su.editingBarcodeCode = null;
+  su.editBarcodeManual = null;
+  rerender();
+};
+actions.askDeleteBarcode = function(code) { const su = strategyUi(); su.confirmDeleteBarcodeCode = code; su.editingBarcodeCode = null; rerender(); };
+actions.cancelDeleteBarcode = function() { strategyUi().confirmDeleteBarcodeCode = null; rerender(); };
+actions.deleteBarcode = function(code) {
+  strategyUi().confirmDeleteBarcodeCode = null;
+  delete state.customBarcodes[code];
+  saveCustomBarcodes();
+  scheduleCloudDelete("custom_barcodes", "barcode", code);
+  rerender();
+};
+
+["Name","Weight","Calories","Protein","Carbs","Fat","Fiber"].forEach(function(f) {
+  inputActions["editBarcode" + f] = function(val) { strategyUi().editBarcodeManual[f.toLowerCase()] = val; };
+});
+["Protein","Carbs","Fat"].forEach(function(f) {
+  inputActions["editBarcode" + f] = function(val) {
+    const m = strategyUi().editBarcodeManual;
+    m[f.toLowerCase()] = val;
+    m.calories = String(calcCaloriesFromMacros(m.protein, m.carbs, m.fat));
+    const el = document.getElementById("editBarcodeCaloriesInput");
+    if (el) el.value = m.calories;
+  };
+});
 
 actions.exportData = function() {
   const exportObj = { settings: state.settings, foodLogs: state.foodLogs, weights: state.weights, favorites: state.favorites, recentFoods: state.recentFoods, recipes: state.recipes, customBarcodes: state.customBarcodes, exportDate: new Date().toISOString(), version: "1.0" };
