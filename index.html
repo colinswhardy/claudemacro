@@ -1401,6 +1401,7 @@ function renderEntryEditor(entry) {
       '<button class="sectionBtn' + (section === "portion" ? " active" : "") + '" data-action="setEntrySection" data-arg="portion">Portion</button>' +
       '<button class="sectionBtn' + (section === "macros" ? " active" : "") + '" data-action="setEntrySection" data-arg="macros">Macros</button>' +
       '<button class="sectionBtn' + (section === "move" ? " active" : "") + '" data-action="setEntrySection" data-arg="move">Move Day</button>' +
+      '<button class="sectionBtn' + (section === "copy" ? " active" : "") + '" data-action="setEntrySection" data-arg="copy">Copy</button>' +
     '</div>';
 
   if (section === "portion") {
@@ -1439,7 +1440,7 @@ function renderEntryEditor(entry) {
       (isCustom ? "This is a " + (entry.source === "Recipe" ? "recipe" : "custom food") + " you created \u2014 saving here also updates it for next time." : "This only changes today\u2019s entry \u2014 the original food won\u2019t be affected.") +
     '</div>';
     html += btn({ label: "Save Macros", action: "saveEditMacros", small: true });
-  } else {
+  } else if (section === "move") {
     const targetDate = state.ui.entryMoveDate || state.date;
     html += '<div class="row" style="margin-bottom:10px">' +
       btn({ label: "\u2039 Yesterday", action: "moveEntryYesterday", small: true, outline: true }) +
@@ -1448,6 +1449,17 @@ function renderEntryEditor(entry) {
     html += '<div class="row" style="align-items:center">' +
       textInput({ value: targetDate, type: "date", bind: "entryMoveDate", style: "flex:1" }) +
       btn({ label: "Move", action: "moveEntryCustomDate", small: true }) +
+    '</div>';
+  } else {
+    const copyDate = state.ui.entryCopyDate || state.date;
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:10px">Logs a duplicate of this entry on the date you pick \u2014 the original stays right here.</div>';
+    html += '<div class="row" style="margin-bottom:10px">' +
+      btn({ label: "\u2039 Yesterday", action: "copyEntryYesterday", small: true, outline: true }) +
+      btn({ label: "Tomorrow \u203a", action: "copyEntryTomorrow", small: true, outline: true }) +
+    '</div>';
+    html += '<div class="row" style="align-items:center">' +
+      textInput({ value: copyDate, type: "date", bind: "entryCopyDate", style: "flex:1" }) +
+      btn({ label: "Copy", action: "copyEntryCustomDate", small: true }) +
     '</div>';
   }
   html += '</div>';
@@ -1464,6 +1476,7 @@ function closeEntryEditor() {
   state.ui.entrySection = "portion";
   state.ui.entryWeightInput = null;
   state.ui.entryMoveDate = null;
+  state.ui.entryCopyDate = null;
 }
 
 actions.toggleEntryEditor = function(entryId) {
@@ -1609,6 +1622,54 @@ actions.moveEntryCustomDate = function() {
   if (!id || !state.ui.entryMoveDate) return;
   moveFoodEntryToDate(id, state.ui.entryMoveDate);
   closeEntryEditor();
+  rerender();
+};
+
+// Unlike moveFoodEntryToDate, copying to the same date the entry is already on is allowed --
+// duplicating something logged today onto today ("ate a second serving") is a legitimate case,
+// not a no-op to guard against. Leaves the editor open (no closeEntryEditor call) so copying
+// the same item to several dates in a row doesn't require reopening it each time.
+function copyFoodEntryToDate(entryId, toDate) {
+  const fromDate = state.date;
+  if (!toDate) return false;
+  const list = state.foodLogs[fromDate] || [];
+  const entry = list.find(function(e){ return e.id === entryId; });
+  if (!entry) return false;
+  const now = new Date().toISOString();
+  const copy = Object.assign({}, entry, {
+    id: "log_" + Date.now() + "_" + Math.random().toString(36).slice(2,7),
+    timestamp: now, updatedAt: now,
+    photoExpires: entry.photo ? new Date(Date.now() + 2*24*60*60*1000).toISOString() : null,
+  });
+  if (!state.foodLogs[toDate]) state.foodLogs[toDate] = [];
+  state.foodLogs[toDate].push(copy);
+  saveFoodLogs();
+  return true;
+}
+inputActions.entryCopyDate = function(val) { state.ui.entryCopyDate = val; };
+actions.copyEntryYesterday = function() {
+  const id = state.ui.editingEntryId;
+  if (!id) return;
+  const d = parseDateStr(state.date);
+  d.setDate(d.getDate() - 1);
+  const toDate = fmtDate(d);
+  if (copyFoodEntryToDate(id, toDate)) { showToast("Copied to " + dayLabel(toDate)); return; } // showToast already rerenders
+  rerender();
+};
+actions.copyEntryTomorrow = function() {
+  const id = state.ui.editingEntryId;
+  if (!id) return;
+  const d = parseDateStr(state.date);
+  d.setDate(d.getDate() + 1);
+  const toDate = fmtDate(d);
+  if (copyFoodEntryToDate(id, toDate)) { showToast("Copied to " + dayLabel(toDate)); return; }
+  rerender();
+};
+actions.copyEntryCustomDate = function() {
+  const id = state.ui.editingEntryId;
+  const toDate = state.ui.entryCopyDate;
+  if (!id || !toDate) return;
+  if (copyFoodEntryToDate(id, toDate)) { showToast("Copied to " + dayLabel(toDate)); return; }
   rerender();
 };
 

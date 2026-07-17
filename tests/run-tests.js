@@ -97,6 +97,7 @@ const exportLine =
   "mergeCustomBarcodesFromCloud: mergeCustomBarcodesFromCloud, filterFoodsByName: filterFoodsByName, " +
   "isAnimalProteinFood: isAnimalProteinFood, getDayTotals: getDayTotals, " +
   "estimateMaintenanceCalories: estimateMaintenanceCalories, computeGoalPlan: computeGoalPlan, " +
+  "copyFoodEntryToDate: copyFoodEntryToDate, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -194,6 +195,42 @@ test("getDayTotals: a mixed-keyword dish is attributed fully to animal protein (
 test("getDayTotals: an empty day has zero plant-protein total, not NaN/undefined", function () {
   M.state.foodLogs = {};
   assertEqual(M.getDayTotals("2026-07-16").plantProtein, 0, "zero for a day with no entries");
+});
+
+// ==== copyFoodEntryToDate ====
+test("copyFoodEntryToDate: duplicates the entry onto the target date with a new id", function () {
+  M.state.date = "2026-07-16";
+  M.state.foodLogs = { "2026-07-16": [{ id: "e1", foodId: "f1", name: "Oatmeal", weight: 100, macros: { calories: 150, protein: 5, carbs: 27, fat: 3, fiber: 4 }, timestamp: "2026-07-16T08:00:00.000Z", source: "USDA" }] };
+  const ok = M.copyFoodEntryToDate("e1", "2026-07-17");
+  assertEqual(ok, true, "copy succeeds");
+  assertEqual(M.state.foodLogs["2026-07-16"].length, 1, "original entry untouched, still on the source date");
+  assertEqual(M.state.foodLogs["2026-07-17"].length, 1, "one new entry on the target date");
+  const copy = M.state.foodLogs["2026-07-17"][0];
+  assertEqual(copy.name, "Oatmeal", "food data carried over");
+  assertEqual(copy.macros.calories, 150, "macros carried over");
+  assertEqual(copy.id === "e1", false, "copy gets its own id, distinct from the original");
+});
+test("copyFoodEntryToDate: copying onto the same date is allowed (duplicate a second serving)", function () {
+  M.state.date = "2026-07-16";
+  M.state.foodLogs = { "2026-07-16": [{ id: "e1", foodId: "f1", name: "Snack", weight: 50, macros: { calories: 100, protein: 2, carbs: 10, fat: 5, fiber: 1 }, timestamp: "2026-07-16T08:00:00.000Z", source: "Manual" }] };
+  const ok = M.copyFoodEntryToDate("e1", "2026-07-16");
+  assertEqual(ok, true, "same-date copy succeeds (unlike move, which treats this as a no-op)");
+  assertEqual(M.state.foodLogs["2026-07-16"].length, 2, "now two entries on the same day");
+});
+test("copyFoodEntryToDate: unknown entry id fails without touching state", function () {
+  M.state.date = "2026-07-16";
+  M.state.foodLogs = { "2026-07-16": [{ id: "e1", foodId: "f1", name: "Oatmeal", weight: 100, macros: { calories: 150, protein: 5, carbs: 27, fat: 3, fiber: 4 } }] };
+  const ok = M.copyFoodEntryToDate("does_not_exist", "2026-07-17");
+  assertEqual(ok, false, "no matching entry to copy");
+  assertEqual(M.state.foodLogs["2026-07-17"], undefined, "no entry created on the target date");
+});
+test("actions.copyEntryTomorrow: leaves the editor open (unlike moving, which closes it)", function () {
+  M.state.date = "2026-07-16";
+  M.state.foodLogs = { "2026-07-16": [{ id: "e1", foodId: "f1", name: "Oatmeal", weight: 100, macros: { calories: 150, protein: 5, carbs: 27, fat: 3, fiber: 4 } }] };
+  M.state.ui = { editingEntryId: "e1", entrySection: "copy" };
+  M.actions.copyEntryTomorrow();
+  assertEqual(M.state.ui.editingEntryId, "e1", "editor stays open on the same entry for repeat copies");
+  assertEqual(M.state.foodLogs["2026-07-17"].length, 1, "copy landed on tomorrow");
 });
 
 // ==== estimateMaintenanceCalories / computeGoalPlan ====
