@@ -98,6 +98,7 @@ const exportLine =
   "isAnimalProteinFood: isAnimalProteinFood, getDayTotals: getDayTotals, " +
   "estimateMaintenanceCalories: estimateMaintenanceCalories, computeGoalPlan: computeGoalPlan, " +
   "copyFoodEntryToDate: copyFoodEntryToDate, " +
+  "scheduleCloudSync: scheduleCloudSync, flushPendingCloudSyncs: flushPendingCloudSyncs, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -231,6 +232,59 @@ test("actions.copyEntryTomorrow: leaves the editor open (unlike moving, which cl
   M.actions.copyEntryTomorrow();
   assertEqual(M.state.ui.editingEntryId, "e1", "editor stays open on the same entry for repeat copies");
   assertEqual(M.state.foodLogs["2026-07-17"].length, 1, "copy landed on tomorrow");
+});
+test("actions.moveEntryToday: moves an entry from a past viewed day back to the real current date", function () {
+  const today = M.fmtDate(new Date());
+  M.state.date = "2026-01-01"; // a day in the past being viewed -- distinct from "today"
+  M.state.foodLogs = { "2026-01-01": [{ id: "e1", foodId: "f1", name: "Leftover Pizza", weight: 200, macros: { calories: 500, protein: 20, carbs: 60, fat: 20, fiber: 3 } }] };
+  M.state.ui = { editingEntryId: "e1", entrySection: "move" };
+  M.actions.moveEntryToday();
+  assertEqual(M.state.foodLogs["2026-01-01"].length, 0, "removed from the viewed day");
+  assertEqual(M.state.foodLogs[today].length, 1, "moved onto the real current date, not just \"tomorrow\" relative to the viewed day");
+  assertEqual(M.state.ui.editingEntryId, null, "editor closes, matching moveEntryYesterday/Tomorrow");
+});
+test("actions.copyEntryToday: duplicates an entry from a past viewed day onto today, leaving the original", function () {
+  const today = M.fmtDate(new Date());
+  M.state.date = "2026-01-01";
+  M.state.foodLogs = { "2026-01-01": [{ id: "e1", foodId: "f1", name: "Leftover Pizza", weight: 200, macros: { calories: 500, protein: 20, carbs: 60, fat: 20, fiber: 3 } }] };
+  M.state.ui = { editingEntryId: "e1", entrySection: "copy" };
+  M.actions.copyEntryToday();
+  assertEqual(M.state.foodLogs["2026-01-01"].length, 1, "original untouched on the viewed day");
+  assertEqual(M.state.foodLogs[today].length, 1, "copy landed on the real current date");
+  assertEqual(M.state.ui.editingEntryId, "e1", "editor stays open, matching copyEntryYesterday/Tomorrow");
+});
+
+// ==== scheduleCloudSync / flushPendingCloudSyncs ====
+// Guards against the exact bug this was built to fix: a debounced push that never fires
+// because the app was backgrounded/closed within the 2.5s window, leaving an entry stranded
+// in local storage with no cloud copy.
+test("flushPendingCloudSyncs: fires a pending debounced push immediately instead of waiting out the timer", function () {
+  M.state.session = { userId: "test-user", accessToken: "tok", expiresAt: Date.now() + 100000 };
+  let calls = 0;
+  M.scheduleCloudSync("testKind", function () { calls++; return Promise.resolve({ data: [] }); });
+  assertEqual(calls, 0, "push has not fired yet -- still inside the debounce window");
+  M.flushPendingCloudSyncs();
+  assertEqual(calls, 1, "flush fires the pending push right away");
+  M.state.session = null;
+});
+test("flushPendingCloudSyncs: a second flush with nothing pending is a safe no-op", function () {
+  M.state.session = { userId: "test-user", accessToken: "tok", expiresAt: Date.now() + 100000 };
+  let calls = 0;
+  M.scheduleCloudSync("testKind2", function () { calls++; return Promise.resolve({ data: [] }); });
+  M.flushPendingCloudSyncs();
+  M.flushPendingCloudSyncs();
+  assertEqual(calls, 1, "flushing twice does not double-fire the same push");
+  M.state.session = null;
+});
+test("scheduleCloudSync: a second schedule for the same kind before flush replaces, not duplicates, the pending push", function () {
+  M.state.session = { userId: "test-user", accessToken: "tok", expiresAt: Date.now() + 100000 };
+  let firstCalls = 0, secondCalls = 0;
+  M.scheduleCloudSync("testKind3", function () { firstCalls++; return Promise.resolve({ data: [] }); });
+  M.scheduleCloudSync("testKind3", function () { secondCalls++; return Promise.resolve({ data: [] }); });
+  M.flushPendingCloudSyncs();
+  assertEqual(firstCalls, 0, "the superseded push never fires");
+  assertEqual(secondCalls, 1, "only the latest scheduled push for that kind fires");
+  M.state.session = null;
 });
 
 // ==== estimateMaintenanceCalories / computeGoalPlan ====

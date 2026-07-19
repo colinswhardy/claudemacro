@@ -167,6 +167,11 @@ const WIZARD_TRIGGERS = {
   pasta: ["pasta","spaghetti","penne","fettuccine","linguine","macaroni","noodle","noodles","rigatoni","fusilli","farfalle"],
 };
 
+// Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
+// Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
+// landed there yet, rather than guessing from a possibly-stale service-worker cache.
+const APP_VERSION = "1.01";
+
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
 
@@ -335,6 +340,10 @@ async function supabaseTable(path, options) {
         "Content-Type": "application/json",
       }, options.headers || {}),
       body: options.body ? JSON.stringify(options.body) : undefined,
+      // Lets the request complete even if the tab is backgrounded or torn down right after it
+      // starts -- exactly what happens when someone logs food and immediately locks their
+      // phone. Bodies here are small JSON blobs, well under keepalive's ~64KB combined limit.
+      keepalive: true,
     });
     if (!r.ok) {
       const errBody = await r.json().catch(function(){ return {}; });
@@ -435,11 +444,22 @@ async function pullWeightsFromCloud() {
 // Each push re-sends the full current dataset (upsert), so it's idempotent: a failed or
 // skipped push just gets caught up by the next one. That means no separate retry queue is
 // needed -- debouncing so we don't hammer the API on every keystroke is all this needs.
+//
+// The debounce window is also a real data-loss window: if the app is backgrounded or closed
+// within those 2.5s (e.g. logging a food and immediately locking the phone -- a completely
+// normal thing to do), the pending push never fires, and that entry exists only in this
+// device's localStorage with no cloud copy. pendingSyncPushFns tracks the not-yet-fired push
+// alongside its timer specifically so flushPendingCloudSyncs() (wired to visibilitychange and
+// pagehide below) can fire it immediately instead of waiting out the debounce.
 const syncDebounceTimers = {};
+const pendingSyncPushFns = {};
 function scheduleCloudSync(kind, pushFn) {
   if (!state.session) return;
   if (syncDebounceTimers[kind]) clearTimeout(syncDebounceTimers[kind]);
+  pendingSyncPushFns[kind] = pushFn;
   syncDebounceTimers[kind] = setTimeout(function() {
+    delete syncDebounceTimers[kind];
+    delete pendingSyncPushFns[kind];
     // Deliberately does not rerender() on completion -- this can fire while the user is mid-
     // keystroke elsewhere in the app, and a surprise rerender would steal focus. The "last
     // synced" status just picks up the new value next time that screen is naturally rendered.
@@ -447,6 +467,17 @@ function scheduleCloudSync(kind, pushFn) {
       if (!result.error) state.lastSyncedAt = Date.now();
     });
   }, 2500);
+}
+function flushPendingCloudSyncs() {
+  Object.keys(pendingSyncPushFns).forEach(function(kind) {
+    clearTimeout(syncDebounceTimers[kind]);
+    delete syncDebounceTimers[kind];
+    const pushFn = pendingSyncPushFns[kind];
+    delete pendingSyncPushFns[kind];
+    pushFn().then(function(result) {
+      if (!result.error) state.lastSyncedAt = Date.now();
+    });
+  });
 }
 
 // Merge strategy: rows that exist in the cloud but not locally (by id) get added; rows that
@@ -1444,6 +1475,7 @@ function renderEntryEditor(entry) {
     const targetDate = state.ui.entryMoveDate || state.date;
     html += '<div class="row" style="margin-bottom:10px">' +
       btn({ label: "\u2039 Yesterday", action: "moveEntryYesterday", small: true, outline: true }) +
+      btn({ label: "Today", action: "moveEntryToday", small: true, outline: true }) +
       btn({ label: "Tomorrow \u203a", action: "moveEntryTomorrow", small: true, outline: true }) +
     '</div>';
     html += '<div class="row" style="align-items:center">' +
@@ -1455,6 +1487,7 @@ function renderEntryEditor(entry) {
     html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:10px">Logs a duplicate of this entry on the date you pick \u2014 the original stays right here.</div>';
     html += '<div class="row" style="margin-bottom:10px">' +
       btn({ label: "\u2039 Yesterday", action: "copyEntryYesterday", small: true, outline: true }) +
+      btn({ label: "Today", action: "copyEntryToday", small: true, outline: true }) +
       btn({ label: "Tomorrow \u203a", action: "copyEntryTomorrow", small: true, outline: true }) +
     '</div>';
     html += '<div class="row" style="align-items:center">' +
@@ -1617,6 +1650,13 @@ actions.moveEntryTomorrow = function() {
   closeEntryEditor();
   rerender();
 };
+actions.moveEntryToday = function() {
+  const id = state.ui.editingEntryId;
+  if (!id) return;
+  moveFoodEntryToDate(id, todayStr());
+  closeEntryEditor();
+  rerender();
+};
 actions.moveEntryCustomDate = function() {
   const id = state.ui.editingEntryId;
   if (!id || !state.ui.entryMoveDate) return;
@@ -1662,6 +1702,13 @@ actions.copyEntryTomorrow = function() {
   const d = parseDateStr(state.date);
   d.setDate(d.getDate() + 1);
   const toDate = fmtDate(d);
+  if (copyFoodEntryToDate(id, toDate)) { showToast("Copied to " + dayLabel(toDate)); return; }
+  rerender();
+};
+actions.copyEntryToday = function() {
+  const id = state.ui.editingEntryId;
+  if (!id) return;
+  const toDate = todayStr();
   if (copyFoodEntryToDate(id, toDate)) { showToast("Copied to " + dayLabel(toDate)); return; }
   rerender();
 };
@@ -4043,7 +4090,7 @@ function renderDataSection() {
     '</div>';
   }
   html += '</div>';
-  html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:16px;text-align:center">MacroLog v1.0</div>';
+  html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:16px;text-align:center">MacroLog v' + APP_VERSION + '</div>';
   return card(html) + renderCustomBarcodesSection();
 }
 
@@ -4261,6 +4308,10 @@ let hiddenSinceMs = null;
 document.addEventListener("visibilitychange", function() {
   if (document.hidden) {
     hiddenSinceMs = Date.now();
+    // The moment the app is backgrounded is exactly when a pending debounced sync is most at
+    // risk of never firing (see scheduleCloudSync above) -- flush now rather than hoping the
+    // timer survives.
+    flushPendingCloudSyncs();
   } else {
     if (hiddenSinceMs && (Date.now() - hiddenSinceMs) > 10 * 60 * 1000) {
       stopBarcodeCamera();
@@ -4272,6 +4323,10 @@ document.addEventListener("visibilitychange", function() {
     hiddenSinceMs = null;
   }
 });
+// Covers actual navigation away/tab close, which visibilitychange doesn't always precede
+// (e.g. closing a background tab directly) -- a second, redundant flush is harmless since
+// flushPendingCloudSyncs() only acts on syncs that are still actually pending.
+window.addEventListener("pagehide", flushPendingCloudSyncs);
 
 // Physical back button and edge-swipe-back gestures both fire popstate. Collapse exactly
 // one app-level level (see collapseOneNavLevel above) instead of letting the browser close
