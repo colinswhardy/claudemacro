@@ -170,7 +170,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.01";
+const APP_VERSION = "1.02";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -692,12 +692,16 @@ async function pullAndMergeAll() {
     await pushSettingsToCloud();
   }
 
-  // Everything else is either an id-keyed additive merge or a whole-blob replace, so
-  // push-then-pull is safe: pushing first just ensures local is already in what we pull back.
-  await Promise.all([
-    pushFoodLogsToCloud(), pushWeightsToCloud(), pushRecipesToCloud(), pushCustomBarcodesToCloud(),
-    pushFavoritesToCloud(), pushRecentFoodsToCloud(), pushFoodCacheToCloud(),
-  ]);
+  // PULL AND MERGE FIRST, then push. Order matters and was a real data-loss bug when reversed:
+  // favorites/recentFoods/foodCache are stored as one whole JSON blob each, and their push is a
+  // blind whole-blob overwrite of the cloud copy. If we pushed first, a device that booted with
+  // an empty or truncated local store (a fresh install, or iOS/PWA localStorage eviction) would
+  // overwrite the cloud's complete history with its near-empty local copy -- wiping history for
+  // every device ("history is empty sometimes"). Pulling and merging first means local already
+  // contains the cloud's data before we push, so the push always sends local-unioned-with-cloud,
+  // never a subset. It also makes food-log newer-wins correct: the blind id-upsert on push can't
+  // clobber a newer cloud edit with a stale local one, because the merge pulled the newer cloud
+  // version in first.
   const [logsPull, weightsPull, recipesPull, barcodesPull, favsPull, recentPull, cachePull] = await Promise.all([
     pullFoodLogsFromCloud(), pullWeightsFromCloud(), pullRecipesFromCloud(), pullCustomBarcodesFromCloud(),
     pullFavoritesFromCloud(), pullRecentFoodsFromCloud(), pullFoodCacheFromCloud(),
@@ -707,13 +711,23 @@ async function pullAndMergeAll() {
 
   const logsAdded = mergeFoodLogsFromCloud(logsPull.data);
   const weightsAdded = mergeWeightsFromCloud(weightsPull.data);
-  mergeRecipesFromCloud(recipesPull.data);
-  mergeCustomBarcodesFromCloud(barcodesPull.data);
-  mergeFavoritesFromCloud(favsPull.data && favsPull.data[0] && favsPull.data[0].data);
-  mergeRecentFoodsFromCloud(recentPull.data && recentPull.data[0] && recentPull.data[0].data);
-  mergeFoodCacheFromCloud(cachePull.data && cachePull.data[0] && cachePull.data[0].data);
+  const recipesAdded = mergeRecipesFromCloud(recipesPull.data);
+  const barcodesAdded = mergeCustomBarcodesFromCloud(barcodesPull.data);
+  const favsAdded = mergeFavoritesFromCloud(favsPull.data && favsPull.data[0] && favsPull.data[0].data);
+  const recentAdded = mergeRecentFoodsFromCloud(recentPull.data && recentPull.data[0] && recentPull.data[0].data);
+  const cacheAdded = mergeFoodCacheFromCloud(cachePull.data && cachePull.data[0] && cachePull.data[0].data);
+
+  // Now push the merged local state up, so anything this device had that the cloud lacked gets
+  // persisted. Safe to overwrite the whole-blob collections now: local already contains the
+  // cloud's copy after the merges above.
+  await Promise.all([
+    pushFoodLogsToCloud(), pushWeightsToCloud(), pushRecipesToCloud(), pushCustomBarcodesToCloud(),
+    pushFavoritesToCloud(), pushRecentFoodsToCloud(), pushFoodCacheToCloud(),
+  ]);
+
   state.lastSyncedAt = Date.now();
-  return { data: { logsAdded: logsAdded, weightsAdded: weightsAdded } };
+  const totalAdded = logsAdded + weightsAdded + recipesAdded + barcodesAdded + favsAdded + recentAdded + cacheAdded;
+  return { data: { logsAdded: logsAdded, weightsAdded: weightsAdded, totalAdded: totalAdded } };
 }
 
 function renderLoginScreen() {
@@ -1306,9 +1320,14 @@ function addFoodToLog(food) {
     state.favorites = state.favorites.slice(0, 100);
     saveFavorites();
   }
+  // History (the Food tab's History sub-tab) is meant to be a durable, searchable list of
+  // everything ever added, so old items can be re-found and re-added -- so this cap is
+  // deliberately high (was 50, which quietly dropped anything older). 500 distinct foods is
+  // effectively "everything" for one person over years while keeping the synced JSON blob a
+  // sane size; only the very oldest, least-recently-used items fall off past that.
   state.recentFoods = [Object.assign({}, food, { lastUsed: new Date().toISOString() })]
     .concat(state.recentFoods.filter(function(r){ return r.id !== food.id; }))
-    .slice(0, 50);
+    .slice(0, 500);
   saveRecentFoods();
 
   if (!state.foodCache[food.id]) {
@@ -1495,6 +1514,16 @@ function renderEntryEditor(entry) {
       btn({ label: "Copy", action: "copyEntryCustomDate", small: true }) +
     '</div>';
   }
+  // For barcode-scanned items only: after fixing the weight (Portion) and/or macros (Macros)
+  // above, offer to remember the correction so the NEXT scan of this barcode uses it instead
+  // of the wrong data the scan returned. Shown on the Portion/Macros tabs, where the fixing
+  // actually happens.
+  if ((section === "portion" || section === "macros") && barcodeCodeForEntry(entry)) {
+    html += '<div style="border-top:1px solid ' + C.border + ';margin-top:12px;padding-top:12px">' +
+      '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Scanned by barcode. Fixed the numbers above? Save the correction so future scans of this product use it.</div>' +
+      btn({ label: "\u{1F4BE} Save correction for future scans", action: "saveBarcodeCorrection", arg: entry.id, small: true, outline: true }) +
+    '</div>';
+  }
   html += '</div>';
   return html;
 }
@@ -1615,6 +1644,41 @@ actions.saveEditMacros = function() {
   updateFoodEntry(id, { macros: newMacros });
   closeEntryEditor();
   rerender();
+};
+
+// The scannable barcode number behind a logged entry, or null if it isn't a barcode item.
+// Barcode-scanned items found in Open Food Facts carry foodId "off_<barcode>" and source
+// "Open Food Facts (Barcode)"; ones typed in after a failed scan carry foodId "barcode_<code>".
+// Deliberately excludes text-searched OFF results (also "off_" but source "Open Food Facts"),
+// since their id may be an internal OFF id rather than a real scannable barcode.
+function barcodeCodeForEntry(entry) {
+  if (!entry || !entry.foodId) return null;
+  if (entry.foodId.indexOf("barcode_") === 0) return entry.foodId.slice("barcode_".length);
+  if (entry.source === "Open Food Facts (Barcode)" && entry.foodId.indexOf("off_") === 0) return entry.foodId.slice("off_".length);
+  return null;
+}
+
+// Snapshots a logged barcode entry's CURRENT weight + macros into state.customBarcodes, keyed
+// by the raw barcode. handleBarcodeDetected checks state.customBarcodes[code] before hitting
+// Open Food Facts, so the next scan of this product uses the corrected numbers instead of the
+// wrong ones OFF returned. Stored in the same per-serving shape as a hand-entered custom
+// barcode, so it also shows up (and stays editable/deletable) in Strategy > Data > Custom
+// Barcodes. Snapshots the entry as it stands, so fix the weight (Portion) and macros (Macros)
+// first, then save the correction.
+actions.saveBarcodeCorrection = function(entryId) {
+  const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === entryId; });
+  if (!entry) return;
+  const code = barcodeCodeForEntry(entry);
+  if (!code) return;
+  const w = entry.weight || 100;
+  const m = entry.macros;
+  state.customBarcodes[code] = {
+    id: "barcode_" + code, name: entry.name, brand: "", source: "Custom Barcode Entry",
+    per100g: false, calories: m.calories, protein: m.protein, carbs: m.carbs, fat: m.fat, fiber: m.fiber || 0,
+    state: "—", servingSizes: [{ label: round1(w) + "g", grams: w }],
+  };
+  saveCustomBarcodes();
+  showToast("Saved — future scans will use this");
 };
 
 function moveFoodEntryToDate(entryId, toDate) {
@@ -3478,6 +3542,19 @@ function renderWeightTab() {
   return html;
 }
 
+// X pixel position for each date, proportional to its real elapsed time from the first date --
+// so missed days leave a proportional gap. dates is ascending "YYYY-MM-DD" strings; returns an
+// array of x pixels from x0 (left edge) across plotWidth. Degenerate spans (one date, or all
+// the same) collapse to x0. Pure and date-only, so it's unit-tested directly.
+function weightChartXPositions(dates, x0, plotWidth) {
+  const t0 = parseDateStr(dates[0]).getTime();
+  const tSpan = parseDateStr(dates[dates.length - 1]).getTime() - t0;
+  return dates.map(function(d) {
+    if (tSpan <= 0) return x0;
+    return x0 + ((parseDateStr(d).getTime() - t0) / tSpan) * plotWidth;
+  });
+}
+
 function renderWeightChart(data, goalWeight, selectedDate) {
   const w = 460, h = 200, padL = 36, padR = 10, padT = 10, padB = 24;
   const weights = data.map(function(d){ return d.weight; });
@@ -3485,9 +3562,12 @@ function renderWeightChart(data, goalWeight, selectedDate) {
   if (goalWeight) { minW = Math.min(minW, goalWeight); maxW = Math.max(maxW, goalWeight); }
   const pad = (maxW - minW) * 0.15 || 2;
   minW -= pad; maxW += pad;
-  const xStep = data.length > 1 ? (w - padL - padR) / (data.length - 1) : 0;
+  // X is proportional to actual elapsed time, not evenly spaced by index (see
+  // weightChartXPositions) -- a gap where a day or week of weigh-ins was missed shows as a real
+  // horizontal gap instead of sitting as close as two consecutive days.
+  const xs = weightChartXPositions(data.map(function(d){ return d.date; }), padL, w - padL - padR);
   const yScale = function(val) { return padT + (1 - (val - minW) / (maxW - minW)) * (h - padT - padB); };
-  const xScale = function(i) { return padL + i * xStep; };
+  const xScale = function(i) { return xs[i]; };
 
   let path = "";
   data.forEach(function(d, i) {
@@ -4298,7 +4378,10 @@ if (screen.orientation && screen.orientation.lock) {
 // something was actually pulled in that wasn't already showing.
 if (state.session) {
   pullAndMergeAll().then(function(result) {
-    if (result && result.data && (result.data.logsAdded > 0 || result.data.weightsAdded > 0)) rerender();
+    // Rerender if anything at all was merged in -- not just food logs/weights. Restoring
+    // recentFoods/favorites from the cloud (e.g. after a local eviction wiped History) needs a
+    // repaint too, or the History tab would keep showing "empty" until the user navigated.
+    if (result && result.data && result.data.totalAdded > 0) rerender();
   });
 }
 

@@ -99,6 +99,8 @@ const exportLine =
   "estimateMaintenanceCalories: estimateMaintenanceCalories, computeGoalPlan: computeGoalPlan, " +
   "copyFoodEntryToDate: copyFoodEntryToDate, " +
   "scheduleCloudSync: scheduleCloudSync, flushPendingCloudSyncs: flushPendingCloudSyncs, " +
+  "mergeRecentFoodsFromCloud: mergeRecentFoodsFromCloud, mergeFavoritesFromCloud: mergeFavoritesFromCloud, mergeFoodCacheFromCloud: mergeFoodCacheFromCloud, " +
+  "barcodeCodeForEntry: barcodeCodeForEntry, weightChartXPositions: weightChartXPositions, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -285,6 +287,104 @@ test("scheduleCloudSync: a second schedule for the same kind before flush replac
   assertEqual(firstCalls, 0, "the superseded push never fires");
   assertEqual(secondCalls, 1, "only the latest scheduled push for that kind fires");
   M.state.session = null;
+});
+
+// ==== whole-blob merges restore history into an empty local store ====
+// These merges are the second half of the "history empty sometimes" fix: pullAndMergeAll now
+// pulls+merges BEFORE pushing, and these additive merges must repopulate an empty local store
+// from the cloud (rather than the old order, where an empty local was pushed up and clobbered
+// the cloud master copy). The reorder itself is verified by reading pullAndMergeAll; these
+// tests pin the invariant the reorder depends on -- merging is purely additive and never drops.
+test("mergeRecentFoodsFromCloud: repopulates an empty local history from the cloud", function () {
+  M.state.recentFoods = [];
+  const added = M.mergeRecentFoodsFromCloud([
+    { id: "f1", name: "Oatmeal" }, { id: "f2", name: "Chicken" },
+  ]);
+  assertEqual(added, 2, "both cloud items restored");
+  assertEqual(M.state.recentFoods.length, 2, "local history repopulated");
+});
+test("mergeRecentFoodsFromCloud: keeps local items and unions in only the new cloud ones", function () {
+  M.state.recentFoods = [{ id: "f1", name: "Oatmeal (local)" }];
+  const added = M.mergeRecentFoodsFromCloud([
+    { id: "f1", name: "Oatmeal (cloud)" }, { id: "f3", name: "Rice" },
+  ]);
+  assertEqual(added, 1, "only the genuinely-new cloud item is added");
+  assertEqual(M.state.recentFoods.length, 2, "local item preserved, not overwritten");
+  assertEqual(M.state.recentFoods[0].name, "Oatmeal (local)", "local copy of a shared id wins (no clobber)");
+});
+test("mergeFavoritesFromCloud: repopulates empty local favorites from the cloud", function () {
+  M.state.favorites = [];
+  const added = M.mergeFavoritesFromCloud([{ id: "fav1", name: "Almonds" }]);
+  assertEqual(added, 1, "favorite restored from cloud");
+});
+test("mergeFoodCacheFromCloud: repopulates empty local foodCache from the cloud", function () {
+  M.state.foodCache = {};
+  const added = M.mergeFoodCacheFromCloud({ c1: { id: "c1", name: "Quinoa" } });
+  assertEqual(added, 1, "cache entry restored");
+  assertEqual(M.state.foodCache.c1.name, "Quinoa", "cache entry present by id");
+});
+test("merge functions treat a null/absent cloud blob as a no-op (fresh account, no data yet)", function () {
+  M.state.recentFoods = [{ id: "f1", name: "Oatmeal" }];
+  assertEqual(M.mergeRecentFoodsFromCloud(null), 0, "null cloud blob adds nothing");
+  assertEqual(M.state.recentFoods.length, 1, "local untouched when cloud has nothing");
+});
+
+// ==== barcodeCodeForEntry / saveBarcodeCorrection ====
+test("barcodeCodeForEntry: extracts the code from a hand-entered custom barcode entry", function () {
+  assertEqual(M.barcodeCodeForEntry({ foodId: "barcode_012345678905", source: "Custom Barcode Entry" }), "012345678905", "barcode_ prefix stripped");
+});
+test("barcodeCodeForEntry: extracts the code from an Open Food Facts barcode scan", function () {
+  assertEqual(M.barcodeCodeForEntry({ foodId: "off_5000159484695", source: "Open Food Facts (Barcode)" }), "5000159484695", "off_ prefix stripped for a barcode scan");
+});
+test("barcodeCodeForEntry: returns null for a text-searched OFF item (id may not be a real barcode)", function () {
+  assertEqual(M.barcodeCodeForEntry({ foodId: "off_12345", source: "Open Food Facts" }), null, "plain OFF search source is excluded");
+});
+test("barcodeCodeForEntry: returns null for non-barcode foods (USDA, manual, AI)", function () {
+  assertEqual(M.barcodeCodeForEntry({ foodId: "usda_9999", source: "USDA" }), null, "USDA item");
+  assertEqual(M.barcodeCodeForEntry({ foodId: "manual_123", source: "Manual Entry" }), null, "manual entry");
+  assertEqual(M.barcodeCodeForEntry({ foodId: null, source: "AI Estimate" }), null, "missing foodId");
+});
+test("actions.saveBarcodeCorrection: writes the entry's current weight+macros into customBarcodes so future scans use them", function () {
+  M.state.date = "2026-07-20";
+  M.state.customBarcodes = {};
+  M.state.foodLogs = { "2026-07-20": [{
+    id: "e1", foodId: "off_5000159484695", name: "Chocolate Bar", source: "Open Food Facts (Barcode)",
+    weight: 45, macros: { calories: 240, protein: 3, carbs: 26, fat: 13, fiber: 1 },
+  }] };
+  M.actions.saveBarcodeCorrection("e1");
+  const corrected = M.state.customBarcodes["5000159484695"];
+  assertEqual(!!corrected, true, "a custom barcode override now exists keyed by the raw barcode");
+  assertEqual(corrected.calories, 240, "corrected macros captured");
+  assertEqual(corrected.per100g, false, "stored per-serving, matching hand-entered custom barcodes");
+  assertEqual(corrected.servingSizes[0].grams, 45, "the logged weight becomes the serving size");
+});
+test("actions.saveBarcodeCorrection: does nothing for a non-barcode entry", function () {
+  M.state.date = "2026-07-20";
+  M.state.customBarcodes = {};
+  M.state.foodLogs = { "2026-07-20": [{ id: "e2", foodId: "usda_1", name: "Broccoli", source: "USDA", weight: 100, macros: { calories: 34, protein: 3, carbs: 7, fat: 0, fiber: 3 } }] };
+  M.actions.saveBarcodeCorrection("e2");
+  assertEqual(Object.keys(M.state.customBarcodes).length, 0, "no override created for a non-barcode food");
+});
+
+// ==== weightChartXPositions (time-proportional X axis) ====
+test("weightChartXPositions: consecutive days are evenly spaced", function () {
+  const xs = M.weightChartXPositions(["2026-07-01", "2026-07-02", "2026-07-03"], 0, 100);
+  assertEqual(xs, [0, 50, 100], "3 consecutive days at 0/50/100");
+});
+test("weightChartXPositions: a skipped day leaves a proportional gap, not an even one", function () {
+  // Days 1, 2, then 4 (day 3 skipped). Middle point should sit 1/3 across (day 2 of a 3-day
+  // span), NOT halfway as evenly-spaced-by-index would put it.
+  const xs = M.weightChartXPositions(["2026-07-01", "2026-07-02", "2026-07-04"], 0, 300);
+  assertEqual(xs, [0, 100, 300], "middle day at 1/3 of the span, reflecting the real gap after it");
+});
+test("weightChartXPositions: a larger gap stretches proportionally", function () {
+  // Day 1, day 2, day 12: the last point is 11 days from the start, the middle 1 day in.
+  const xs = M.weightChartXPositions(["2026-07-01", "2026-07-02", "2026-07-12"], 0, 110);
+  assertEqual(xs[1], 10, "one day into an 11-day span = 10px of 110");
+  assertEqual(xs[2], 110, "final day at the right edge");
+});
+test("weightChartXPositions: degenerate single-date span collapses to the left edge", function () {
+  assertEqual(M.weightChartXPositions(["2026-07-01", "2026-07-01"], 5, 100), [5, 5], "no time span, both at x0");
 });
 
 // ==== estimateMaintenanceCalories / computeGoalPlan ====
