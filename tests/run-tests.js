@@ -102,6 +102,9 @@ const exportLine =
   "mergeRecentFoodsFromCloud: mergeRecentFoodsFromCloud, mergeFavoritesFromCloud: mergeFavoritesFromCloud, mergeFoodCacheFromCloud: mergeFoodCacheFromCloud, " +
   "barcodeCodeForEntry: barcodeCodeForEntry, weightChartXPositions: weightChartXPositions, " +
   "dbResultsExcludingHistory: dbResultsExcludingHistory, " +
+  "foodBaseGrams: foodBaseGrams, foodQuantityLabel: foodQuantityLabel, " +
+  "isAnimalProteinEntry: isAnimalProteinEntry, entryBrandLine: entryBrandLine, entryHasZeroMacros: entryHasZeroMacros, " +
+  "addFoodToLog: addFoodToLog, updateFoodEntry: updateFoodEntry, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -145,12 +148,109 @@ test("calcMacrosForWeight: falls back to a 100g base with no serving sizes", fun
   const food = { per100g: false, calories: 50, protein: 1, carbs: 1, fat: 1, fiber: 0 };
   assertEqual(M.calcMacrosForWeight(food, 200), { calories: 100, protein: 2, carbs: 2, fat: 2, fiber: 0 }, "default 100g base");
 });
+// Regression test for the reported bug: "Loonie Dog" logged at 235 kcal / 83g, then re-added
+// from History came back as 195 kcal. Root cause: absolute-portion foods (Manual Entry, AI
+// Estimate, Recipe) had no servingSizes recorded, so calcMacrosForWeight assumed a 100g base
+// and rescaled 235 * (83/100) = 195.45 -> 195. loggedWeight (always set on these foods) is now
+// the fallback base instead of a blind 100g guess.
+test("calcMacrosForWeight: an absolute-portion food (no servingSizes) uses loggedWeight as its base, not 100g", function () {
+  const loonieDog = { per100g: false, calories: 235, protein: 8, carbs: 20, fat: 14, fiber: 1, loggedWeight: 83, servingSizes: [] };
+  assertEqual(M.calcMacrosForWeight(loonieDog, 83), { calories: 235, protein: 8, carbs: 20, fat: 14, fiber: 1 }, "re-adding at the exact same weight must return the exact original macros");
+});
+test("calcMacrosForWeight: foodBaseGrams prefers servingSizes over loggedWeight when both are present", function () {
+  const food = { per100g: false, calories: 100, protein: 5, carbs: 10, fat: 2, fiber: 0, loggedWeight: 83, servingSizes: [{ label: "1 serving", grams: 50 }] };
+  assertEqual(M.foodBaseGrams(food), 50, "an explicit serving size still wins over loggedWeight");
+});
+test("foodBaseGrams: per100g foods always use 100 regardless of loggedWeight", function () {
+  assertEqual(M.foodBaseGrams({ per100g: true, loggedWeight: 83 }), 100, "per100g takes priority");
+});
+test("foodBaseGrams: falls all the way through to 100 when nothing else is available", function () {
+  assertEqual(M.foodBaseGrams({ per100g: false }), 100, "last resort");
+});
+
+// ==== foodQuantityLabel ====
+test("foodQuantityLabel: per100g foods always show kcal/100g", function () {
+  assertEqual(M.foodQuantityLabel({ per100g: true, servingSizes: [] }), "kcal/100g", "database foods");
+});
+test("foodQuantityLabel: absolute-portion foods show their real portion, not a misleading /100g", function () {
+  assertEqual(M.foodQuantityLabel({ per100g: false, loggedWeight: 83, servingSizes: [] }), "kcal/83g", "matches the actual portion the calories describe");
+});
 
 // ==== round1 ====
 test("round1: rounds to one decimal place", function () {
   assertEqual(M.round1(1.24), 1.2, "round down");
   assertEqual(M.round1(1.25), 1.3, "round half up");
   assertEqual(M.round1(1.26), 1.3, "round up");
+});
+
+// ==== isAnimalProteinEntry (manual per-entry override) ====
+test("isAnimalProteinEntry: null override (Auto) falls through to the keyword guess", function () {
+  assertEqual(M.isAnimalProteinEntry({ name: "Grilled Chicken", animalOverride: null }), true, "auto-detected as animal");
+  assertEqual(M.isAnimalProteinEntry({ name: "Lentil Soup", animalOverride: null }), false, "auto-detected as plant");
+});
+test("isAnimalProteinEntry: a manual override wins over the keyword guess in both directions", function () {
+  assertEqual(M.isAnimalProteinEntry({ name: "Grilled Chicken", animalOverride: false }), false, "manually marked plant despite the word chicken");
+  assertEqual(M.isAnimalProteinEntry({ name: "Lentil Soup", animalOverride: true }), true, "manually marked animal despite no matching keyword");
+});
+
+// ==== entryBrandLine (dashboard card display) ====
+test("entryBrandLine: shows a real, distinct brand", function () {
+  assertEqual(M.entryBrandLine({ brand: "Schneiders", source: "Open Food Facts (Barcode)" }), "Schneiders", "real brand shown");
+});
+test("entryBrandLine: hides the line when there's no brand", function () {
+  assertEqual(M.entryBrandLine({ brand: "", source: "USDA" }), null, "empty brand suppressed");
+  assertEqual(M.entryBrandLine({ source: "USDA" }), null, "missing brand field suppressed");
+});
+test("entryBrandLine: hides the line when the brand would just repeat the source line underneath", function () {
+  assertEqual(M.entryBrandLine({ brand: "Manual Entry", source: "Manual Entry" }), null, "no point showing the same text twice");
+});
+
+// ==== entryHasZeroMacros (dashboard warning flag) ====
+test("entryHasZeroMacros: flags an entry with no protein/carbs/fat recorded", function () {
+  assertEqual(M.entryHasZeroMacros({ macros: { calories: 150, protein: 0, carbs: 0, fat: 0, fiber: 0 } }), true, "flagged despite having calories -- that's the whole point, calories with no macro breakdown is the suspicious case");
+});
+test("entryHasZeroMacros: a normal entry with real macros is not flagged", function () {
+  assertEqual(M.entryHasZeroMacros({ macros: { calories: 150, protein: 5, carbs: 20, fat: 3, fiber: 1 } }), false, "has real macros");
+});
+test("entryHasZeroMacros: only one or two zero macros is not flagged (e.g. pure fat or pure carbs is plausible)", function () {
+  assertEqual(M.entryHasZeroMacros({ macros: { calories: 100, protein: 0, carbs: 0, fat: 11, fiber: 0 } }), false, "pure fat (e.g. oil) is a real food, not flagged");
+});
+
+// ==== actions.saveEntryDetails (edit name/brand/plant-protein override after logging) ====
+test("actions.saveEntryDetails: edits name, brand, and animal override together", function () {
+  M.state.date = "2026-07-21";
+  M.state.foodLogs = { "2026-07-21": [{ id: "e1", name: "hot dog", brand: "", source: "Open Food Facts (Barcode)", weight: 83, macros: { calories: 235, protein: 8, carbs: 20, fat: 14, fiber: 1 }, animalOverride: null }] };
+  M.state.ui = { editingEntryId: "e1", entryNameInput: "Loonie Dog", entryBrandInput: "Schneiders", entryAnimalOverrideInput: true };
+  M.actions.saveEntryDetails();
+  const saved = M.state.foodLogs["2026-07-21"][0];
+  assertEqual(saved.name, "Loonie Dog", "name updated");
+  assertEqual(saved.brand, "Schneiders", "brand updated");
+  assertEqual(saved.animalOverride, true, "override updated");
+  assertEqual(M.state.ui.editingEntryId, null, "editor closes on save");
+});
+test("addFoodToLog: carries brand and animalOverride from the food object onto the log entry", function () {
+  M.state.date = "2026-07-21";
+  M.state.foodLogs = {};
+  M.addFoodToLog({ id: "off_1", name: "Hot Dog", brand: "Schneiders", source: "Open Food Facts (Barcode)", loggedWeight: 83, calories: 235, protein: 8, carbs: 20, fat: 14, fiber: 1, animalOverride: true });
+  const entry = M.state.foodLogs["2026-07-21"][0];
+  assertEqual(entry.brand, "Schneiders", "brand carried onto the entry");
+  assertEqual(entry.animalOverride, true, "override carried onto the entry");
+});
+test("addFoodToLog: defaults brand to empty string and override to null when the food doesn't specify them", function () {
+  M.state.date = "2026-07-21";
+  M.state.foodLogs = {};
+  M.addFoodToLog({ id: "usda_1", name: "Broccoli", source: "USDA", calories: 34, protein: 3, carbs: 7, fat: 0, fiber: 3 });
+  const entry = M.state.foodLogs["2026-07-21"][0];
+  assertEqual(entry.brand, "", "no brand defaults to empty string, not undefined");
+  assertEqual(entry.animalOverride, null, "no override defaults to null (Auto)");
+});
+test("actions.saveEntryDetails: refuses to save a blank name", function () {
+  M.state.date = "2026-07-21";
+  M.state.foodLogs = { "2026-07-21": [{ id: "e1", name: "Loonie Dog", brand: "Schneiders", source: "Open Food Facts (Barcode)", weight: 83, macros: { calories: 235, protein: 8, carbs: 20, fat: 14, fiber: 1 }, animalOverride: null }] };
+  M.state.ui = { editingEntryId: "e1", entryNameInput: "   ", entryBrandInput: "Schneiders", entryAnimalOverrideInput: null };
+  M.actions.saveEntryDetails();
+  assertEqual(M.state.foodLogs["2026-07-21"][0].name, "Loonie Dog", "original name preserved, blank rejected");
+  assertEqual(M.state.ui.editingEntryId, "e1", "editor stays open since nothing was saved");
 });
 
 // ==== isAnimalProteinFood / getDayTotals plant-protein rollup ====

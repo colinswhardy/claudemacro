@@ -30,3 +30,22 @@ Supabase backend, so a future fitness app can read the same data.
 
 Once steps 1–5 are done and you've sent over the Project URL + anon key, the next
 phase is wiring MacroLog's login screen and sync engine up to this project.
+
+## Migrations
+
+`schema.sql` is the source of truth for a fresh install, but your database already
+exists — running it again won't add new columns to an existing table. When a change
+needs a new column, run the matching snippet below once in **SQL Editor → New query**.
+Each is listed with the date/reason it was added, and only needs to be run once.
+
+### 2026-07 — brand + protein-source override on food log entries
+
+Needed for: editable food name/brand on logged entries, and the manual
+plant-vs-animal-protein override. Until this is run, those two new fields save
+locally on your phone but won't sync to the cloud or across devices (everything else
+in the app is unaffected).
+
+```sql
+alter table food_log_entries add column if not exists brand text;
+alter table food_log_entries add column if not exists animal_override boolean;
+```

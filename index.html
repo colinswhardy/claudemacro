@@ -170,14 +170,14 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.03";
+const APP_VERSION = "1.04";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
 
 const DEFAULT_SETTINGS = {
   calorieTarget: 1876, proteinTarget: 163, carbsTarget: 153, fatTarget: 68,
-  weightUnit: "lbs", carbsDisplay: "total",
+  weightUnit: "lbs", carbsDisplay: "total", showPlantProtein: true,
   goalWeight: 150, goalDate: "2026-09-14", goalRatePerWeek: "",
   startWeight: null, startDate: null,
   aiProvider: "claude-sonnet", aiEnabled: true, geminiApiKey: "", claudeApiKey: "", compareWithGemini: false,
@@ -907,9 +907,37 @@ function deduplicateFoods(foods) {
   return merged;
 }
 
+// How many grams the food's stored calories/protein/carbs/fat actually describe.
+// Database foods (USDA / Open Food Facts) are per-100g. Everything the user creates -- manual
+// entries, AI estimates, recipe logs, custom barcodes -- stores ABSOLUTE macros for one
+// specific portion instead, so the portion has to be recoverable or the numbers get rescaled
+// as though they were per-100g. That was a real bug: a 235 kcal / 83g item re-added from
+// History came back as 235 * (83/100) = 195 kcal, because these foods recorded servingSizes: []
+// (or omitted it) and the lookup fell through to 100.
+// loggedWeight is the retroactive rescue for entries already saved in that broken shape -- for
+// every path that stores absolute macros, loggedWeight is exactly the portion they belong to.
+// The calories shown in a search-result row need a label that actually matches what the number
+// means -- "kcal/100g" was hardcoded everywhere, which is only true for database (USDA/OFF)
+// foods. Absolute-portion foods (Manual Entry, AI Estimate, Recipe, custom barcodes) were
+// showing e.g. "235 kcal/100g" for a 235-calorie, 83g hot dog -- actively misleading, and the
+// same wrong assumption that caused the calcMacrosForWeight rescaling bug above.
+function foodQuantityLabel(food) {
+  if (food.per100g) return "kcal/100g";
+  const g = foodBaseGrams(food);
+  return "kcal/" + round1(g) + "g";
+}
+
+function foodBaseGrams(food) {
+  if (food.per100g) return 100;
+  const serving = food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams;
+  if (serving > 0) return serving;
+  if (food.loggedWeight > 0) return food.loggedWeight;
+  return 100;
+}
+
 function calcMacrosForWeight(food, grams) {
   if (!food) return { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 };
-  const base = food.per100g ? 100 : ((food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams) || 100);
+  const base = foodBaseGrams(food);
   const mult = grams / base;
   return {
     calories: Math.round(food.calories * mult),
@@ -1284,6 +1312,13 @@ function isAnimalProteinFood(name) {
   return ANIMAL_PROTEIN_RE.test(name || "");
 }
 
+// entry.animalOverride (true/false/null) lets a manual correction win over the keyword guess --
+// null (the default, "Auto") falls through to isAnimalProteinFood. Per-entry only for now, not
+// propagated to the underlying food, so re-adding the same food from History re-guesses fresh.
+function isAnimalProteinEntry(entry) {
+  return entry.animalOverride != null ? entry.animalOverride : isAnimalProteinFood(entry.name);
+}
+
 function getDayTotals(date) {
   const entries = state.foodLogs[date] || [];
   return entries.reduce(function(acc, e) {
@@ -1294,7 +1329,7 @@ function getDayTotals(date) {
       carbs: acc.carbs + (e.macros.carbs || 0),
       fat: acc.fat + (e.macros.fat || 0),
       fiber: acc.fiber + (e.macros.fiber || 0),
-      plantProtein: acc.plantProtein + (isAnimalProteinFood(e.name) ? 0 : protein),
+      plantProtein: acc.plantProtein + (isAnimalProteinEntry(e) ? 0 : protein),
     };
   }, { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0, plantProtein: 0 });
 }
@@ -1302,11 +1337,12 @@ function getDayTotals(date) {
 function addFoodToLog(food) {
   const entry = {
     id: "log_" + Date.now() + "_" + Math.random().toString(36).slice(2,7),
-    foodId: food.id, name: food.name,
+    foodId: food.id, name: food.name, brand: food.brand || "",
     weight: food.loggedWeight || 100,
     macros: food.loggedMacros || { calories: food.calories, protein: food.protein, carbs: food.carbs, fat: food.fat, fiber: food.fiber || 0 },
     timestamp: food.timestamp || new Date().toISOString(),
     source: food.source || "Manual",
+    animalOverride: food.animalOverride != null ? food.animalOverride : null,
     photo: food.photo || null,
     photoExpires: food.photo ? new Date(Date.now() + 2*24*60*60*1000).toISOString() : null,
     updatedAt: new Date().toISOString(),
@@ -1373,7 +1409,7 @@ function renderDashboard() {
       '</div>' +
     '</div>' +
     progressBar(totals.calories, set.calorieTarget, C.calories, "Calories", "", " kcal") +
-    progressBar(totals.protein, set.proteinTarget, C.protein, "Protein", totals.plantProtein > 0 ? "(" + Math.round(totals.plantProtein) + "g plant-based)" : "") +
+    progressBar(totals.protein, set.proteinTarget, C.protein, "Protein", (set.showPlantProtein && totals.plantProtein > 0) ? "(" + Math.round(totals.plantProtein) + "g plant-based)" : "") +
     progressBar(totals.carbs, set.carbsTarget, C.carbs, "Carbs", totals.fiber > 0 ? "(" + Math.round(totals.fiber) + "g fiber)" : "") +
     progressBar(totals.fat, set.fatTarget, C.fat, "Fat")
   );
@@ -1412,14 +1448,36 @@ function renderDashboard() {
   return html;
 }
 
+// A real, distinct brand is shown as its own line; falling back to the source (e.g. "Manual
+// Entry", "Recipe") would just repeat the source line right underneath it, so that fallback is
+// suppressed here (unlike foodQuantityLabel, which needs a fallback for the math to be right --
+// this one is purely cosmetic).
+function entryBrandLine(entry) {
+  return (entry.brand && entry.brand !== entry.source) ? entry.brand : null;
+}
+
+// True protein/carbs/fat all recorded as exactly zero -- almost always a sign something went
+// wrong capturing the macros (a bad AI estimate, a product with missing OFF nutrition data,
+// etc.) rather than a food that's genuinely all zeros, so it's worth flagging rather than
+// silently trusting it. Deliberately does not check calories -- a food can have real calories
+// from something not tracked (e.g. alcohol) while still validly having 0g of all three.
+function entryHasZeroMacros(entry) {
+  const m = entry.macros;
+  return m.protein === 0 && m.carbs === 0 && m.fat === 0;
+}
+
 function renderFoodEntry(entry) {
   const editing = state.ui.editingEntryId === entry.id;
   const confirmingRemove = state.ui.confirmRemoveEntryId === entry.id;
+  const brandLine = entryBrandLine(entry);
+  const zeroMacros = entryHasZeroMacros(entry);
   let html = '<div class="foodEntry">' +
     '<div data-action="toggleEntryEditor" data-arg="' + entry.id + '" style="cursor:pointer;display:flex;justify-content:space-between;align-items:flex-start">' +
       '<div style="flex:1;min-width:0">' +
         '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(entry.name) + '</div>' +
+        (brandLine ? '<div style="color:' + C.textMut + ';font-size:12px;margin-top:1px">' + esc(brandLine) + '</div>' : '') +
         '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">' + esc(entry.source) + ' \u2022 ' + entry.weight + 'g</div>' +
+        (zeroMacros ? '<div style="color:' + C.warning + ';font-size:11px;margin-top:4px">\u26a0 No protein/carbs/fat recorded \u2014 tap to check the macros</div>' : '') +
       '</div>' +
       '<div style="text-align:right;display:flex;align-items:center;gap:8px">' +
         '<span style="color:' + C.calories + ';font-weight:700;font-size:16px">' + entry.macros.calories + '</span>' +
@@ -1450,6 +1508,7 @@ function renderEntryEditor(entry) {
     '<div class="row" style="margin-bottom:10px;flex-wrap:wrap">' +
       '<button class="sectionBtn' + (section === "portion" ? " active" : "") + '" data-action="setEntrySection" data-arg="portion">Portion</button>' +
       '<button class="sectionBtn' + (section === "macros" ? " active" : "") + '" data-action="setEntrySection" data-arg="macros">Macros</button>' +
+      '<button class="sectionBtn' + (section === "details" ? " active" : "") + '" data-action="setEntrySection" data-arg="details">Details</button>' +
       '<button class="sectionBtn' + (section === "move" ? " active" : "") + '" data-action="setEntrySection" data-arg="move">Move Day</button>' +
       '<button class="sectionBtn' + (section === "copy" ? " active" : "") + '" data-action="setEntrySection" data-arg="copy">Copy</button>' +
     '</div>';
@@ -1490,6 +1549,22 @@ function renderEntryEditor(entry) {
       (isCustom ? "This is a " + (entry.source === "Recipe" ? "recipe" : "custom food") + " you created \u2014 saving here also updates it for next time." : "This only changes today\u2019s entry \u2014 the original food won\u2019t be affected.") +
     '</div>';
     html += btn({ label: "Save Macros", action: "saveEditMacros", small: true });
+  } else if (section === "details") {
+    const nameVal = state.ui.entryNameInput != null ? state.ui.entryNameInput : entry.name;
+    const brandVal = state.ui.entryBrandInput != null ? state.ui.entryBrandInput : (entry.brand || "");
+    const override = state.ui.entryAnimalOverrideInput !== undefined ? state.ui.entryAnimalOverrideInput : entry.animalOverride;
+    html += '<div style="margin-bottom:10px"><label class="label">Food Name</label>' +
+      textInput({ id: "entryNameInput", value: nameVal, bind: "entryNameInput", enter: "saveEntryDetails" }) + '</div>';
+    html += '<div style="margin-bottom:10px"><label class="label">Brand</label>' +
+      textInput({ id: "entryBrandInput", value: brandVal, placeholder: "e.g. Schneiders", bind: "entryBrandInput", enter: "saveEntryDetails" }) + '</div>';
+    html += '<div style="margin-bottom:10px"><label class="label" style="margin-bottom:6px">Protein Source</label><div class="row">' +
+      [[null,"Auto"],[false,"Plant"],[true,"Animal"]].map(function(o) {
+        const active = override === o[0];
+        return '<button class="chip' + (active ? ' active' : '') + '" data-action="setEntryAnimalOverride" data-arg="' + (o[0] === null ? "auto" : o[0]) + '" style="flex:1;text-align:center">' + o[1] + '</button>';
+      }).join('') +
+    '</div></div>';
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">"Auto" guesses from the food name for the dashboard’s plant-protein estimate. Override it here if it guessed wrong.</div>';
+    html += btn({ label: "Save Details", action: "saveEntryDetails", small: true });
   } else if (section === "move") {
     const targetDate = state.ui.entryMoveDate || state.date;
     html += '<div class="row" style="margin-bottom:10px">' +
@@ -1539,6 +1614,9 @@ function closeEntryEditor() {
   state.ui.entryWeightInput = null;
   state.ui.entryMoveDate = null;
   state.ui.entryCopyDate = null;
+  state.ui.entryNameInput = null;
+  state.ui.entryBrandInput = null;
+  state.ui.entryAnimalOverrideInput = undefined;
 }
 
 actions.toggleEntryEditor = function(entryId) {
@@ -1642,6 +1720,26 @@ actions.saveEditMacros = function() {
   const newMacros = { protein: p, carbs: c, fat: f, fiber: fib, calories: Math.round(p*4 + c*4 + f*9) };
   propagateCustomFoodEdit(entry, newMacros);
   updateFoodEntry(id, { macros: newMacros });
+  closeEntryEditor();
+  rerender();
+};
+
+inputActions.entryNameInput = function(val) { state.ui.entryNameInput = val; };
+inputActions.entryBrandInput = function(val) { state.ui.entryBrandInput = val; };
+actions.setEntryAnimalOverride = function(arg) {
+  state.ui.entryAnimalOverrideInput = arg === "auto" ? null : (arg === "true");
+  rerender();
+};
+actions.saveEntryDetails = function() {
+  const id = state.ui.editingEntryId;
+  if (!id) return;
+  const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === id; });
+  if (!entry) return;
+  const name = (state.ui.entryNameInput != null ? state.ui.entryNameInput : entry.name).trim();
+  if (!name) return; // never allow saving a blank name
+  const brand = (state.ui.entryBrandInput != null ? state.ui.entryBrandInput : (entry.brand || "")).trim();
+  const override = state.ui.entryAnimalOverrideInput !== undefined ? state.ui.entryAnimalOverrideInput : entry.animalOverride;
+  updateFoodEntry(id, { name: name, brand: brand, animalOverride: override });
   closeEntryEditor();
   rerender();
 };
@@ -1914,7 +2012,7 @@ function foodResultRow(food, srcTab) {
         (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px">' + esc(food.brand) + '</div>' : '') +
         '<div class="rowWrap" style="margin-top:6px">' + badge(food.state, food.state === "Cooked" ? C.warning : food.state === "Raw" ? C.success : C.textMut) + badge(food.source) + '</div>' +
       '</div>' +
-      '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + food.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">kcal/100g</div></div>' +
+      '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + food.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">' + foodQuantityLabel(food) + '</div></div>' +
     '</div>' +
     '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
       '<span style="color:' + C.protein + '">P: ' + food.protein + 'g</span>' +
@@ -2614,7 +2712,7 @@ function renderIngredientPickerScreen(fu, rb) {
         '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
           '<div style="flex:1;min-width:0"><div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(food.name) + '</div>' +
           (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px">' + esc(food.brand) + '</div>' : '') + '</div>' +
-          '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + food.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">kcal/100g</div></div>' +
+          '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + food.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">' + foodQuantityLabel(food) + '</div></div>' +
         '</div></div>';
     });
     if (pk.searching) inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">Searching databases...</div>';
@@ -2920,7 +3018,10 @@ actions.addManualEntry = function() {
     state: "\u2014",
     loggedWeight: weight,
     loggedMacros: { calories: cal, protein: pro, carbs: carb, fat: ft, fiber: fib },
-    timestamp: new Date().toISOString(), per100g: false, servingSizes: [],
+    // Anchors the absolute macros above to the portion they describe, so re-adding this from
+    // History later doesn't rescale them against an assumed 100g base (see foodBaseGrams).
+    timestamp: new Date().toISOString(), per100g: false,
+    servingSizes: [{ label: round1(weight) + "g", grams: weight }],
   };
   addFoodToLog(food);
   fu.manual = { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" };
@@ -4130,15 +4231,20 @@ function renderDisplaySection() {
     html += '<button class="chip' + (set.weightUnit === u ? ' active' : '') + '" data-action="setWeightUnit" data-arg="' + u + '" style="flex:1;text-align:center;padding:10px">' + u + '</button>';
   });
   html += '</div></div>';
-  html += '<div><label class="label" style="margin-bottom:8px">Carb Display</label><div class="row">';
+  html += '<div style="margin-bottom:16px"><label class="label" style="margin-bottom:8px">Carb Display</label><div class="row">';
   [["total","Total + Fiber"],["net","Net Carbs"]].forEach(function(o) {
     html += '<button class="chip' + (set.carbsDisplay === o[0] ? ' active' : '') + '" data-action="setCarbsDisplay" data-arg="' + o[0] + '" style="flex:1;text-align:center;padding:10px">' + o[1] + '</button>';
   });
   html += '</div></div>';
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:' + C.inputBg + ';border-radius:10px;border:1px solid ' + C.border + '">' +
+    '<div><div style="font-size:14px">Show Plant Protein</div><div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">Show the "(Xg plant-based)" estimate under Protein on the dashboard</div></div>' +
+    toggleSwitch(set.showPlantProtein, "toggleShowPlantProtein") +
+  '</div>';
   return card(html);
 }
 actions.setWeightUnit = function(u) { state.settings.weightUnit = u; saveSettings(); rerender(); };
 actions.setCarbsDisplay = function(v) { state.settings.carbsDisplay = v; saveSettings(); rerender(); };
+actions.toggleShowPlantProtein = function() { state.settings.showPlantProtein = !state.settings.showPlantProtein; saveSettings(); rerender(); };
 
 function renderAISection() {
   const set = state.settings;

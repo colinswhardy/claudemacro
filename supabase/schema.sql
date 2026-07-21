@@ -15,6 +15,7 @@ create table food_log_entries (
   log_date date not null,              -- the day this was logged against (YYYY-MM-DD)
   food_id text,                        -- links back to the food definition (usda_/off_/recipe_food_/manual_/barcode_/ai_ ids)
   name text not null,
+  brand text,                          -- real brand (from USDA/OFF) or a manual correction; blank/null falls back to source in the UI
   weight numeric not null,
   calories numeric not null default 0,
   protein numeric not null default 0,
@@ -22,6 +23,7 @@ create table food_log_entries (
   fat numeric not null default 0,
   fiber numeric not null default 0,
   source text,
+  animal_override boolean,             -- null = auto-guess plant/animal protein from the name; true/false = manual correction
   logged_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
