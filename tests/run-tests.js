@@ -101,6 +101,7 @@ const exportLine =
   "scheduleCloudSync: scheduleCloudSync, flushPendingCloudSyncs: flushPendingCloudSyncs, " +
   "mergeRecentFoodsFromCloud: mergeRecentFoodsFromCloud, mergeFavoritesFromCloud: mergeFavoritesFromCloud, mergeFoodCacheFromCloud: mergeFoodCacheFromCloud, " +
   "barcodeCodeForEntry: barcodeCodeForEntry, weightChartXPositions: weightChartXPositions, " +
+  "dbResultsExcludingHistory: dbResultsExcludingHistory, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -364,6 +365,31 @@ test("actions.saveBarcodeCorrection: does nothing for a non-barcode entry", func
   M.state.foodLogs = { "2026-07-20": [{ id: "e2", foodId: "usda_1", name: "Broccoli", source: "USDA", weight: 100, macros: { calories: 34, protein: 3, carbs: 7, fat: 0, fiber: 3 } }] };
   M.actions.saveBarcodeCorrection("e2");
   assertEqual(Object.keys(M.state.customBarcodes).length, 0, "no override created for a non-barcode food");
+});
+
+// ==== dbResultsExcludingHistory (search: "Eaten before" group vs database group) ====
+test("dbResultsExcludingHistory: drops database hits already shown in the history group", function () {
+  const history = [{ id: "usda_1", name: "Oatmeal", calories: 150, protein: 5 }];
+  const db = [
+    { id: "usda_1", name: "Oatmeal", calories: 150, protein: 5, source: "USDA" },
+    { id: "usda_2", name: "Oat Bran", calories: 240, protein: 17, source: "USDA" },
+  ];
+  const out = M.dbResultsExcludingHistory(history, db);
+  assertEqual(out.length, 1, "the already-eaten item is not repeated in the database group");
+  assertEqual(out[0].id, "usda_2", "the genuinely new database hit remains");
+});
+test("dbResultsExcludingHistory: empty history returns all database results", function () {
+  const db = [{ id: "usda_1", name: "Oatmeal", calories: 150, protein: 5, source: "USDA" }];
+  assertEqual(M.dbResultsExcludingHistory([], db).length, 1, "nothing filtered when history is empty");
+  assertEqual(M.dbResultsExcludingHistory(null, db).length, 1, "null history is treated as empty");
+});
+test("dbResultsExcludingHistory: still de-duplicates USDA against Open Food Facts within the database group", function () {
+  const db = [
+    { id: "usda_1", name: "Almonds", calories: 579, protein: 21, source: "USDA" },
+    { id: "off_9", name: "Almonds", calories: 579, protein: 21, source: "Open Food Facts" },
+  ];
+  const out = M.dbResultsExcludingHistory([], db);
+  assertEqual(out.length, 1, "same food from both databases collapses to one row");
 });
 
 // ==== weightChartXPositions (time-proportional X axis) ====

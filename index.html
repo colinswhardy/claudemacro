@@ -170,7 +170,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.02";
+const APP_VERSION = "1.03";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -1789,7 +1789,7 @@ actions.copyEntryCustomDate = function() {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null };
   return state.ui.food;
 }
 
@@ -1906,9 +1906,40 @@ function subTabBtn(key, label) {
 // Split out of renderFoodTab so it can be patched into #foodResultsBlock directly as the user
 // types, instead of a full rerender() -- rerendering the whole #app mid-keystroke would blur
 // the search input and, on mobile, can dismiss the keyboard.
+function foodResultRow(food, srcTab) {
+  return '<div class="foodResult" data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '"' + (srcTab ? ' data-arg2="' + srcTab + '"' : '') + '>' +
+    '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+      '<div style="flex:1;min-width:0">' +
+        '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(food.name) + '</div>' +
+        (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px">' + esc(food.brand) + '</div>' : '') +
+        '<div class="rowWrap" style="margin-top:6px">' + badge(food.state, food.state === "Cooked" ? C.warning : food.state === "Raw" ? C.success : C.textMut) + badge(food.source) + '</div>' +
+      '</div>' +
+      '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + food.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">kcal/100g</div></div>' +
+    '</div>' +
+    '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
+      '<span style="color:' + C.protein + '">P: ' + food.protein + 'g</span>' +
+      '<span style="color:' + C.carbs + '">C: ' + food.carbs + 'g</span>' +
+      '<span style="color:' + C.fat + '">F: ' + food.fat + 'g</span>' +
+    '</div></div>';
+}
+
+function resultsSectionHeader(label, color) {
+  return '<div style="display:flex;align-items:center;gap:8px;margin:4px 0 8px">' +
+    '<span style="color:' + color + ';font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px">' + esc(label) + '</span>' +
+    '<div style="flex:1;height:1px;background:' + C.border + '"></div>' +
+  '</div>';
+}
+
+// Two deliberately separate groups: foods already eaten before (instant, local, no network)
+// on top, then the online database hits underneath. They are NOT merged through
+// deduplicateFoods together -- doing that folded a history item into a database row and
+// stripped its "you've had this before" identity. Instead the database list simply drops
+// anything already shown in the history group (by id), so nothing appears twice.
 function renderFoodResultsBlock(fu) {
+  const history = fu.historyResults || [];
+  const dbResults = fu.results || [];
   let html = '';
-  if (fu.wizardSuggestion && fu.results.length > 0) {
+  if (fu.wizardSuggestion && (history.length > 0 || dbResults.length > 0)) {
     const wc = WIZARD_CONFIGS[fu.wizardSuggestion];
     html += '<div style="padding:12px;background:' + C.primary + '11;border:1px solid ' + C.primary + '33;border-radius:12px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">' +
       '<span style="color:' + C.textSec + ';font-size:13px">' + wc.icon + ' Use ' + esc(wc.label) + ' Selection?</span>' +
@@ -1916,25 +1947,19 @@ function renderFoodResultsBlock(fu) {
       '</div>';
   }
 
-  fu.results.forEach(function(food) {
-    html += '<div class="foodResult" data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '">' +
-      '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
-        '<div style="flex:1;min-width:0">' +
-          '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(food.name) + '</div>' +
-          (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px">' + esc(food.brand) + '</div>' : '') +
-          '<div class="rowWrap" style="margin-top:6px">' + badge(food.state, food.state === "Cooked" ? C.warning : food.state === "Raw" ? C.success : C.textMut) + badge(food.source) + '</div>' +
-        '</div>' +
-        '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + food.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">kcal/100g</div></div>' +
-      '</div>' +
-      '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
-        '<span style="color:' + C.protein + '">P: ' + food.protein + 'g</span>' +
-        '<span style="color:' + C.carbs + '">C: ' + food.carbs + 'g</span>' +
-        '<span style="color:' + C.fat + '">F: ' + food.fat + 'g</span>' +
-      '</div></div>';
-  });
+  if (history.length > 0) {
+    html += resultsSectionHeader("★ Eaten before", C.warning);
+    history.forEach(function(food) { html += foodResultRow(food, "history"); });
+  }
+
+  if (dbResults.length > 0) {
+    if (history.length > 0) html += '<div style="height:6px"></div>';
+    html += resultsSectionHeader("Food databases", C.textMut);
+    dbResults.forEach(function(food) { html += foodResultRow(food); });
+  }
 
   if (fu.searching) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">Searching databases...</div>';
-  else if (fu.results.length === 0 && fu.query) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No results. Try AI estimation or manual entry.</div>';
+  else if (history.length === 0 && dbResults.length === 0 && fu.query) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No results. Try AI estimation or manual entry.</div>';
   return html;
 }
 function patchFoodResultsBlock() {
@@ -2047,7 +2072,10 @@ inputActions.foodQuery = function(val) {
   clearTimeout(foodSearchDebounceTimer);
 
   const q = val.trim().toLowerCase();
-  fu.results = q.length >= 2 ? localFoodMatches(q) : [];
+  // Previously-eaten foods appear from the very first character -- it's a local, synchronous
+  // lookup with no network cost, and surfacing them instantly is the whole point of the group.
+  fu.historyResults = q.length >= 1 ? localFoodMatches(q) : [];
+  fu.results = []; // database hits arrive below, once the debounced search returns
   fu.searching = false;
   patchFoodResultsBlock();
 
@@ -2055,6 +2083,13 @@ inputActions.foodQuery = function(val) {
   const mySeq = foodSearchSeq;
   foodSearchDebounceTimer = setTimeout(function() { liveFoodSearch(q, mySeq); }, 450);
 };
+
+// Database results, minus anything already listed in the "Eaten before" group, so a food the
+// user has had before shows once (in history) rather than twice.
+function dbResultsExcludingHistory(historyList, dbFoods) {
+  const historyIds = new Set((historyList || []).map(function(f){ return f.id; }));
+  return deduplicateFoods(dbFoods).filter(function(f){ return !historyIds.has(f.id); });
+}
 
 // Debounced as-you-type database search, fired from inputActions.foodQuery after a pause in
 // typing so a fast typist doesn't send a USDA + Open Food Facts request per keystroke -- USDA
@@ -2069,7 +2104,8 @@ async function liveFoodSearch(q, mySeq) {
   const offP = searchOpenFoodFacts(q);
   const usda = await usdaP, off = await offP;
   if (mySeq !== foodSearchSeq) return; // superseded by further typing or an explicit search
-  fu.results = deduplicateFoods(localFoodMatches(q).concat(usda, off));
+  fu.historyResults = localFoodMatches(q);
+  fu.results = dbResultsExcludingHistory(fu.historyResults, usda.concat(off));
   fu.searching = false;
   patchFoodResultsBlock();
 }
@@ -2083,14 +2119,16 @@ actions.doFoodSearch = async function() {
   const qLower = q.toLowerCase();
   fu.searching = true;
   fu.wizardSuggestion = detectWizard(fu.query);
-  fu.results = localFoodMatches(qLower);
+  fu.historyResults = localFoodMatches(qLower);
+  fu.results = [];
   rerender();
 
   const usdaP = searchUSDA(q);
   const offP = searchOpenFoodFacts(q);
   const usda = await usdaP, off = await offP;
   if (mySeq !== foodSearchSeq) return; // superseded by further typing or another explicit search
-  fu.results = deduplicateFoods(localFoodMatches(qLower).concat(usda, off));
+  fu.historyResults = localFoodMatches(qLower);
+  fu.results = dbResultsExcludingHistory(fu.historyResults, usda.concat(off));
   fu.searching = false;
   rerender();
 };
@@ -2667,6 +2705,10 @@ function renderLogRecipeScreen(fu) {
 actions.selectFoodForAdd = function(foodId, srcTab) {
   const fu = foodUi();
   let food = fu.results.find(function(f){ return f.id === foodId; });
+  // The search screen's "Eaten before" group lives in its own list, separate from the database
+  // results, so it has to be searched too -- those rows can come from favorites or the food
+  // cache, not just recentFoods, and would otherwise fall through the srcTab checks below.
+  if (!food) food = (fu.historyResults || []).find(function(f){ return f.id === foodId; });
   if (!food && srcTab === "history") food = state.recentFoods.find(function(f){ return f.id === foodId; });
   if (!food && srcTab === "favorites") food = state.favorites.find(function(f){ return f.id === foodId; });
   if (!food) food = state.foodCache[foodId];
@@ -2798,7 +2840,7 @@ actions.confirmAddFood = function() {
   fu._confirmLock = now;
   const m = calcMacrosForWeight(food, w);
   addFoodToLog(Object.assign({}, food, { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString() }));
-  fu.query = ""; fu.results = [];
+  fu.query = ""; fu.results = []; fu.historyResults = [];
   stepBackOneLevel();
 };
 
@@ -3416,7 +3458,7 @@ actions.wizardConfirmAdd = function() {
   fu._confirmLock = now;
   const m = calcMacrosForWeight(wiz.selectedFood, w);
   addFoodToLog(Object.assign({}, wiz.selectedFood, { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString(), wizardUsed: true }));
-  fu.query = ""; fu.results = [];
+  fu.query = ""; fu.results = []; fu.historyResults = [];
   stepBackOneLevel();
 };
 
