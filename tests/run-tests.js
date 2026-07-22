@@ -105,6 +105,7 @@ const exportLine =
   "foodBaseGrams: foodBaseGrams, foodQuantityLabel: foodQuantityLabel, " +
   "isAnimalProteinEntry: isAnimalProteinEntry, entryBrandLine: entryBrandLine, entryHasZeroMacros: entryHasZeroMacros, " +
   "addFoodToLog: addFoodToLog, updateFoodEntry: updateFoodEntry, " +
+  "flattenFoodLogsForSync: flattenFoodLogsForSync, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -669,6 +670,56 @@ test("mergeFoodLogsFromCloud: a newer cloud row replaces the local one", functio
   }]);
   assertEqual(changed, 1, "change applied");
   assertEqual(M.state.foodLogs["2026-07-15"][0].name, "Cloud Newer", "cloud edit wins");
+});
+test("mergeFoodLogsFromCloud: brand and animal_override round-trip from a cloud row", function () {
+  M.state.foodLogs = {};
+  M.recentlyDeletedIds.food_log_entries.clear();
+  M.mergeFoodLogsFromCloud([{
+    id: "log_brand1", log_date: "2026-07-15", food_id: "off_1", name: "Hot Dog", weight: 100,
+    calories: 250, protein: 10, carbs: 5, fat: 20, fiber: 0, source: "Open Food Facts (Barcode)",
+    brand: "Schneiders", animal_override: true,
+    logged_at: "2026-07-15T00:00:00.000Z", updated_at: "2026-07-15T00:00:00.000Z",
+  }]);
+  const entry = M.state.foodLogs["2026-07-15"][0];
+  assertEqual(entry.brand, "Schneiders", "brand carried over from the cloud row");
+  assertEqual(entry.animalOverride, true, "animal_override carried over as animalOverride (camelCase, boolean true)");
+});
+test("flattenFoodLogsForSync: always includes brand/animal_override keys, even when unset (PostgREST bulk upsert needs a consistent column set across every row)", function () {
+  M.state.session = { userId: "test-user" };
+  M.state.date = "2026-07-15";
+  M.state.foodLogs = { "2026-07-15": [
+    { id: "e1", name: "Broccoli", weight: 100, macros: { calories: 34, protein: 3, carbs: 7, fat: 0, fiber: 3 } }, // no brand/animalOverride set at all
+  ] };
+  const rows = M.flattenFoodLogsForSync();
+  assertEqual("brand" in rows[0], true, "brand key present even when the entry never set one");
+  assertEqual(rows[0].brand, null, "explicit null, not omitted");
+  assertEqual("animal_override" in rows[0], true, "animal_override key present even when unset");
+  assertEqual(rows[0].animal_override, null, "explicit null, not omitted");
+  M.state.session = null;
+});
+test("flattenFoodLogsForSync: carries a set brand/animalOverride through to the row", function () {
+  M.state.session = { userId: "test-user" };
+  M.state.date = "2026-07-15";
+  M.state.foodLogs = { "2026-07-15": [
+    { id: "e2", name: "Hot Dog", brand: "Schneiders", animalOverride: true, weight: 100, macros: { calories: 250, protein: 10, carbs: 5, fat: 20, fiber: 0 } },
+  ] };
+  const rows = M.flattenFoodLogsForSync();
+  assertEqual(rows[0].brand, "Schneiders", "brand carried through");
+  assertEqual(rows[0].animal_override, true, "animalOverride carried through as animal_override (snake_case)");
+  M.state.session = null;
+});
+test("mergeFoodLogsFromCloud: a null animal_override/brand from the cloud maps to null, not undefined", function () {
+  M.state.foodLogs = {};
+  M.recentlyDeletedIds.food_log_entries.clear();
+  M.mergeFoodLogsFromCloud([{
+    id: "log_brand2", log_date: "2026-07-15", food_id: "usda_1", name: "Broccoli", weight: 100,
+    calories: 34, protein: 3, carbs: 7, fat: 0, fiber: 3, source: "USDA",
+    brand: null, animal_override: null,
+    logged_at: "2026-07-15T00:00:00.000Z", updated_at: "2026-07-15T00:00:00.000Z",
+  }]);
+  const entry = M.state.foodLogs["2026-07-15"][0];
+  assertEqual(entry.brand, null, "no brand stays null");
+  assertEqual(entry.animalOverride, null, "no override stays null (auto-guess still applies)");
 });
 
 // ==== mergeWeightsFromCloud ====
