@@ -106,7 +106,7 @@ const exportLine =
   "isAnimalProteinEntry: isAnimalProteinEntry, entryBrandLine: entryBrandLine, entryHasZeroMacros: entryHasZeroMacros, " +
   "addFoodToLog: addFoodToLog, updateFoodEntry: updateFoodEntry, " +
   "flattenFoodLogsForSync: flattenFoodLogsForSync, " +
-  "weightRangeStats: weightRangeStats, weightStatsRangeLabel: weightStatsRangeLabel, " +
+  "weightRangeStats: weightRangeStats, weightStatsRangeLabel: weightStatsRangeLabel, weightChartCutoff: weightChartCutoff, " +
   "updateFoodRecordEverywhere: updateFoodRecordEverywhere, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
@@ -543,6 +543,40 @@ test("weightStatsRangeLabel: maps each chip value to a readable caption", functi
   assertEqual(M.weightStatsRangeLabel("all"), "all time");
 });
 
+// ==== weightChartCutoff (fixed 2026-07: the "7d seems to start from Monday" bug) ====
+// The old implementation compared Date.now() (a moving clock-time) against each entry's
+// local-midnight timestamp, so the cutoff fell partway through a calendar day rather than at a
+// clean boundary -- these tests are pure date-string-in, timestamp-out, so they pin the exact
+// boundary regardless of what time of day it is when the suite runs (unlike the old code,
+// nothing here reads the real clock).
+test("weightChartCutoff: \"7d\" is a real 7-calendar-day window, inclusive of the reference day", function () {
+  const cutoff = M.weightChartCutoff("7d", "2026-07-23"); // a Thursday
+  assertEqual(M.fmtDate(new Date(cutoff)), "2026-07-17", "cutoff lands exactly 6 days back (7 days total, inclusive)");
+});
+test("weightChartCutoff: a weigh-in exactly on the cutoff day is included, one day earlier is not", function () {
+  const cutoff = M.weightChartCutoff("7d", "2026-07-23");
+  const onBoundary = new Date(2026, 6, 17).getTime(); // local midnight, same convention as parseDateStr
+  const dayBefore = new Date(2026, 6, 16).getTime();
+  assertEqual(onBoundary >= cutoff, true, "the 7th day back is included");
+  assertEqual(dayBefore >= cutoff, false, "the 8th day back is excluded");
+});
+test("weightChartCutoff: reproduces the reported bug scenario -- \"last 7 days\" measured from a Sunday must still include the Sunday one week back, not start on the following Monday", function () {
+  // 2026-07-19 is a Sunday. The bug specifically manifested when "today" was a Sunday, because
+  // Date.now() (some time later that Sunday) always sorts after that same Sunday's own
+  // midnight timestamp one week back, silently excluding it.
+  const cutoff = M.weightChartCutoff("7d", "2026-07-19");
+  assertEqual(M.fmtDate(new Date(cutoff)), "2026-07-13", "cutoff is the Sunday one week back, not the Monday after it");
+});
+test("weightChartCutoff: 30d/90d/6m use the same inclusive-of-today convention", function () {
+  assertEqual(M.fmtDate(new Date(M.weightChartCutoff("30d", "2026-07-23"))), "2026-06-24", "30 calendar days inclusive");
+  assertEqual(M.fmtDate(new Date(M.weightChartCutoff("90d", "2026-07-23"))), "2026-04-25", "90 calendar days inclusive");
+  assertEqual(M.fmtDate(new Date(M.weightChartCutoff("6m", "2026-07-23"))), "2026-01-25", "~6 months (180 days) inclusive");
+});
+test("weightChartCutoff: \"all\" (and anything unrecognized) admits everything", function () {
+  assertEqual(M.weightChartCutoff("all", "2026-07-23"), 0, "no lower bound for All");
+  assertEqual(M.weightChartCutoff("bogus", "2026-07-23"), 0, "unrecognized value falls back to no bound rather than throwing");
+});
+
 // ==== weight range chip -> stats mode wiring ====
 test("actions.setWeightRange: arms statsFollowsRange so Avg Daily/Weekly Change switch to that window", function () {
   M.state.ui = { weight: { timeRange: "30d", statsFollowsRange: false } };
@@ -598,7 +632,9 @@ test("actions.saveFoodRecordMacros: rescales loggedMacros to the corrected base 
   M.state.favorites = []; M.state.foodCache = {};
   const originalGetElementById = documentStub.getElementById;
   documentStub.getElementById = function(id) {
-    const map = { editMacro_protein: "10", editMacro_carbs: "5", editMacro_fat: "20", editMacro_fiber: "0" };
+    // editMacroCaloriesInput simulates the live auto-calc having already run (10*4+5*4+20*9=240)
+    // and the user leaving it as-is -- the override case is covered by a separate test below.
+    const map = { editMacro_protein: "10", editMacro_carbs: "5", editMacro_fat: "20", editMacro_fiber: "0", editMacroCaloriesInput: "240" };
     return { value: map[id] };
   };
   try {
@@ -611,6 +647,24 @@ test("actions.saveFoodRecordMacros: rescales loggedMacros to the corrected base 
   assertEqual(food.calories, 240, "base calories recalculated via Atwater (10*4 + 5*4 + 20*9 = 240)");
   assertEqual(food.loggedMacros.calories, 199, "loggedMacros rescaled to 83g of the corrected 100g base (240 * 83/100 = 199.2 -> 199)");
   assertEqual(food.loggedMacros.protein, 8.3, "loggedMacros protein rescaled the same way (10 * 0.83 = 8.3)");
+});
+test("actions.saveFoodRecordMacros: an overridden calories value wins over the P/C/F Atwater calculation (the alcohol case)", function () {
+  // A shot of vodka: ~0g protein/carbs/fat but real calories from the alcohol itself, which
+  // Atwater math over P/C/F can't see at all. Saving must keep the calories the user actually
+  // entered, not silently discard it back down to 240 = the P/C/F-only value.
+  M.state.recentFoods = [{ id: "f6", name: "Vodka Shot", calories: 97, protein: 0, carbs: 0, fat: 0, fiber: 0, per100g: false, servingSizes: [{ label: "44g", grams: 44 }] }];
+  M.state.favorites = []; M.state.foodCache = {};
+  const originalGetElementById = documentStub.getElementById;
+  documentStub.getElementById = function(id) {
+    const map = { editMacro_protein: "0", editMacro_carbs: "0", editMacro_fat: "0", editMacro_fiber: "0", editMacroCaloriesInput: "97" };
+    return { value: map[id] };
+  };
+  try {
+    M.actions.saveFoodRecordMacros("f6");
+  } finally {
+    documentStub.getElementById = originalGetElementById;
+  }
+  assertEqual(M.state.recentFoods[0].calories, 97, "the entered 97 kcal survives, not the Atwater 0*4+0*4+0*9=0 that P/C/F alone implies");
 });
 
 // ==== estimateMaintenanceCalories / computeGoalPlan ====

@@ -170,7 +170,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.06";
+const APP_VERSION = "1.07";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -1545,11 +1545,14 @@ function renderEntryEditor(entry) {
     const m = entry.macros;
     const isCustom = entry.source === "Recipe" || entry.source === "Manual Entry" || entry.source === "Custom Barcode Entry";
     html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">' +
-      macroEditField("protein", "Protein (g)", m.protein) +
-      macroEditField("carbs", "Carbs (g)", m.carbs) +
-      macroEditField("fat", "Fat (g)", m.fat) +
+      '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' +
+        '<input class="input" type="number" id="editMacroCaloriesInput" value="' + m.calories + '" data-enter="saveEditMacros" style="padding:6px;font-size:13px"></div>' +
+      macroEditField("protein", "Protein (g)", m.protein, "saveEditMacros", "editMacroProtein") +
+      macroEditField("carbs", "Carbs (g)", m.carbs, "saveEditMacros", "editMacroCarbs") +
+      macroEditField("fat", "Fat (g)", m.fat, "saveEditMacros", "editMacroFat") +
       macroEditField("fiber", "Fiber (g)", m.fiber || 0) +
     '</div>';
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Calories auto-calculate from protein/carbs/fat \u2014 edit it directly to override (e.g. alcohol, which adds calories beyond P/C/F).</div>';
     html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">' +
       (isCustom ? "This is a " + (entry.source === "Recipe" ? "recipe" : "custom food") + " you created \u2014 saving here also updates it for next time." : "This only changes today\u2019s entry \u2014 the original food won\u2019t be affected.") +
     '</div>';
@@ -1608,10 +1611,28 @@ function renderEntryEditor(entry) {
   return html;
 }
 
-function macroEditField(key, label, value, enterAction) {
+function macroEditField(key, label, value, enterAction, bindAction) {
   return '<div><label class="label" style="text-transform:capitalize">' + label + '</label>' +
-    '<input class="input" type="number" id="editMacro_' + key + '" value="' + value + '" data-enter="' + (enterAction || "saveEditMacros") + '" style="padding:6px;font-size:13px"></div>';
+    '<input class="input" type="number" id="editMacro_' + key + '" value="' + value + '" data-enter="' + (enterAction || "saveEditMacros") + '"' + (bindAction ? ' data-bind="' + bindAction + '"' : '') + ' style="padding:6px;font-size:13px"></div>';
 }
+// Live-patches the (auto-calculated-but-overridable) calories field as protein/carbs/fat are
+// edited -- shared by the dashboard log-entry Macros tab and the History food-record Macros
+// tab, since both use the same editMacro_* element ids and neither is ever on-screen at the
+// same time as the other. Fiber deliberately isn't wired to this (it doesn't factor into
+// Atwater calories). Fixes a real gap: alcohol contributes ~7 kcal/g that isn't captured by
+// protein/carbs/fat at all, so a food containing it needs calories to be a real, editable
+// number rather than always silently re-derived from P/C/F -- exactly like Manual Entry's
+// calories field already works.
+function patchEditMacroCalories() {
+  const p = parseFloat(document.getElementById("editMacro_protein").value) || 0;
+  const c = parseFloat(document.getElementById("editMacro_carbs").value) || 0;
+  const f = parseFloat(document.getElementById("editMacro_fat").value) || 0;
+  const el = document.getElementById("editMacroCaloriesInput");
+  if (el) el.value = calcCaloriesFromMacros(p, c, f);
+}
+inputActions.editMacroProtein = function() { patchEditMacroCalories(); };
+inputActions.editMacroCarbs = function() { patchEditMacroCalories(); };
+inputActions.editMacroFat = function() { patchEditMacroCalories(); };
 
 function closeEntryEditor() {
   state.ui.editingEntryId = null;
@@ -1722,7 +1743,11 @@ actions.saveEditMacros = function() {
   const c = Math.max(0, parseFloat(document.getElementById("editMacro_carbs").value) || 0);
   const f = Math.max(0, parseFloat(document.getElementById("editMacro_fat").value) || 0);
   const fib = Math.max(0, parseFloat(document.getElementById("editMacro_fiber").value) || 0);
-  const newMacros = { protein: p, carbs: c, fat: f, fiber: fib, calories: Math.round(p*4 + c*4 + f*9) };
+  // Calories comes from its own (auto-calculated-but-editable) field now, not always
+  // recomputed from P/C/F -- so a correction that needs to account for alcohol's extra ~7
+  // kcal/g isn't silently discarded on save.
+  const cal = Math.max(0, parseFloat(document.getElementById("editMacroCaloriesInput").value) || 0);
+  const newMacros = { protein: p, carbs: c, fat: f, fiber: fib, calories: cal };
   propagateCustomFoodEdit(entry, newMacros);
   updateFoodEntry(id, { macros: newMacros });
   closeEntryEditor();
@@ -2159,12 +2184,14 @@ function renderFoodRecordEditor(food) {
     const basisLabel = food.per100g ? "per 100g" : ("for " + round1(foodBaseGrams(food)) + "g");
     html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Values are ' + basisLabel + ' — matches how this food is stored.</div>';
     html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">' +
-      macroEditField("protein", "Protein (g)", food.protein, "saveFoodRecordMacros") +
-      macroEditField("carbs", "Carbs (g)", food.carbs, "saveFoodRecordMacros") +
-      macroEditField("fat", "Fat (g)", food.fat, "saveFoodRecordMacros") +
+      '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' +
+        '<input class="input" type="number" id="editMacroCaloriesInput" value="' + food.calories + '" data-enter="saveFoodRecordMacros" style="padding:6px;font-size:13px"></div>' +
+      macroEditField("protein", "Protein (g)", food.protein, "saveFoodRecordMacros", "editMacroProtein") +
+      macroEditField("carbs", "Carbs (g)", food.carbs, "saveFoodRecordMacros", "editMacroCarbs") +
+      macroEditField("fat", "Fat (g)", food.fat, "saveFoodRecordMacros", "editMacroFat") +
       macroEditField("fiber", "Fiber (g)", food.fiber || 0, "saveFoodRecordMacros") +
     '</div>';
-    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Calories (' + food.calories + ' kcal) are calculated from protein/carbs/fat when you save, same as everywhere else in the app.</div>';
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Calories auto-calculate from protein/carbs/fat — edit it directly to override (e.g. alcohol, which adds calories beyond P/C/F).</div>';
     html += btn({ label: "Save Macros", action: "saveFoodRecordMacros", arg: food.id, small: true });
   } else {
     const nameVal = fu.foodEditNameInput != null ? fu.foodEditNameInput : food.name;
@@ -2235,7 +2262,10 @@ actions.saveFoodRecordMacros = function(foodId) {
   const c = Math.max(0, parseFloat(document.getElementById("editMacro_carbs").value) || 0);
   const f = Math.max(0, parseFloat(document.getElementById("editMacro_fat").value) || 0);
   const fib = Math.max(0, parseFloat(document.getElementById("editMacro_fiber").value) || 0);
-  const updates = { protein: p, carbs: c, fat: f, fiber: fib, calories: Math.round(p*4 + c*4 + f*9) };
+  // Calories comes from its own (auto-calculated-but-editable) field, not always recomputed
+  // from P/C/F -- so it can account for alcohol's extra ~7 kcal/g, which P/C/F alone misses.
+  const cal = Math.max(0, parseFloat(document.getElementById("editMacroCaloriesInput").value) || 0);
+  const updates = { protein: p, carbs: c, fat: f, fiber: fib, calories: cal };
   // Rescale the "last logged" snapshot to the corrected base, at the same weight as before --
   // otherwise re-adding this food would still show the old numbers via loggedMacros
   // (addFoodToLog prefers loggedMacros over the base fields whenever both are present).
@@ -3735,13 +3765,7 @@ function renderWeightTab() {
 
   // Chart data -- computed here (moved up from below the stat cards) so the Avg Daily/Weekly
   // Change cards can use the exact same filtered window the chart itself is showing.
-  const now = Date.now();
-  let cutoff;
-  if (wu.timeRange === "7d") cutoff = now - 7*86400000;
-  else if (wu.timeRange === "30d") cutoff = now - 30*86400000;
-  else if (wu.timeRange === "90d") cutoff = now - 90*86400000;
-  else if (wu.timeRange === "6m") cutoff = now - 180*86400000;
-  else cutoff = 0;
+  const cutoff = weightChartCutoff(wu.timeRange, state.date);
   const chartData = allWeights.filter(function(w){ return parseDateStr(w[0]).getTime() >= cutoff; })
     .map(function(w){ return { date: w[0], weight: w[1].weight }; });
 
@@ -3858,6 +3882,27 @@ function weightChartXPositions(dates, x0, plotWidth) {
     if (tSpan <= 0) return x0;
     return x0 + ((parseDateStr(d).getTime() - t0) / tSpan) * plotWidth;
   });
+}
+
+// Millisecond cutoff for a "7d"/"30d"/"90d"/"6m"/"all" chip, as a real calendar-day boundary --
+// N calendar days ending on (and including) referenceDateStr, at local midnight. "all" (or
+// anything unrecognized) returns 0, admitting everything.
+//
+// Fixed 2026-07: this used to be `Date.now() - N*86400000` compared against each entry's
+// local-midnight timestamp. Date.now() is a moving clock-time, not a calendar boundary, so the
+// cutoff fell at an arbitrary time WITHIN a day rather than at midnight -- whichever calendar
+// day that happened to slice through got silently excluded, depending purely on what time of
+// day "now" was when the chart was viewed (reported as "7d seems to start from Monday": if
+// today is Sunday, the boundary lands partway through the Sunday one week back, which always
+// sorts after that Sunday's own midnight timestamp, so that Sunday drops out and the window
+// effectively starts the following Monday). setDate() (not raw ms subtraction) so this is also
+// correct across DST transitions, which are 23 or 25 hours, not a clean 24.
+function weightChartCutoff(timeRange, referenceDateStr) {
+  const days = { "7d": 7, "30d": 30, "90d": 90, "6m": 180 }[timeRange];
+  if (!days) return 0;
+  const d = parseDateStr(referenceDateStr);
+  d.setDate(d.getDate() - (days - 1)); // inclusive of the reference day itself -> N calendar days total
+  return d.getTime();
 }
 
 // First-vs-last net change across a chart's currently-filtered window, expressed the same way
