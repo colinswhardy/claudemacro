@@ -170,7 +170,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.07";
+const APP_VERSION = "1.08";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -178,6 +178,7 @@ const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
 const DEFAULT_SETTINGS = {
   calorieTarget: 1876, proteinTarget: 163, carbsTarget: 153, fatTarget: 68,
   weightUnit: "lbs", carbsDisplay: "total", showPlantProtein: true,
+  goalType: "cut", // "cut" | "bulk" | "maintain"
   goalWeight: 150, goalDate: "2026-09-14", goalRatePerWeek: "",
   startWeight: null, startDate: null,
   aiProvider: "claude-sonnet", aiEnabled: true, geminiApiKey: "", claudeApiKey: "", compareWithGemini: false,
@@ -4418,7 +4419,13 @@ function renderWeightGoalsSection() {
 
   let html = '<h3 class="cardTitle">Weight Goals</h3>';
   if (latestWeight != null) html += statCard("Current Weight", latestWeight + " " + set.weightUnit, C.text);
-  html += '<div style="margin-top:16px"><label class="label">Goal Weight (' + set.weightUnit + ')</label>' + textInput({ value: set.goalWeight, type: "number", bind: "goalWeight" }) + '</div>';
+  const currentGoalType = set.goalType || "cut";
+  html += '<div style="margin-top:16px"><label class="label">Goal Phase</label><div class="rowWrap">' +
+    '<button class="chip' + (currentGoalType === 'cut' ? ' active' : '') + '" data-action="setGoalType" data-arg="cut">Cut</button>' +
+    '<button class="chip' + (currentGoalType === 'maintain' ? ' active' : '') + '" data-action="setGoalType" data-arg="maintain">Maintenance</button>' +
+    '<button class="chip' + (currentGoalType === 'bulk' ? ' active' : '') + '" data-action="setGoalType" data-arg="bulk">Bulk</button>' +
+  '</div></div>';
+  html += '<div style="margin-top:12px"><label class="label">Goal Weight (' + set.weightUnit + ')</label>' + textInput({ value: set.goalWeight, type: "number", bind: "goalWeight" }) + '</div>';
   html += '<div style="margin-top:12px"><label class="label">Target Date</label>' + textInput({ value: set.goalDate, type: "date", bind: "goalDate" }) + '</div>';
   html += '<div style="margin-top:12px"><label class="label">Desired Change Per Week (' + set.weightUnit + ', optional)</label>' + textInput({ value: set.goalRatePerWeek, type: "number", placeholder: "e.g. 1", bind: "goalRatePerWeek" }) + '</div>';
   if (remaining != null) {
@@ -4447,6 +4454,7 @@ function renderWeightGoalsSection() {
   return card(html);
 }
 
+actions.setGoalType = function(t) { state.settings.goalType = t; saveSettings(); patchGoalPlanBlock(); rerender(); };
 inputActions.goalWeight = function(v) { state.settings.goalWeight = v; saveSettings(); patchGoalPlanBlock(); };
 inputActions.goalDate = function(v) { state.settings.goalDate = v; saveSettings(); patchGoalPlanBlock(); };
 inputActions.goalRatePerWeek = function(v) { state.settings.goalRatePerWeek = v; saveSettings(); patchGoalPlanBlock(); };
