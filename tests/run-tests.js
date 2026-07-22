@@ -106,6 +106,8 @@ const exportLine =
   "isAnimalProteinEntry: isAnimalProteinEntry, entryBrandLine: entryBrandLine, entryHasZeroMacros: entryHasZeroMacros, " +
   "addFoodToLog: addFoodToLog, updateFoodEntry: updateFoodEntry, " +
   "flattenFoodLogsForSync: flattenFoodLogsForSync, " +
+  "weightRangeStats: weightRangeStats, weightStatsRangeLabel: weightStatsRangeLabel, " +
+  "updateFoodRecordEverywhere: updateFoodRecordEverywhere, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -512,6 +514,103 @@ test("weightChartXPositions: a larger gap stretches proportionally", function ()
 });
 test("weightChartXPositions: degenerate single-date span collapses to the left edge", function () {
   assertEqual(M.weightChartXPositions(["2026-07-01", "2026-07-01"], 5, 100), [5, 5], "no time span, both at x0");
+});
+
+// ==== weightRangeStats / weightStatsRangeLabel (Avg Daily/Weekly Change following the chart's selected range) ====
+test("weightRangeStats: computes avg/day and per-week from the first and last point in the window", function () {
+  const stats = M.weightRangeStats([
+    { date: "2026-07-01", weight: 180 }, { date: "2026-07-08", weight: 179 },
+  ]);
+  assertEqual(stats.avgDaily, -0.14, "1 lb lost over 7 days = -1/7 rounded to 2 decimals");
+  assertEqual(stats.weeklyChange, -1, "1 lb lost over exactly 7 days = -1/week");
+});
+test("weightRangeStats: uses only the first and last point, ignoring points in between", function () {
+  const stats = M.weightRangeStats([
+    { date: "2026-07-01", weight: 180 }, { date: "2026-07-04", weight: 400 } /* noise */, { date: "2026-07-08", weight: 179 },
+  ]);
+  assertEqual(stats.weeklyChange, -1, "middle point does not affect the net change calculation");
+});
+test("weightRangeStats: null with fewer than 2 points (not enough data in the range)", function () {
+  assertEqual(M.weightRangeStats([{ date: "2026-07-01", weight: 180 }]), null, "a single point can't show a trend");
+  assertEqual(M.weightRangeStats([]), null, "empty range");
+  assertEqual(M.weightRangeStats(null), null, "null input treated as empty, not a crash");
+});
+test("weightStatsRangeLabel: maps each chip value to a readable caption", function () {
+  assertEqual(M.weightStatsRangeLabel("7d"), "last 7 days");
+  assertEqual(M.weightStatsRangeLabel("30d"), "last 30 days");
+  assertEqual(M.weightStatsRangeLabel("90d"), "last 90 days");
+  assertEqual(M.weightStatsRangeLabel("6m"), "last 6 months");
+  assertEqual(M.weightStatsRangeLabel("all"), "all time");
+});
+
+// ==== weight range chip -> stats mode wiring ====
+test("actions.setWeightRange: arms statsFollowsRange so Avg Daily/Weekly Change switch to that window", function () {
+  M.state.ui = { weight: { timeRange: "30d", statsFollowsRange: false } };
+  M.actions.setWeightRange("7d");
+  assertEqual(M.state.ui.weight.timeRange, "7d", "chart range updated");
+  assertEqual(M.state.ui.weight.statsFollowsRange, true, "stats now follow the selected range");
+});
+test("actions.resetWeightStatsRange: reverts stats to the starting-point calculation without touching the chart's range", function () {
+  M.state.ui = { weight: { timeRange: "90d", statsFollowsRange: true } };
+  M.actions.resetWeightStatsRange();
+  assertEqual(M.state.ui.weight.statsFollowsRange, false, "stats reverted to starting-point mode");
+  assertEqual(M.state.ui.weight.timeRange, "90d", "chart keeps showing whatever range was selected");
+});
+
+// ==== updateFoodRecordEverywhere / History item editing ====
+test("updateFoodRecordEverywhere: updates a food present in recentFoods only", function () {
+  M.state.recentFoods = [{ id: "f1", name: "Oatmeal", calories: 150, protein: 5, carbs: 27, fat: 3 }];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+  const ok = M.updateFoodRecordEverywhere("f1", { name: "Steel-Cut Oatmeal" });
+  assertEqual(ok, true, "update applied");
+  assertEqual(M.state.recentFoods[0].name, "Steel-Cut Oatmeal", "recentFoods entry corrected");
+});
+test("updateFoodRecordEverywhere: propagates to favorites and foodCache when the same id is present there too", function () {
+  M.state.recentFoods = [{ id: "f2", name: "Hot Dog", calories: 235, protein: 10, carbs: 5, fat: 20 }];
+  M.state.favorites = [{ id: "f2", name: "Hot Dog", calories: 235, protein: 10, carbs: 5, fat: 20 }];
+  M.state.foodCache = { f2: { id: "f2", name: "Hot Dog", calories: 235, protein: 10, carbs: 5, fat: 20 } };
+  M.updateFoodRecordEverywhere("f2", { brand: "Schneiders" });
+  assertEqual(M.state.favorites[0].brand, "Schneiders", "favorites copy also corrected");
+  assertEqual(M.state.foodCache.f2.brand, "Schneiders", "foodCache copy also corrected");
+});
+test("updateFoodRecordEverywhere: leaves favorites/foodCache untouched when the food isn't present there", function () {
+  M.state.recentFoods = [{ id: "f3", name: "Rice", calories: 130, protein: 3, carbs: 28, fat: 0 }];
+  M.state.favorites = [{ id: "other", name: "Something Else" }];
+  M.state.foodCache = {};
+  M.updateFoodRecordEverywhere("f3", { name: "Brown Rice" });
+  assertEqual(M.state.favorites[0].name, "Something Else", "unrelated favorite untouched");
+});
+test("updateFoodRecordEverywhere: returns false and changes nothing for an unknown food id", function () {
+  M.state.recentFoods = [{ id: "f4", name: "Toast" }];
+  const ok = M.updateFoodRecordEverywhere("does_not_exist", { name: "x" });
+  assertEqual(ok, false, "no match in recentFoods");
+  assertEqual(M.state.recentFoods[0].name, "Toast", "unrelated entry untouched");
+});
+test("actions.saveFoodRecordMacros: rescales loggedMacros to the corrected base at the same logged weight", function () {
+  // A 100g-base food incorrectly saved as 235 kcal (should be based on macros); loggedWeight
+  // 83g means loggedMacros should reflect 83g of the CORRECTED macros, not the stale ones.
+  M.state.recentFoods = [{
+    id: "f5", name: "Loonie Dog", calories: 235, protein: 8, carbs: 20, fat: 12, fiber: 0,
+    per100g: false, servingSizes: [{ label: "100g", grams: 100 }],
+    loggedWeight: 83, loggedMacros: { calories: 195, protein: 6.6, carbs: 16.6, fat: 10, fiber: 0 },
+  }];
+  M.state.favorites = []; M.state.foodCache = {};
+  const originalGetElementById = documentStub.getElementById;
+  documentStub.getElementById = function(id) {
+    const map = { editMacro_protein: "10", editMacro_carbs: "5", editMacro_fat: "20", editMacro_fiber: "0" };
+    return { value: map[id] };
+  };
+  try {
+    M.actions.saveFoodRecordMacros("f5");
+  } finally {
+    documentStub.getElementById = originalGetElementById; // restore -- this stub is a shared singleton across the whole test run
+  }
+  const food = M.state.recentFoods[0];
+  assertEqual(food.protein, 10, "base protein corrected");
+  assertEqual(food.calories, 240, "base calories recalculated via Atwater (10*4 + 5*4 + 20*9 = 240)");
+  assertEqual(food.loggedMacros.calories, 199, "loggedMacros rescaled to 83g of the corrected 100g base (240 * 83/100 = 199.2 -> 199)");
+  assertEqual(food.loggedMacros.protein, 8.3, "loggedMacros protein rescaled the same way (10 * 0.83 = 8.3)");
 });
 
 // ==== estimateMaintenanceCalories / computeGoalPlan ====

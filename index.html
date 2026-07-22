@@ -170,7 +170,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.05";
+const APP_VERSION = "1.06";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -1608,9 +1608,9 @@ function renderEntryEditor(entry) {
   return html;
 }
 
-function macroEditField(key, label, value) {
+function macroEditField(key, label, value, enterAction) {
   return '<div><label class="label" style="text-transform:capitalize">' + label + '</label>' +
-    '<input class="input" type="number" id="editMacro_' + key + '" value="' + value + '" data-enter="saveEditMacros" style="padding:6px;font-size:13px"></div>';
+    '<input class="input" type="number" id="editMacro_' + key + '" value="' + value + '" data-enter="' + (enterAction || "saveEditMacros") + '" style="padding:6px;font-size:13px"></div>';
 }
 
 function closeEntryEditor() {
@@ -1892,7 +1892,7 @@ actions.copyEntryCustomDate = function() {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null, editingFoodId: null, foodEditSection: "macros", foodEditNameInput: null, foodEditBrandInput: null, foodEditAnimalOverrideInput: undefined };
   return state.ui.food;
 }
 
@@ -2114,20 +2114,149 @@ function renderHistoryListBlock(fu) {
   list.forEach(function(food) {
     const m = food.loggedMacros || { calories: food.calories, protein: food.protein, carbs: food.carbs, fat: food.fat };
     const w = food.loggedWeight;
-    html += '<div class="foodResult" data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '" data-arg2="history">' +
-      '<div style="display:flex;justify-content:space-between">' +
-        '<div style="color:' + C.text + ';font-weight:500;font-size:14px">' + esc(food.name) + '</div>' +
-        '<span style="color:' + C.calories + ';font-weight:600">' + m.calories + ' kcal</span>' +
+    const editing = fu.editingFoodId === food.id;
+    // The tap-to-log action moved from the outer .foodResult div onto this inner wrapper so an
+    // Edit button can live alongside it without also triggering selectFoodForAdd -- event
+    // delegation resolves to the innermost data-action under the tap, same pattern as the
+    // dashboard's nested remove/edit buttons.
+    html += '<div class="foodResult">' +
+      '<div data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '" data-arg2="history" style="cursor:pointer">' +
+        '<div style="display:flex;justify-content:space-between">' +
+          '<div style="color:' + C.text + ';font-weight:500;font-size:14px">' + esc(food.name) + '</div>' +
+          '<span style="color:' + C.calories + ';font-weight:600">' + m.calories + ' kcal</span>' +
+        '</div>' +
+        (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">' + esc(food.brand) + '</div>' : '') +
+        '<div style="display:flex;gap:10px;margin-top:4px;font-size:12px">' +
+          '<span style="color:' + C.protein + '">P: ' + m.protein + 'g</span>' +
+          '<span style="color:' + C.carbs + '">C: ' + m.carbs + 'g</span>' +
+          '<span style="color:' + C.fat + '">F: ' + m.fat + 'g</span>' +
+          (w ? '<span style="color:' + C.textMut + ';margin-left:auto">last: ' + w + 'g</span>' : '') +
+        '</div>' +
       '</div>' +
-      '<div style="display:flex;gap:10px;margin-top:4px;font-size:12px">' +
-        '<span style="color:' + C.protein + '">P: ' + m.protein + 'g</span>' +
-        '<span style="color:' + C.carbs + '">C: ' + m.carbs + 'g</span>' +
-        '<span style="color:' + C.fat + '">F: ' + m.fat + 'g</span>' +
-        (w ? '<span style="color:' + C.textMut + ';margin-left:auto">last: ' + w + 'g</span>' : '') +
-      '</div></div>';
+      '<div class="row" style="margin-top:8px">' +
+        btn({ label: editing ? "Cancel" : "✎ Edit", action: "toggleFoodRecordEditor", arg: food.id, small: true, outline: true, full: true }) +
+      '</div>' +
+      (editing ? renderFoodRecordEditor(food) : '') +
+    '</div>';
   });
   return html;
 }
+
+// Editing a food's stored record (its name/brand/macros/protein-source), reached from the
+// History tab -- as opposed to renderEntryEditor, which edits one day's LOGGED entry. Only
+// Macros + Details apply here (no Portion/Move/Copy -- there's no specific day or weight to
+// relocate, just the food definition itself). Saves via updateFoodRecordEverywhere so the
+// correction is visible the next time this food is re-added from History, Favorites, or search.
+function renderFoodRecordEditor(food) {
+  const fu = foodUi();
+  const section = fu.foodEditSection || "macros";
+  let html = '<div style="margin-top:10px;padding:10px;background:' + C.bg + ';border-radius:10px">' +
+    '<div class="row" style="margin-bottom:10px">' +
+      '<button class="sectionBtn' + (section === "macros" ? " active" : "") + '" data-action="setFoodEditSection" data-arg="macros">Macros</button>' +
+      '<button class="sectionBtn' + (section === "details" ? " active" : "") + '" data-action="setFoodEditSection" data-arg="details">Details</button>' +
+    '</div>';
+  if (section === "macros") {
+    const basisLabel = food.per100g ? "per 100g" : ("for " + round1(foodBaseGrams(food)) + "g");
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Values are ' + basisLabel + ' — matches how this food is stored.</div>';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">' +
+      macroEditField("protein", "Protein (g)", food.protein, "saveFoodRecordMacros") +
+      macroEditField("carbs", "Carbs (g)", food.carbs, "saveFoodRecordMacros") +
+      macroEditField("fat", "Fat (g)", food.fat, "saveFoodRecordMacros") +
+      macroEditField("fiber", "Fiber (g)", food.fiber || 0, "saveFoodRecordMacros") +
+    '</div>';
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Calories (' + food.calories + ' kcal) are calculated from protein/carbs/fat when you save, same as everywhere else in the app.</div>';
+    html += btn({ label: "Save Macros", action: "saveFoodRecordMacros", arg: food.id, small: true });
+  } else {
+    const nameVal = fu.foodEditNameInput != null ? fu.foodEditNameInput : food.name;
+    const brandVal = fu.foodEditBrandInput != null ? fu.foodEditBrandInput : (food.brand || "");
+    const override = fu.foodEditAnimalOverrideInput !== undefined ? fu.foodEditAnimalOverrideInput : food.animalOverride;
+    html += '<div style="margin-bottom:10px"><label class="label">Food Name</label>' +
+      textInput({ value: nameVal, bind: "foodEditNameInput", enter: "saveFoodRecordDetails" }) + '</div>';
+    html += '<div style="margin-bottom:10px"><label class="label">Brand</label>' +
+      textInput({ value: brandVal, placeholder: "e.g. Schneiders", bind: "foodEditBrandInput", enter: "saveFoodRecordDetails" }) + '</div>';
+    html += '<div style="margin-bottom:10px"><label class="label" style="margin-bottom:6px">Protein Source</label><div class="row">' +
+      [[null,"Auto"],[false,"Plant"],[true,"Animal"]].map(function(o) {
+        const active = override === o[0];
+        return '<button class="chip' + (active ? ' active' : '') + '" data-action="setFoodEditAnimalOverride" data-arg="' + (o[0] === null ? "auto" : o[0]) + '" style="flex:1;text-align:center">' + o[1] + '</button>';
+      }).join('') +
+    '</div></div>';
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">"Auto" guesses from the food name for the dashboard’s plant-protein estimate. Override it here if it guessed wrong.</div>';
+    html += btn({ label: "Save Details", action: "saveFoodRecordDetails", arg: food.id, small: true });
+  }
+  html += '</div>';
+  return html;
+}
+
+// Applies a correction to a food's stored record everywhere it might be cached -- History
+// (recentFoods), Favorites, and the general food-lookup cache -- so re-adding it from ANY of
+// those places uses the corrected data, not just the one list the user happened to edit from.
+// Mirrors propagateCustomFoodEdit's reasoning (a log-entry edit propagating to its source) but
+// generalized to any food, editable directly rather than only via a logged instance.
+function updateFoodRecordEverywhere(foodId, updates) {
+  const idx = state.recentFoods.findIndex(function(f){ return f.id === foodId; });
+  if (idx < 0) return false;
+  state.recentFoods[idx] = Object.assign({}, state.recentFoods[idx], updates);
+  saveRecentFoods();
+  const favIdx = state.favorites.findIndex(function(f){ return f.id === foodId; });
+  if (favIdx >= 0) { state.favorites[favIdx] = Object.assign({}, state.favorites[favIdx], updates); saveFavorites(); }
+  if (state.foodCache[foodId]) { state.foodCache[foodId] = Object.assign({}, state.foodCache[foodId], updates); saveFoodCache(); }
+  return true;
+}
+
+function closeFoodRecordEditor() {
+  const fu = foodUi();
+  fu.editingFoodId = null;
+  fu.foodEditSection = "macros";
+  fu.foodEditNameInput = null;
+  fu.foodEditBrandInput = null;
+  fu.foodEditAnimalOverrideInput = undefined;
+}
+actions.toggleFoodRecordEditor = function(foodId) {
+  const fu = foodUi();
+  if (fu.editingFoodId === foodId) {
+    closeFoodRecordEditor();
+  } else {
+    closeFoodRecordEditor();
+    fu.editingFoodId = foodId;
+  }
+  rerender();
+};
+actions.setFoodEditSection = function(section) { foodUi().foodEditSection = section; rerender(); };
+inputActions.foodEditNameInput = function(val) { foodUi().foodEditNameInput = val; };
+inputActions.foodEditBrandInput = function(val) { foodUi().foodEditBrandInput = val; };
+actions.setFoodEditAnimalOverride = function(arg) {
+  foodUi().foodEditAnimalOverrideInput = arg === "auto" ? null : (arg === "true");
+  rerender();
+};
+actions.saveFoodRecordMacros = function(foodId) {
+  const food = state.recentFoods.find(function(f){ return f.id === foodId; });
+  if (!food) return;
+  const p = Math.max(0, parseFloat(document.getElementById("editMacro_protein").value) || 0);
+  const c = Math.max(0, parseFloat(document.getElementById("editMacro_carbs").value) || 0);
+  const f = Math.max(0, parseFloat(document.getElementById("editMacro_fat").value) || 0);
+  const fib = Math.max(0, parseFloat(document.getElementById("editMacro_fiber").value) || 0);
+  const updates = { protein: p, carbs: c, fat: f, fiber: fib, calories: Math.round(p*4 + c*4 + f*9) };
+  // Rescale the "last logged" snapshot to the corrected base, at the same weight as before --
+  // otherwise re-adding this food would still show the old numbers via loggedMacros
+  // (addFoodToLog prefers loggedMacros over the base fields whenever both are present).
+  if (food.loggedWeight) updates.loggedMacros = calcMacrosForWeight(Object.assign({}, food, updates), food.loggedWeight);
+  updateFoodRecordEverywhere(foodId, updates);
+  closeFoodRecordEditor();
+  rerender();
+};
+actions.saveFoodRecordDetails = function(foodId) {
+  const fu = foodUi();
+  const food = state.recentFoods.find(function(f){ return f.id === foodId; });
+  if (!food) return;
+  const name = (fu.foodEditNameInput != null ? fu.foodEditNameInput : food.name).trim();
+  if (!name) return; // never allow saving a blank name
+  const brand = (fu.foodEditBrandInput != null ? fu.foodEditBrandInput : (food.brand || "")).trim();
+  const override = fu.foodEditAnimalOverrideInput !== undefined ? fu.foodEditAnimalOverrideInput : food.animalOverride;
+  updateFoodRecordEverywhere(foodId, { name: name, brand: brand, animalOverride: override });
+  closeFoodRecordEditor();
+  rerender();
+};
+
 function renderFavoritesListBlock(fu) {
   if (state.favorites.length === 0) {
     return card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No favorites yet. Star foods to add them here.</div>');
@@ -3573,7 +3702,7 @@ actions.wizardConfirmAdd = function() {
 // WEIGHT TAB
 // ============================================================
 function weightUi() {
-  if (!state.ui.weight) state.ui.weight = { input: "", timeRange: "30d", importMsg: "", editingStart: false, startInputDate: "", startInputWeight: "", selectedPoint: null, confirmDeleteDate: null };
+  if (!state.ui.weight) state.ui.weight = { input: "", timeRange: "30d", importMsg: "", editingStart: false, startInputDate: "", startInputWeight: "", selectedPoint: null, confirmDeleteDate: null, statsFollowsRange: false };
   return state.ui.weight;
 }
 
@@ -3604,9 +3733,41 @@ function renderWeightTab() {
   const avgDailySinceStart = (daysSinceStart != null && totalChange != null) ? Math.round((totalChange / daysSinceStart) * 100) / 100 : null;
   const weeklyChangeSinceStart = (daysSinceStart != null && totalChange != null) ? round1(totalChange / (daysSinceStart / 7)) : null;
 
+  // Chart data -- computed here (moved up from below the stat cards) so the Avg Daily/Weekly
+  // Change cards can use the exact same filtered window the chart itself is showing.
+  const now = Date.now();
+  let cutoff;
+  if (wu.timeRange === "7d") cutoff = now - 7*86400000;
+  else if (wu.timeRange === "30d") cutoff = now - 30*86400000;
+  else if (wu.timeRange === "90d") cutoff = now - 90*86400000;
+  else if (wu.timeRange === "6m") cutoff = now - 180*86400000;
+  else cutoff = 0;
+  const chartData = allWeights.filter(function(w){ return parseDateStr(w[0]).getTime() >= cutoff; })
+    .map(function(w){ return { date: w[0], weight: w[1].weight }; });
+
+  // Avg Daily / Weekly Change normally reflect "since your starting point" (effStartDate/Weight
+  // above) -- the original, always-on calculation. Tapping a 7d/30d/90d/6m/All chip arms
+  // wu.statsFollowsRange and switches these two cards (only these two -- Current Weight/Total
+  // Change above are unaffected) to the currently charted window instead, via the pure
+  // weightRangeStats helper over the same chartData the chart renders from. Tapping the Current
+  // Weight card disarms it, reverting to the starting-point numbers without touching which
+  // range the chart itself is showing.
+  let statsAvgDaily = avgDailySinceStart, statsWeekly = weeklyChangeSinceStart;
+  let statsCaption = effStartDate ? "since " + dayLabel(effStartDate) : null;
+  if (wu.statsFollowsRange) {
+    const rangeStats = weightRangeStats(chartData);
+    statsAvgDaily = rangeStats ? rangeStats.avgDaily : null;
+    statsWeekly = rangeStats ? rangeStats.weeklyChange : null;
+    statsCaption = weightStatsRangeLabel(wu.timeRange) + (rangeStats ? "" : " \u2014 not enough data in range");
+  }
+
   if (latestWeight != null) {
     html += '<div class="row" style="margin-bottom:16px">' +
-      statCard("Current Weight", latestWeight + " " + unit, C.text) +
+      '<div class="statCard" style="cursor:pointer;min-width:0" data-action="resetWeightStatsRange">' +
+        '<div class="statLabel">Current Weight</div>' +
+        '<div class="statValue" style="color:' + C.text + '">' + latestWeight + ' ' + unit + '</div>' +
+        (wu.statsFollowsRange ? '<div style="color:' + C.textMut + ';font-size:10px;margin-top:4px">tap to use starting point</div>' : '') +
+      '</div>' +
       '<div class="statCard" style="cursor:pointer;min-width:0" data-action="toggleStartEdit">' +
         '<div class="statLabel">Total Change</div>' +
         '<div class="statValue" style="color:' + (totalChange != null ? (totalChange <= 0 ? C.success : C.danger) : C.text) + '">' + (totalChange != null ? (totalChange > 0 ? "+" : "") + totalChange + " " + unit : "\u2014") + '</div>' +
@@ -3628,23 +3789,13 @@ function renderWeightTab() {
     );
   }
 
-  if (avgDailySinceStart != null) {
-    html += '<div class="row" style="margin-bottom:16px">' +
-      statCard("Avg Daily", (avgDailySinceStart > 0 ? "+" : "") + avgDailySinceStart + " " + unit + "/day", avgDailySinceStart <= 0 ? C.success : C.danger) +
-      statCard("Weekly Change", weeklyChangeSinceStart != null ? (weeklyChangeSinceStart > 0 ? "+" : "") + weeklyChangeSinceStart + " " + unit : "\u2014", weeklyChangeSinceStart != null ? (weeklyChangeSinceStart <= 0 ? C.success : C.danger) : C.text) +
+  if (statsAvgDaily != null || statsWeekly != null || wu.statsFollowsRange) {
+    html += '<div class="row" style="margin-bottom:4px">' +
+      statCard("Avg Daily", statsAvgDaily != null ? (statsAvgDaily > 0 ? "+" : "") + statsAvgDaily + " " + unit + "/day" : "\u2014", statsAvgDaily != null ? (statsAvgDaily <= 0 ? C.success : C.danger) : C.text) +
+      statCard("Weekly Change", statsWeekly != null ? (statsWeekly > 0 ? "+" : "") + statsWeekly + " " + unit : "\u2014", statsWeekly != null ? (statsWeekly <= 0 ? C.success : C.danger) : C.text) +
     '</div>';
+    if (statsCaption) html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:16px;text-align:center">' + esc(statsCaption) + '</div>';
   }
-
-  // Chart data
-  const now = Date.now();
-  let cutoff;
-  if (wu.timeRange === "7d") cutoff = now - 7*86400000;
-  else if (wu.timeRange === "30d") cutoff = now - 30*86400000;
-  else if (wu.timeRange === "90d") cutoff = now - 90*86400000;
-  else if (wu.timeRange === "6m") cutoff = now - 180*86400000;
-  else cutoff = 0;
-  const chartData = allWeights.filter(function(w){ return parseDateStr(w[0]).getTime() >= cutoff; })
-    .map(function(w){ return { date: w[0], weight: w[1].weight }; });
 
   if (chartData.length > 1) {
     let histInner = '<h3 class="cardTitle" style="margin-bottom:4px">Weight History</h3>' +
@@ -3657,9 +3808,15 @@ function renderWeightTab() {
     const selPoint = wu.selectedPoint ? chartData.find(function(d){ return d.date === wu.selectedPoint; }) : null;
     if (selPoint) {
       const confirmingDeleteWeight = wu.confirmDeleteDate === selPoint.date;
+      // "All" can span multiple years, where the usual weekday/month/day label is ambiguous
+      // about which year a point falls in -- every other range tab is well under a year, so
+      // dayLabel's existing format stays unambiguous there.
+      const selDateLabel = wu.timeRange === "all"
+        ? parseDateStr(selPoint.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" })
+        : dayLabel(selPoint.date);
       histInner += '<div style="margin-top:12px;padding:12px 14px;background:' + C.inputBg + ';border:1px solid ' + C.border + ';border-radius:12px">' +
         '<div style="display:flex;justify-content:space-between;align-items:center">' +
-          '<div><div style="color:' + C.textMut + ';font-size:12px">' + esc(dayLabel(selPoint.date)) + '</div>' +
+          '<div><div style="color:' + C.textMut + ';font-size:12px">' + esc(selDateLabel) + '</div>' +
           '<div style="font-size:18px;font-weight:700;margin-top:2px;color:' + C.text + '">' + selPoint.weight + ' ' + unit + '</div></div>' +
           '<div style="display:flex;align-items:center;gap:4px">' +
             '<button data-action="askDeleteWeight" data-arg="' + selPoint.date + '" style="background:none;border:none;color:' + C.textMut + ';font-size:16px;cursor:pointer;padding:4px">\u{1F5D1}</button>' +
@@ -3701,6 +3858,20 @@ function weightChartXPositions(dates, x0, plotWidth) {
     if (tSpan <= 0) return x0;
     return x0 + ((parseDateStr(d).getTime() - t0) / tSpan) * plotWidth;
   });
+}
+
+// First-vs-last net change across a chart's currently-filtered window, expressed the same way
+// the starting-point calculation is (avg/day, and per-week). null when there isn't enough data
+// in the window to say anything (fewer than 2 points). data: ascending [{date, weight}].
+function weightRangeStats(data) {
+  if (!data || data.length < 2) return null;
+  const first = data[0], last = data[data.length - 1];
+  const days = Math.max(1, (parseDateStr(last.date) - parseDateStr(first.date)) / 86400000);
+  const change = last.weight - first.weight;
+  return { avgDaily: Math.round((change / days) * 100) / 100, weeklyChange: round1(change / (days / 7)) };
+}
+function weightStatsRangeLabel(timeRange) {
+  return { "7d": "last 7 days", "30d": "last 30 days", "90d": "last 90 days", "6m": "last 6 months", "all": "all time" }[timeRange] || "selected range";
 }
 
 function renderWeightChart(data, goalWeight, selectedDate) {
@@ -3770,7 +3941,16 @@ function renderWeightChart(data, goalWeight, selectedDate) {
 }
 
 inputActions.weightInput = function(val) { weightUi().input = val; };
-actions.setWeightRange = function(r) { weightUi().timeRange = r; rerender(); };
+actions.setWeightRange = function(r) {
+  const wu = weightUi();
+  wu.timeRange = r;
+  wu.statsFollowsRange = true; // tapping any range chip switches Avg Daily/Weekly Change to that window
+  rerender();
+};
+actions.resetWeightStatsRange = function() {
+  weightUi().statsFollowsRange = false; // back to the starting-point calculation; doesn't touch which range the chart shows
+  rerender();
+};
 
 actions.selectWeightPoint = function(date) {
   const wu = weightUi();
