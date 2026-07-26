@@ -94,7 +94,7 @@ const exportLine =
   "wasRecentlyDeleted: wasRecentlyDeleted, markRecentlyDeleted: markRecentlyDeleted, recentlyDeletedIds: recentlyDeletedIds, " +
   "computeNavDepth: computeNavDepth, collapseOneNavLevel: collapseOneNavLevel, showToast: showToast, fmtDate: fmtDate, " +
   "computeQtyWeight: computeQtyWeight, calcCaloriesFromMacros: calcCaloriesFromMacros, localFoodMatches: localFoodMatches, " +
-  "mergeCustomBarcodesFromCloud: mergeCustomBarcodesFromCloud, filterFoodsByName: filterFoodsByName, " +
+  "mergeCustomBarcodesFromCloud: mergeCustomBarcodesFromCloud, filterFoodsByQuery: filterFoodsByQuery, " +
   "isAnimalProteinFood: isAnimalProteinFood, getDayTotals: getDayTotals, " +
   "estimateMaintenanceCalories: estimateMaintenanceCalories, computeGoalPlan: computeGoalPlan, " +
   "copyFoodEntryToDate: copyFoodEntryToDate, " +
@@ -108,6 +108,10 @@ const exportLine =
   "flattenFoodLogsForSync: flattenFoodLogsForSync, " +
   "weightRangeStats: weightRangeStats, weightStatsRangeLabel: weightStatsRangeLabel, weightChartCutoff: weightChartCutoff, " +
   "updateFoodRecordEverywhere: updateFoodRecordEverywhere, " +
+  "anchorFoodBase: anchorFoodBase, positiveGramsOr: positiveGramsOr, aiItemGrams: aiItemGrams, " +
+  "entryMatchesFood: entryMatchesFood, rescaleEntryMacros: rescaleEntryMacros, " +
+  "groupEntriesByHourNewestFirst: groupEntriesByHourNewestFirst, foodMatchesQuery: foodMatchesQuery, " +
+  "propagateCustomFoodEdit: propagateCustomFoodEdit, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -933,20 +937,20 @@ test("actions.deleteBarcode: removes the local entry and tombstones it against a
   assertEqual(M.state.ui.strategy.confirmDeleteBarcodeCode, null, "confirm state cleared");
 });
 
-// ==== filterFoodsByName (History/Favorites live search) ====
-test("filterFoodsByName: substring match is case-insensitive", function () {
+// ==== filterFoodsByQuery (History/Favorites live search) ====
+test("filterFoodsByQuery: substring match is case-insensitive", function () {
   const list = [{ name: "Ice Cream" }, { name: "Ice Water" }, { name: "Bread" }];
-  assertEqual(M.filterFoodsByName(list, "ice").length, 2, "matches both ice- foods");
-  assertEqual(M.filterFoodsByName(list, "ICE-CREAM".slice(0,3)).length, 2, "case-insensitive");
+  assertEqual(M.filterFoodsByQuery(list, "ice").length, 2, "matches both ice- foods");
+  assertEqual(M.filterFoodsByQuery(list, "ICE-CREAM".slice(0,3)).length, 2, "case-insensitive");
 });
-test("filterFoodsByName: blank query returns the full list unfiltered", function () {
+test("filterFoodsByQuery: blank query returns the full list unfiltered", function () {
   const list = [{ name: "Ice Cream" }, { name: "Bread" }];
-  assertEqual(M.filterFoodsByName(list, "").length, 2, "empty query is a no-op filter");
-  assertEqual(M.filterFoodsByName(list, "   ").length, 2, "whitespace-only query is a no-op filter");
+  assertEqual(M.filterFoodsByQuery(list, "").length, 2, "empty query is a no-op filter");
+  assertEqual(M.filterFoodsByQuery(list, "   ").length, 2, "whitespace-only query is a no-op filter");
 });
-test("filterFoodsByName: no match returns an empty array", function () {
+test("filterFoodsByQuery: no match returns an empty array", function () {
   const list = [{ name: "Ice Cream" }];
-  assertEqual(M.filterFoodsByName(list, "zzz").length, 0, "no substring match");
+  assertEqual(M.filterFoodsByQuery(list, "zzz").length, 0, "no substring match");
 });
 
 // ==== two-step delete confirmation (recipes, log entries) ====
@@ -1154,6 +1158,290 @@ test("addManualEntry: a rapid double-tap only logs one entry", function () {
   M.actions.addManualEntry(); // rapid second tap, well within the 600ms debounce window
   const entries = M.state.foodLogs["2026-07-15"] || [];
   assertEqual(entries.length, 1, "only one entry logged despite two rapid calls");
+});
+
+// ============================================================
+// BASE-PORTION ANCHOR (baseGrams) -- the "macros don't scale to the new weight" bug
+// ============================================================
+
+// ==== positiveGramsOr / aiItemGrams ====
+test("positiveGramsOr: rejects blank, NaN, zero, negative and Infinity", function () {
+  assertEqual(M.positiveGramsOr("", 100), 100, "blank falls back");
+  assertEqual(M.positiveGramsOr("abc", 100), 100, "NaN falls back");
+  assertEqual(M.positiveGramsOr(0, 100), 100, "zero is not a usable portion");
+  assertEqual(M.positiveGramsOr(-50, 100), 100, "negative falls back");
+  assertEqual(M.positiveGramsOr("1e999", 100), 100, "Infinity falls back");
+  assertEqual(M.positiveGramsOr("83", 100), 83, "a valid numeric string is used");
+  assertEqual(M.positiveGramsOr(0.5, 100), 0.5, "a small positive weight is legitimate");
+});
+test("aiItemGrams: a missing or zero quantity_grams falls back to 100 instead of leaving no anchor", function () {
+  assertEqual(M.aiItemGrams({ quantity_grams: 400 }), 400, "uses the estimate");
+  assertEqual(M.aiItemGrams({}), 100, "omitted quantity_grams");
+  assertEqual(M.aiItemGrams({ quantity_grams: 0 }), 100, "zero quantity_grams");
+  assertEqual(M.aiItemGrams(null), 100, "null item");
+});
+
+// ==== foodBaseGrams / anchorFoodBase ====
+test("foodBaseGrams: an explicit baseGrams wins over servingSizes and loggedWeight", function () {
+  const food = { per100g: false, baseGrams: 166, servingSizes: [{ label: "83g", grams: 83 }], loggedWeight: 50 };
+  assertEqual(M.foodBaseGrams(food), 166, "explicit anchor beats both inferences");
+});
+test("foodBaseGrams: null food returns the 100g last resort instead of throwing", function () {
+  assertEqual(M.foodBaseGrams(null), 100, "null guard");
+});
+test("anchorFoodBase: freezes the currently-inferred base into an explicit field", function () {
+  const legacy = { per100g: false, calories: 500, loggedWeight: 400 };
+  assertEqual(M.anchorFoodBase(legacy).baseGrams, 400, "legacy record upgraded from its inferred base");
+  assertEqual(legacy.baseGrams, undefined, "the original object is not mutated");
+});
+test("anchorFoodBase: overwriting loggedWeight afterwards can no longer move the base", function () {
+  const food = Object.assign({}, M.anchorFoodBase({ per100g: false, calories: 500, loggedWeight: 400 }), { loggedWeight: 200 });
+  assertEqual(M.foodBaseGrams(food), 400, "base stays at the portion the macros describe");
+  assertEqual(M.calcMacrosForWeight(food, 400).calories, 500, "400g still reads 500 kcal, not 1000");
+});
+// The reported compounding bug: an AI Estimate (no servingSizes) re-added from History at a new
+// weight used to re-anchor its unchanged absolute macros to that new weight, doubling the food
+// every round trip.
+test("confirmAddFood: re-adding an absolute-macro food at a new weight does not re-anchor it", function () {
+  M.state.date = "2026-07-20";
+  M.state.foodLogs = {}; M.state.recentFoods = []; M.state.favorites = []; M.state.foodCache = {};
+  M.state.ui = {}; // let foodUi() build its defaults, same as the real boot path
+  M.addFoodToLog({
+    id: "ai_1", name: "Chili", source: "AI Estimate", calories: 500, protein: 30, carbs: 40, fat: 22, fiber: 5,
+    loggedWeight: 400, baseGrams: 400,
+    loggedMacros: { calories: 500, protein: 30, carbs: 40, fat: 22, fiber: 5 },
+  });
+  // Re-add from History at half the portion.
+  M.actions.selectFoodForAdd("ai_1", "history");
+  M.state.ui.food.addWeight = "200"; M.state.ui.food._confirmLock = 0;
+  M.actions.confirmAddFood();
+  const half = M.state.foodLogs["2026-07-20"][1];
+  assertEqual(half.macros.calories, 250, "200g of a 400g/500kcal food is 250 kcal");
+  // ...and back to the original portion, which must return the original numbers.
+  M.actions.selectFoodForAdd("ai_1", "history");
+  M.state.ui.food.addWeight = "400"; M.state.ui.food._confirmLock = 0;
+  M.actions.confirmAddFood();
+  const full = M.state.foodLogs["2026-07-20"][2];
+  assertEqual(full.macros.calories, 500, "back at 400g it is 500 kcal again, not 1000");
+  assertEqual(M.state.recentFoods[0].baseGrams, 400, "the History record kept its base");
+});
+
+// ==== entryMatchesFood / rescaleEntryMacros ====
+test("entryMatchesFood: true for an untouched entry, false once its macros are hand-corrected", function () {
+  const food = { per100g: false, baseGrams: 100, calories: 200, protein: 10, carbs: 20, fat: 8, fiber: 1 };
+  const clean = { weight: 50, macros: { calories: 100, protein: 5, carbs: 10, fat: 4, fiber: 0.5 } };
+  const edited = { weight: 50, macros: { calories: 140, protein: 5, carbs: 10, fat: 4, fiber: 0.5 } };
+  assertEqual(M.entryMatchesFood(clean, food), true, "untouched entry still matches its source");
+  assertEqual(M.entryMatchesFood(edited, food), false, "a corrected entry no longer matches");
+  assertEqual(M.entryMatchesFood(clean, null), false, "no source food");
+  assertEqual(M.entryMatchesFood({ weight: 0, macros: { calories: 1 } }, food), false, "unusable entry weight");
+  // Fiber is one of the four editable fields, so a fiber-only correction must also count as
+  // "modified" -- otherwise the next portion change silently reverts it.
+  const fiberOnly = { weight: 50, macros: { calories: 100, protein: 5, carbs: 10, fat: 4, fiber: 6 } };
+  assertEqual(M.entryMatchesFood(fiberOnly, food), false, "a fiber-only correction is still a correction");
+});
+test("rescaleEntryMacros: an entry with no macros object degrades instead of throwing", function () {
+  M.state.foodCache = {};
+  assertEqual(M.rescaleEntryMacros({ foodId: "x", weight: 50 }, 100), { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 }, "zeros, not a thrown TypeError mid-render");
+});
+test("rescaleEntryMacros: an untouched entry re-derives from its source food", function () {
+  M.state.foodCache = { f1: { id: "f1", per100g: true, calories: 200, protein: 10, carbs: 20, fat: 8, fiber: 2 } };
+  const entry = { foodId: "f1", weight: 100, macros: { calories: 200, protein: 10, carbs: 20, fat: 8, fiber: 2 } };
+  assertEqual(M.rescaleEntryMacros(entry, 250).calories, 500, "scaled off the food's own base");
+});
+test("rescaleEntryMacros: a hand-corrected entry scales from its own macros, keeping the correction", function () {
+  M.state.foodCache = { f1: { id: "f1", per100g: true, calories: 200, protein: 10, carbs: 20, fat: 8, fiber: 2 } };
+  const corrected = { foodId: "f1", weight: 100, macros: { calories: 300, protein: 15, carbs: 30, fat: 12, fiber: 3 } };
+  assertEqual(M.rescaleEntryMacros(corrected, 200).calories, 600, "doubles the corrected 300, not the source's 200");
+  assertEqual(M.rescaleEntryMacros(corrected, 200).protein, 30, "protein follows the correction too");
+});
+test("rescaleEntryMacros: no source food and no usable old weight keeps the macros rather than emitting NaN", function () {
+  M.state.foodCache = {};
+  const broken = { foodId: "gone", weight: 0, macros: { calories: 120, protein: 6, carbs: 12, fat: 4, fiber: 1 } };
+  assertEqual(M.rescaleEntryMacros(broken, 200), { calories: 120, protein: 6, carbs: 12, fat: 4, fiber: 1 }, "unchanged, not Infinity/NaN");
+});
+test("rescaleEntryMacros: no source food but a usable old weight scales proportionally", function () {
+  M.state.foodCache = {};
+  const orphan = { foodId: "gone", weight: 50, macros: { calories: 120, protein: 6, carbs: 12, fat: 4, fiber: 1 } };
+  assertEqual(M.rescaleEntryMacros(orphan, 100), { calories: 240, protein: 12, carbs: 24, fat: 8, fiber: 2 }, "doubled");
+});
+
+// ==== propagateCustomFoodEdit ====
+// The exact reported symptom: correct a custom food's macros while the entry sits at a weight
+// other than the food's original portion, then change the portion -- the macros used to come
+// back completely unchanged, because the food record still claimed the ORIGINAL base.
+test("propagateCustomFoodEdit: a macro correction re-anchors the food to the entry's weight", function () {
+  M.state.date = "2026-07-21";
+  M.state.recentFoods = []; M.state.favorites = []; M.state.foodCache = {}; M.state.customBarcodes = {};
+  const food = {
+    id: "manual_1", name: "Dog", source: "Manual Entry", per100g: false,
+    calories: 235, protein: 10, carbs: 20, fat: 13, fiber: 1,
+    baseGrams: 83, loggedWeight: 83, servingSizes: [{ label: "83g", grams: 83 }],
+    loggedMacros: { calories: 235, protein: 10, carbs: 20, fat: 13, fiber: 1 },
+  };
+  M.state.recentFoods = [food];
+  M.state.foodCache = { manual_1: food };
+  const entry = { id: "log_1", foodId: "manual_1", source: "Manual Entry", weight: 166, macros: { calories: 470, protein: 20, carbs: 40, fat: 26, fiber: 2 } };
+  const newMacros = { calories: 474, protein: 20, carbs: 40, fat: 26, fiber: 2 };
+  M.propagateCustomFoodEdit(entry, newMacros);
+  assertEqual(M.state.foodCache.manual_1.baseGrams, 166, "cache re-anchored to the entry's weight");
+  assertEqual(M.state.recentFoods[0].calories, 474, "History got the correction too, not just the cache");
+  assertEqual(M.state.recentFoods[0].baseGrams, 166, "History re-anchored as well");
+  // Halving the portion must now actually halve the macros.
+  const corrected = Object.assign({}, entry, { macros: newMacros });
+  assertEqual(M.rescaleEntryMacros(corrected, 83).calories, 237, "83g is half of the corrected 474, not 474 again");
+});
+test("propagateCustomFoodEdit: a custom-barcode correction restates servingSizes, not just baseGrams", function () {
+  M.state.recentFoods = []; M.state.favorites = []; M.state.foodCache = {};
+  M.state.customBarcodes = { "123": { id: "barcode_123", name: "Bar", per100g: false, calories: 100, protein: 5, carbs: 10, fat: 3, fiber: 0, baseGrams: 40, servingSizes: [{ label: "40g", grams: 40 }] } };
+  const entry = { id: "log_2", foodId: "barcode_123", source: "Custom Barcode Entry", weight: 60, macros: { calories: 150, protein: 7.5, carbs: 15, fat: 4.5, fiber: 0 } };
+  M.propagateCustomFoodEdit(entry, { calories: 160, protein: 8, carbs: 16, fat: 5, fiber: 0 });
+  assertEqual(M.state.customBarcodes["123"].baseGrams, 60, "barcode record re-anchored");
+  assertEqual(M.state.customBarcodes["123"].servingSizes, [{ label: "60g", grams: 60 }], "servingSizes restated -- handleBarcodeDetected reads the portion from here");
+  assertEqual(M.state.customBarcodes["123"].calories, 160, "corrected macros stored");
+});
+test("propagateCustomFoodEdit: an unusable entry weight leaves the base alone rather than anchoring to 0g", function () {
+  M.state.recentFoods = []; M.state.favorites = []; M.state.customBarcodes = {};
+  M.state.foodCache = { manual_2: { id: "manual_2", per100g: false, calories: 100, protein: 5, carbs: 10, fat: 2, fiber: 0, baseGrams: 50 } };
+  M.propagateCustomFoodEdit({ id: "l", foodId: "manual_2", source: "Manual Entry", weight: 0, macros: { calories: 100 } }, { calories: 120, protein: 6, carbs: 12, fat: 3, fiber: 0 });
+  assertEqual(M.state.foodCache.manual_2.baseGrams, 50, "base untouched");
+  assertEqual(M.state.foodCache.manual_2.calories, 120, "macros still corrected");
+});
+
+// ==== updateFoodRecordEverywhere ====
+test("updateFoodRecordEverywhere: reaches the cache even when the food has aged out of History", function () {
+  M.state.recentFoods = []; M.state.favorites = [];
+  M.state.foodCache = { x1: { id: "x1", calories: 100 } };
+  assertEqual(M.updateFoodRecordEverywhere("x1", { calories: 250 }), true, "reports that something matched");
+  assertEqual(M.state.foodCache.x1.calories, 250, "cache updated despite the History miss");
+});
+test("updateFoodRecordEverywhere: reports false when nothing anywhere matches", function () {
+  M.state.recentFoods = []; M.state.favorites = []; M.state.foodCache = {};
+  assertEqual(M.updateFoodRecordEverywhere("nope", { calories: 1 }), false, "no store matched");
+  assertEqual(M.updateFoodRecordEverywhere(null, { calories: 1 }), false, "null id guard");
+});
+
+test("foodBaseGrams: a stringified baseGrams from JSON still returns a number", function () {
+  const g = M.foodBaseGrams({ per100g: false, baseGrams: "166" });
+  assertEqual(typeof g, "number", "callers divide by this and pass it to round1");
+  assertEqual(g, 166, "value preserved");
+});
+
+// ==== saveFoodRecordMacros / saveEditBarcode propagation ====
+test("saveFoodRecordMacros: restates loggedMacros even when the record has no loggedWeight", function () {
+  M.state.recentFoods = [{ id: "h1", name: "Old", per100g: false, baseGrams: 50, calories: 100, protein: 5, carbs: 10, fat: 2, fiber: 0,
+    loggedMacros: { calories: 100, protein: 5, carbs: 10, fat: 2, fiber: 0 } }];
+  M.state.favorites = []; M.state.foodCache = {};
+  M.state.ui = {};
+  const originalGetElementById = documentStub.getElementById;
+  documentStub.getElementById = function(id) {
+    const map = { editMacro_protein: "10", editMacro_carbs: "20", editMacro_fat: "4", editMacro_fiber: "1", editMacroCaloriesInput: "200" };
+    return { value: map[id] };
+  };
+  try {
+    M.actions.saveFoodRecordMacros("h1");
+  } finally {
+    documentStub.getElementById = originalGetElementById; // shared singleton -- always restore
+  }
+  const rec = M.state.recentFoods[0];
+  assertEqual(rec.calories, 200, "base macros corrected");
+  // addFoodToLog prefers loggedMacros, so a stale one would silently win over the correction.
+  assertEqual(rec.loggedMacros.calories, 200, "snapshot restated, not left stale at 100");
+  assertEqual(rec.loggedWeight, 50, "loggedWeight paired with the snapshot's basis");
+});
+test("saveEditBarcode: the correction reaches History, not just customBarcodes and the cache", function () {
+  M.state.customBarcodes = { "999": { id: "barcode_999", name: "Bar", per100g: false, calories: 100, protein: 5, carbs: 10, fat: 3, fiber: 0, baseGrams: 40, servingSizes: [{ label: "40g", grams: 40 }] } };
+  M.state.recentFoods = [{ id: "barcode_999", name: "Bar", calories: 100, protein: 5, carbs: 10, fat: 3, fiber: 0, baseGrams: 40 }];
+  M.state.favorites = []; M.state.foodCache = {};
+  M.state.ui = { strategy: { editingBarcodeCode: "999", editBarcodeManual: { name: "Bar", weight: "60", calories: "150", protein: "7.5", carbs: "15", fat: "4.5", fiber: "0" } } };
+  M.actions.saveEditBarcode();
+  assertEqual(M.state.customBarcodes["999"].calories, 150, "barcode record updated");
+  assertEqual(M.state.recentFoods[0].calories, 150, "History record updated too");
+  assertEqual(M.state.recentFoods[0].baseGrams, 60, "History re-anchored to the new weight");
+  assertEqual(M.state.recentFoods[0].servingSizes === M.state.customBarcodes["999"].servingSizes, false, "servingSizes is not one array aliased across stores");
+});
+
+// ============================================================
+// DASHBOARD LOG ORDERING (newest first)
+// ============================================================
+test("groupEntriesByHourNewestFirst: hour groups run newest to oldest", function () {
+  const groups = M.groupEntriesByHourNewestFirst([
+    { id: "a", timestamp: "2026-07-21T09:15:00" },
+    { id: "b", timestamp: "2026-07-21T17:40:00" },
+    { id: "c", timestamp: "2026-07-21T13:05:00" },
+  ]);
+  assertEqual(groups.map(function(g){ return g.hour; }), [17, 13, 9], "5 PM, then 1 PM, then 9 AM");
+  assertEqual(groups[0].label, "5 PM", "label derived from the hour");
+});
+test("groupEntriesByHourNewestFirst: entries inside an hour run newest first", function () {
+  const groups = M.groupEntriesByHourNewestFirst([
+    { id: "early", timestamp: "2026-07-21T12:05:00" },
+    { id: "late", timestamp: "2026-07-21T12:50:00" },
+    { id: "mid", timestamp: "2026-07-21T12:30:00" },
+  ]);
+  assertEqual(groups.length, 1, "all three share the noon hour");
+  assertEqual(groups[0].items.map(function(e){ return e.id; }), ["late", "mid", "early"], "newest first within the group");
+});
+test("groupEntriesByHourNewestFirst: identical timestamps put the later-added entry first", function () {
+  const groups = M.groupEntriesByHourNewestFirst([
+    { id: "first", timestamp: "2026-07-21T08:00:00" },
+    { id: "second", timestamp: "2026-07-21T08:00:00" },
+  ]);
+  assertEqual(groups[0].items.map(function(e){ return e.id; }), ["second", "first"], "insertion order broken in reverse, not preserved");
+});
+test("groupEntriesByHourNewestFirst: an entry moved in from another day sorts by its real time, not array position", function () {
+  // A copied/moved entry is appended last but carries an older timestamp.
+  const groups = M.groupEntriesByHourNewestFirst([
+    { id: "logged_today", timestamp: "2026-07-21T18:00:00" },
+    { id: "moved_in", timestamp: "2026-07-21T07:00:00" },
+  ]);
+  assertEqual(groups.map(function(g){ return g.hour; }), [18, 7], "6 PM group above the 7 AM group despite insertion order");
+});
+test("groupEntriesByHourNewestFirst: an unparseable timestamp is bucketed, not rendered as 'NaN AM'", function () {
+  const groups = M.groupEntriesByHourNewestFirst([{ id: "bad", timestamp: "not-a-date" }]);
+  assertEqual(groups.length, 1, "still grouped");
+  assertEqual(groups[0].label, "12 AM", "falls into hour 0");
+});
+test("groupEntriesByHourNewestFirst: midnight and noon get distinct 12-hour labels", function () {
+  const groups = M.groupEntriesByHourNewestFirst([
+    { id: "midnight", timestamp: "2026-07-21T00:30:00" },
+    { id: "noon", timestamp: "2026-07-21T12:30:00" },
+  ]);
+  assertEqual(groups.map(function(g){ return g.label; }), ["12 PM", "12 AM"], "noon is PM, midnight is AM");
+});
+test("groupEntriesByHourNewestFirst: empty and missing input return an empty list", function () {
+  assertEqual(M.groupEntriesByHourNewestFirst([]).length, 0, "empty array");
+  assertEqual(M.groupEntriesByHourNewestFirst(null).length, 0, "null guard");
+});
+
+// ============================================================
+// BRAND-AWARE LOCAL SEARCH
+// ============================================================
+test("foodMatchesQuery: matches on brand as well as name", function () {
+  const food = { name: "Loonie Dog", brand: "Schneiders" };
+  assertEqual(M.foodMatchesQuery(food, "loonie"), true, "name match");
+  assertEqual(M.foodMatchesQuery(food, "schneid"), true, "brand match");
+  assertEqual(M.foodMatchesQuery(food, "zzz"), false, "no match");
+});
+test("foodMatchesQuery: name and brand are tested separately, never concatenated", function () {
+  // "dog schneiders" only matches if the two fields were joined into one string.
+  assertEqual(M.foodMatchesQuery({ name: "Loonie Dog", brand: "Schneiders" }, "dog schneiders"), false, "no straddling match across fields");
+});
+test("foodMatchesQuery: a record missing name or brand does not throw", function () {
+  assertEqual(M.foodMatchesQuery({ brand: "Kraft" }, "kraft"), true, "no name field");
+  assertEqual(M.foodMatchesQuery({ name: "Rice" }, "rice"), true, "no brand field");
+  assertEqual(M.foodMatchesQuery(null, "x"), false, "null food");
+});
+test("filterFoodsByQuery: History/Favorites filtering finds a food by its brand", function () {
+  const list = [{ name: "Loonie Dog", brand: "Schneiders" }, { name: "Bread", brand: "Wonder" }];
+  assertEqual(M.filterFoodsByQuery(list, "Schneiders").length, 1, "brand match, case-insensitive");
+  assertEqual(M.filterFoodsByQuery(list, "wonder")[0].name, "Bread", "the right row came back");
+});
+test("localFoodMatches: the search screen's 'Eaten before' group also matches on brand", function () {
+  M.state.recentFoods = [{ id: "r1", name: "Loonie Dog", brand: "Schneiders", source: "Manual Entry", calories: 235, protein: 10, carbs: 20, fat: 13 }];
+  M.state.favorites = []; M.state.foodCache = {};
+  assertEqual(M.localFoodMatches("schneiders").length, 1, "found by brand with no network round trip");
+  assertEqual(M.localFoodMatches("loonie").length, 1, "still found by name");
 });
 
 console.log("\n" + pass + " passed, " + fail + " failed");

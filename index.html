@@ -26,13 +26,26 @@ button{cursor:pointer;}
 a{color:inherit;}
 .hidden{display:none !important;}
 #app{max-width:500px;margin:0 auto;position:relative;padding-bottom:120px;min-height:100vh;}
-.header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;position:sticky;top:0;z-index:100;background:rgba(11,14,24,0.92);backdrop-filter:blur(12px);}
-.brand{font-size:18px;font-weight:700;color:#3B82F6;}
-.dateNav{display:flex;align-items:center;gap:8px;}
-.navArrow{background:none;border:none;color:#94A3B8;font-size:18px;cursor:pointer;padding:4px;}
-.dateBtn{background:#0F1220;border:1px solid #1E2640;border-radius:10px;color:#E2E8F0;padding:6px 16px;font-size:14px;font-weight:500;cursor:pointer;}
+/* 1fr auto 1fr (not space-between) so the date sits in the true centre of the header: the
+   brand and the gear are different widths, and space-between centres nothing -- it just puts
+   the gap where the leftover space happens to fall. The 1fr columns are equal by definition,
+   so the middle one is genuinely centred regardless of what either side contains. */
+.header{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:16px 16px;position:sticky;top:0;z-index:100;background:rgba(11,14,24,0.92);backdrop-filter:blur(12px);}
+/* The centred date column is fixed-width, so on a narrow screen the brand is what has to give.
+   It ellipsises rather than pushing the date off-centre -- the app name is the least useful
+   thing in this header (it's also on the Strategy tab and the home-screen icon). */
+.brand{font-size:15px;font-weight:700;color:#3B82F6;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.dateNav{display:flex;align-items:center;justify-content:center;gap:10px;}
+/* Bigger arrows, set apart from the date so a mis-tap doesn't hit the wrong control. The 28px
+   glyph is what reads as "larger"; min-height keeps the touch target at the 44px both the iOS
+   and Android guidelines call for, without eating the horizontal room the brand needs. */
+.navArrow{background:none;border:none;color:#94A3B8;font-size:28px;line-height:1;cursor:pointer;padding:4px 8px;min-width:40px;min-height:44px;}
+.navArrow:active{color:#E2E8F0;}
+/* min-width stops the arrows sliding sideways as the label swaps between the short "Today" and
+   a full date like "Wed, Jul 23". */
+.dateBtn{background:#0F1220;border:1px solid #1E2640;border-radius:10px;color:#E2E8F0;padding:8px 10px;font-size:14px;font-weight:500;cursor:pointer;text-align:center;min-width:100px;}
 .dateBtn.today{color:#3B82F6;}
-.settingsBtn{background:none;border:none;color:#64748B;font-size:20px;cursor:pointer;}
+.settingsBtn{background:none;border:none;color:#64748B;font-size:20px;cursor:pointer;justify-self:end;}
 .content{padding:0 16px;}
 .bottomBar{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:500px;z-index:100;display:flex;flex-direction:column;background:rgba(20,24,40,0.94);border-top:1px solid #1E2640;backdrop-filter:blur(12px);}
 .bottomNav{display:flex;box-sizing:border-box;}
@@ -49,6 +62,8 @@ a{color:inherit;}
 .btn.outline.danger{background:transparent;border:1px solid #EF4444;color:#EF4444;}
 .btn.full{width:100%;}
 .btn.small{padding:8px 14px;font-size:13px;}
+/* Equal-width member of a .btnRow: shares the row evenly and never wraps to a second line. */
+.btn.rowItem{flex:1;min-width:0;padding:9px 4px;font-size:12px;white-space:nowrap;}
 .btn:disabled{opacity:0.5;cursor:default;}
 .input{width:100%;padding:12px 16px;background:#0F1220;border:1px solid #1E2640;border-radius:10px;color:#E2E8F0;font-size:15px;outline:none;box-sizing:border-box;}
 .input:focus{border-color:#3B82F6;}
@@ -56,6 +71,8 @@ a{color:inherit;}
 .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;text-transform:uppercase;}
 .row{display:flex;gap:8px;}
 .rowWrap{display:flex;gap:6px;flex-wrap:wrap;}
+/* Single-line action row: pair with .btn.rowItem so every button shares the width evenly. */
+.btnRow{display:flex;gap:6px;}
 .statCard{flex:1;background:#0F1220;border:1px solid #1E2640;border-radius:12px;padding:16px;min-width:0;}
 .statLabel{color:#64748B;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;}
 .statValue{font-size:22px;font-weight:700;}
@@ -170,7 +187,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.08";
+const APP_VERSION = "1.09";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -201,6 +218,11 @@ const parseDateStr = (s) => { const p = s.split("-").map(Number); return new Dat
 const dayLabel = (s) => parseDateStr(s).toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; });
 const round1 = (n) => Math.round(n * 10) / 10;
+// A gram weight that is safe to divide by. Zero is not a usable portion here -- it can't
+// anchor macros and it turns any rescale into a divide-by-zero -- so it falls back to the
+// caller's default alongside blank/NaN/negative input, rather than being accepted like the
+// legitimate zeros elsewhere in the app (a 0g-fiber food is real; a 0g food is not).
+const positiveGramsOr = (v, fallback) => { const n = parseFloat(v); return n > 0 && isFinite(n) ? n : fallback; };
 
 // ============================================================
 // STORAGE (localStorage)
@@ -933,12 +955,34 @@ function foodQuantityLabel(food) {
   return "kcal/" + round1(g) + "g";
 }
 
+// food.baseGrams is the EXPLICIT statement of "these macros describe N grams" and wins over
+// everything below it, which are only inferences. It exists because the inferences are each
+// derived from a field some other code path legitimately overwrites: re-logging a food rewrites
+// loggedWeight, and correcting a custom food's macros rewrites the macro fields. Either one on
+// its own silently re-anchors the food to a portion its numbers never described. See
+// anchorFoodBase.
 function foodBaseGrams(food) {
+  if (!food) return 100;
+  // parseFloat, not a bare `> 0`: this value round-trips through JSON in four different stores
+  // and the return type is contracted as a number (callers hand it straight to round1 and to
+  // division), so a stringified "166" must not leak out of here.
+  const explicit = parseFloat(food.baseGrams);
+  if (explicit > 0) return explicit;
   if (food.per100g) return 100;
   const serving = food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams;
   if (serving > 0) return serving;
   if (food.loggedWeight > 0) return food.loggedWeight;
   return 100;
+}
+
+// Returns a copy of `food` with its CURRENT base portion frozen into an explicit baseGrams,
+// so a later write to loggedWeight (re-logging the same food at a different weight) can't move
+// the anchor out from under the stored macros. Must be applied BEFORE loggedWeight is
+// overwritten, which is why it lives at the clone sites rather than inside addFoodToLog.
+// Also upgrades legacy records (saved before baseGrams existed) on their next use, since the
+// inference chain still produces the right answer for a record nothing has re-anchored yet.
+function anchorFoodBase(food) {
+  return Object.assign({}, food, { baseGrams: foodBaseGrams(food) });
 }
 
 function calcMacrosForWeight(food, grams) {
@@ -1183,11 +1227,14 @@ function statCard(label, value, color) {
 }
 
 function btn(opts) {
-  // opts: {label, action, arg, arg2, color, outline, full, small, disabled, extraStyle, id}
+  // opts: {label, action, arg, arg2, color, outline, full, small, rowItem, disabled, extraStyle, id}
+  // rowItem = equal-width member of a .btnRow (deliberately NOT called "compact" -- that word
+  // already means "tighter vertical spacing" in renderServingControls' cfg, a different thing).
   const classes = ["btn"];
   if (opts.outline) classes.push("outline");
   if (opts.full) classes.push("full");
   if (opts.small) classes.push("small");
+  if (opts.rowItem) classes.push("rowItem");
   if (opts.color === "danger") classes.push("danger");
   const style = opts.color && opts.color !== "danger" ? ' style="background:' + (opts.outline ? "transparent" : opts.color) + ';' + (opts.outline ? "color:" + opts.color + ";border-color:" + opts.color : "") + (opts.extraStyle || "") + '"' : (opts.extraStyle ? ' style="' + opts.extraStyle + '"' : "");
   return '<button class="' + classes.join(" ") + '"' +
@@ -1423,26 +1470,17 @@ function renderDashboard() {
   html += '<div class="row" style="margin-bottom:16px">' + btn({ label: "\uFF0B Add Food", action: "setTab", arg: "food", full: true }) + '</div>';
 
   if (entries.length > 0) {
-    // group by hour
-    const groups = {};
-    const order = [];
-    entries.forEach(function(e) {
-      const h = new Date(e.timestamp).getHours();
-      const label = (h === 0 ? 12 : h > 12 ? h - 12 : h) + " " + (h >= 12 ? "PM" : "AM");
-      if (!groups[label]) { groups[label] = []; order.push(label); }
-      groups[label].push(e);
-    });
+    const groups = groupEntriesByHourNewestFirst(entries);
     let logHtml = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">' +
       '<h3 class="cardTitle" style="margin:0">Today\'s Log</h3>' +
       '<span style="color:' + C.textMut + ';font-size:13px">' + entries.length + ' items</span></div>';
 
-    order.slice().reverse().forEach(function(timeLabel) {
-      const items = groups[timeLabel];
-      const groupCals = items.reduce(function(a,i){ return a + (i.macros.calories||0); }, 0);
+    groups.forEach(function(group) {
+      const groupCals = group.items.reduce(function(a,i){ return a + (i.macros.calories||0); }, 0);
       logHtml += '<div style="display:flex;justify-content:space-between;align-items:center;margin:12px 0 8px">' +
-        '<span style="color:' + C.textSec + ';font-size:13px;font-weight:600">\u{1F550} ' + timeLabel + '</span>' +
+        '<span style="color:' + C.textSec + ';font-size:13px;font-weight:600">\u{1F550} ' + group.label + '</span>' +
         '<span style="color:' + C.textMut + ';font-size:12px">' + groupCals + ' kcal</span></div>';
-      items.forEach(function(entry) {
+      group.items.forEach(function(entry) {
         logHtml += renderFoodEntry(entry);
       });
     });
@@ -1452,6 +1490,35 @@ function renderDashboard() {
   }
 
   return html;
+}
+
+// Buckets a day's entries into hour groups, newest first both BETWEEN groups (5 PM above 2 PM)
+// and WITHIN each group (the food just logged sits at the top of its hour, not the bottom).
+// Sorted on the real timestamp rather than relying on array order: entries are appended in the
+// order they're created, so a food moved or copied in from another day lands at the end of the
+// array carrying an older time, and order-of-insertion put it in the wrong place.
+// Keyed by the numeric hour, not the display label, so the ordering can't depend on how "12 AM"
+// happens to sort as a string. Entries with an unparseable timestamp are bucketed under hour 0
+// rather than an "NaN AM" heading.
+function groupEntriesByHourNewestFirst(entries) {
+  const byHour = new Map();
+  (entries || []).forEach(function(e, i) {
+    const d = new Date(e.timestamp);
+    const t = d.getTime();
+    const valid = !isNaN(t);
+    const h = valid ? d.getHours() : 0;
+    if (!byHour.has(h)) byHour.set(h, []);
+    byHour.get(h).push({ entry: e, t: valid ? t : 0, i: i });
+  });
+  return [...byHour.keys()].sort(function(a, b){ return b - a; }).map(function(h) {
+    // `i` breaks ties: timestamps only carry ms, and two foods logged in the same instant
+    // would otherwise keep their insertion order (oldest first) via sort stability -- the exact
+    // opposite of what this function is for. Later insertion wins.
+    const items = byHour.get(h)
+      .sort(function(a, b){ return (b.t - a.t) || (b.i - a.i); })
+      .map(function(x){ return x.entry; });
+    return { hour: h, label: (h === 0 ? 12 : h > 12 ? h - 12 : h) + " " + (h >= 12 ? "PM" : "AM"), items: items };
+  });
 }
 
 // A real, distinct brand is shown as its own line; falling back to the source (e.g. "Manual
@@ -1535,13 +1602,11 @@ function renderEntryEditor(entry) {
       '<span style="color:' + C.textMut + ';font-size:12px">g</span>' +
       btn({ label: "Save", action: "saveEntryPortion", small: true }) +
     '</div>';
-    if (cachedFood) {
-      const w = parseFloat(weightVal) || 0;
-      const m = calcMacrosForWeight(cachedFood, w);
-      html += '<div style="color:' + C.textMut + ';font-size:11px">Preview: ' + m.calories + ' kcal \u2022 P ' + m.protein + 'g \u2022 C ' + m.carbs + 'g \u2022 F ' + m.fat + 'g</div>';
-    } else {
-      html += '<div style="color:' + C.textMut + ';font-size:11px">Original food details unavailable \u2014 weight will scale the current macros proportionally.</div>';
-    }
+    // Preview goes through the same rescaleEntryMacros the Save action uses, so what's shown is
+    // exactly what gets stored -- it used to preview calcMacrosForWeight(cachedFood, w) while
+    // Save could take the proportional path, and the two disagree for a hand-corrected entry.
+    html += '<div id="entryPortionPreview" style="color:' + C.textMut + ';font-size:11px">' +
+      entryPortionPreviewText(entry, parseFloat(weightVal) || 0) + '</div>';
   } else if (section === "macros") {
     const m = entry.macros;
     const isCustom = entry.source === "Recipe" || entry.source === "Manual Entry" || entry.source === "Custom Barcode Entry";
@@ -1668,7 +1733,21 @@ actions.removeFood = function(entryId) {
   rerender();
 };
 
-inputActions.entryWeightInput = function(val) { state.ui.entryWeightInput = val; };
+function entryPortionPreviewText(entry, weight) {
+  if (!(weight > 0)) return "Enter a weight above 0g.";
+  const m = rescaleEntryMacros(entry, weight);
+  return "Preview: " + m.calories + " kcal • P " + m.protein + "g • C " + m.carbs + "g • F " + m.fat + "g";
+}
+// Text inputs don't rerender on keystroke (it would blur the field mid-type), so the preview
+// has to be DOM-patched or it just sits there showing the pre-edit macros while the user types
+// a new weight -- which reads exactly like "the macros don't scale".
+inputActions.entryWeightInput = function(val) {
+  state.ui.entryWeightInput = val;
+  const el = document.getElementById("entryPortionPreview");
+  if (!el) return;
+  const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === state.ui.editingEntryId; });
+  if (entry) el.textContent = entryPortionPreviewText(entry, parseFloat(val) || 0);
+};
 actions.setEntryWeight = function(grams) { state.ui.entryWeightInput = grams; rerender(); };
 actions.saveEntryPortion = function() {
   const id = state.ui.editingEntryId;
@@ -1677,43 +1756,93 @@ actions.saveEntryPortion = function() {
   if (!w || w <= 0) return;
   const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === id; });
   if (!entry) return;
-  const cachedFood = state.foodCache[entry.foodId];
-  let macros;
-  if (cachedFood) {
-    macros = calcMacrosForWeight(cachedFood, w);
-  } else {
-    const ratio = w / entry.weight;
-    macros = {
-      calories: Math.round(entry.macros.calories * ratio),
-      protein: round1(entry.macros.protein * ratio),
-      carbs: round1(entry.macros.carbs * ratio),
-      fat: round1(entry.macros.fat * ratio),
-      fiber: round1((entry.macros.fiber||0) * ratio),
-    };
-  }
-  updateFoodEntry(id, { weight: w, macros: macros });
+  updateFoodEntry(id, { weight: w, macros: rescaleEntryMacros(entry, w) });
   closeEntryEditor();
   rerender();
 };
 
+// True when `entry`'s macros are still exactly what `food` predicts at the entry's own weight,
+// i.e. nobody has hand-corrected this entry away from its source food. Compared against a
+// re-derivation rather than a stored flag so it also holds for entries logged before any of
+// this existed. Tolerance absorbs the rounding calcMacrosForWeight applies (calories to a whole
+// number, macros to 1dp) -- an exact === would report a false mismatch on ordinary entries.
+function entryMatchesFood(entry, food) {
+  if (!food || !entry || !entry.macros) return false;
+  const w = positiveGramsOr(entry.weight, 0);
+  if (w <= 0) return false;
+  const m = calcMacrosForWeight(food, w);
+  // Fiber is checked too, not just P/C/F: it's one of the four editable fields on the Macros
+  // tab, and leaving it out would classify a fiber-only correction as "unmodified" and then
+  // discard it on the next portion change -- the exact failure this function exists to prevent.
+  // Tolerances are sized to the rounding: calories are whole numbers (max 0.5 divergence),
+  // macros are 1dp (max 0.05), so nothing legitimate lands outside them.
+  return Math.abs((m.calories || 0) - (entry.macros.calories || 0)) <= 1 &&
+    Math.abs((m.protein || 0) - (entry.macros.protein || 0)) <= 0.15 &&
+    Math.abs((m.carbs || 0) - (entry.macros.carbs || 0)) <= 0.15 &&
+    Math.abs((m.fat || 0) - (entry.macros.fat || 0)) <= 0.15 &&
+    Math.abs((m.fiber || 0) - (entry.macros.fiber || 0)) <= 0.15;
+}
+
+// Macros for `entry` at a new weight. Re-deriving from the source food is preferred (it scales
+// from the food's own base rather than from already-rounded per-entry numbers, so repeated
+// portion edits don't accumulate drift) -- but ONLY when the entry still agrees with that food.
+// If the entry's macros were hand-corrected on the Macros tab, the editor promised "this only
+// changes today's entry"; re-deriving from the food would silently throw that correction away
+// on the next portion change, so those entries scale from their own numbers instead.
+function rescaleEntryMacros(entry, newWeight) {
+  const cachedFood = state.foodCache[entry.foodId];
+  if (entryMatchesFood(entry, cachedFood)) return calcMacrosForWeight(cachedFood, newWeight);
+  // This is now the single path every portion change goes through, including the live preview
+  // that runs on each keystroke -- so a malformed entry has to degrade, not throw and blank
+  // the screen.
+  const macros = entry.macros || {};
+  const oldWeight = positiveGramsOr(entry.weight, 0);
+  // No usable old weight to scale from and no matching source food: the macros can't be
+  // rescaled meaningfully, so keep them as they are rather than producing NaN/Infinity.
+  if (oldWeight <= 0) return { calories: macros.calories || 0, protein: macros.protein || 0, carbs: macros.carbs || 0, fat: macros.fat || 0, fiber: macros.fiber || 0 };
+  const ratio = newWeight / oldWeight;
+  return {
+    calories: Math.round((macros.calories || 0) * ratio),
+    protein: round1((macros.protein || 0) * ratio),
+    carbs: round1((macros.carbs || 0) * ratio),
+    fat: round1((macros.fat || 0) * ratio),
+    fiber: round1((macros.fiber || 0) * ratio),
+  };
+}
+
 // Editing macros on a log entry only affects that entry \u2014 UNLESS it's a food you created
 // yourself (a recipe or a manual/custom-barcode entry), in which case the correction is
 // also written back to the source so future uses of it are already fixed.
+//
+// The corrected macros describe entry.weight grams -- NOT whatever portion the food was
+// originally created at -- so baseGrams has to move with them. This was the reported "macros
+// don't scale to the new weight" bug: correct a 83g manual food's macros while the entry sits
+// at 166g and the food record kept claiming an 83g base, so a later portion change to 83g
+// re-derived the exact same numbers (no visible change at all), and 166g doubled them.
+// Writing loggedWeight/loggedMacros alongside keeps the History row (which prefers
+// loggedMacros) showing the correction rather than the stale pre-edit numbers.
 function propagateCustomFoodEdit(entry, newMacros) {
   if (entry.source === "Manual Entry" || entry.source === "Custom Barcode Entry") {
-    const cached = state.foodCache[entry.foodId];
-    if (cached) {
-      state.foodCache[entry.foodId] = Object.assign({}, cached, {
-        calories: newMacros.calories, protein: newMacros.protein, carbs: newMacros.carbs, fat: newMacros.fat, fiber: newMacros.fiber,
-      });
-      saveFoodCache();
+    const w = positiveGramsOr(entry.weight, 0);
+    const updates = {
+      calories: newMacros.calories, protein: newMacros.protein, carbs: newMacros.carbs, fat: newMacros.fat, fiber: newMacros.fiber,
+    };
+    if (w > 0) {
+      updates.baseGrams = w;
+      updates.loggedWeight = w;
+      updates.loggedMacros = Object.assign({}, newMacros);
     }
+    // Not just foodCache: History (recentFoods) and Favorites hold their own copies of the same
+    // food, and re-adding from either of those was still handing back the uncorrected numbers.
+    updateFoodRecordEverywhere(entry.foodId, updates);
     if (entry.source === "Custom Barcode Entry" && entry.foodId && entry.foodId.indexOf("barcode_") === 0) {
       const code = entry.foodId.slice("barcode_".length);
       if (state.customBarcodes[code]) {
-        state.customBarcodes[code] = Object.assign({}, state.customBarcodes[code], {
-          calories: newMacros.calories, protein: newMacros.protein, carbs: newMacros.carbs, fat: newMacros.fat, fiber: newMacros.fiber,
-        });
+        // customBarcodes rows are consumed by handleBarcodeDetected, which reads the portion off
+        // servingSizes[0] -- so that has to be re-stated too, not just baseGrams.
+        const barcodeUpdates = Object.assign({}, updates);
+        if (w > 0) barcodeUpdates.servingSizes = [{ label: round1(w) + "g", grams: w }];
+        state.customBarcodes[code] = Object.assign({}, state.customBarcodes[code], barcodeUpdates);
         saveCustomBarcodes();
       }
     }
@@ -1799,12 +1928,12 @@ actions.saveBarcodeCorrection = function(entryId) {
   if (!entry) return;
   const code = barcodeCodeForEntry(entry);
   if (!code) return;
-  const w = entry.weight || 100;
+  const w = positiveGramsOr(entry.weight, 100);
   const m = entry.macros;
   state.customBarcodes[code] = {
-    id: "barcode_" + code, name: entry.name, brand: "", source: "Custom Barcode Entry",
+    id: "barcode_" + code, name: entry.name, brand: entry.brand || "", source: "Custom Barcode Entry",
     per100g: false, calories: m.calories, protein: m.protein, carbs: m.carbs, fat: m.fat, fiber: m.fiber || 0,
-    state: "—", servingSizes: [{ label: round1(w) + "g", grams: w }],
+    state: "—", baseGrams: w, servingSizes: [{ label: round1(w) + "g", grams: w }],
   };
   saveCustomBarcodes();
   showToast("Saved — future scans will use this");
@@ -1963,11 +2092,14 @@ function renderFoodTab() {
       btn({ id: "foodSearchBtn", label: fu.searching ? "..." : "\u{1F50D}", action: "doFoodSearch", disabled: fu.searching }) +
       '</div>';
     html += '<input type="file" accept="image/*" capture="environment" id="aiPhotoInput" data-change="aiPhoto" style="display:none">';
-    html += '<div class="rowWrap" style="margin-bottom:16px">';
-    html += btn({ label: "\u{1F4F7} Scan Barcode", action: "openBarcodeScan", small: true, outline: true });
-    if (state.settings.aiEnabled) html += btn({ label: "\u2728 AI Estimate", action: "openAIScreen", small: true, outline: true });
-    html += btn({ label: "\u270F\uFE0F Manual", action: "openManualEntry", small: true, outline: true });
-    if (state.settings.aiEnabled) html += btn({ label: "\u{1F4F8} Photo", action: "clickPhotoInput", small: true, outline: true });
+    // One row, no wrapping: labels are shortened (the icon already carries most of the meaning)
+    // so all four still fit side by side on a phone-width screen. Each button flexes to an
+    // equal share, so the row stays balanced when the two AI buttons are hidden.
+    html += '<div class="btnRow" style="margin-bottom:16px">';
+    html += btn({ label: "\u{1F4F7} Scan", action: "openBarcodeScan", rowItem: true, outline: true });
+    if (state.settings.aiEnabled) html += btn({ label: "\u2728 AI", action: "openAIScreen", rowItem: true, outline: true });
+    html += btn({ label: "\u270F\uFE0F Manual", action: "openManualEntry", rowItem: true, outline: true });
+    if (state.settings.aiEnabled) html += btn({ label: "\u{1F4F8} Photo", action: "clickPhotoInput", rowItem: true, outline: true });
     html += '</div>';
 
     html += '<div id="foodResultsBlock">' + renderFoodResultsBlock(fu) + '</div>';
@@ -2103,12 +2235,25 @@ function patchFoodResultsBlock() {
 // shown immediately as the user types (e.g. "ice-" surfaces a previously-added "Ice Cream")
 // with no network round trip. The debounced live database search below layers remote hits on
 // top of this once the user pauses typing.
+// Shared match rule for every local food list (History, Favorites, and the search screen's
+// "Eaten before" group). `q` must already be lowercased and trimmed by the caller.
+// Brand is matched as well as name because a hand-added food is often remembered by its brand
+// rather than the name typed on it -- "schneiders" should find the one logged as "Loonie Dog".
+// The two fields are tested separately, not concatenated, so a query can't match by straddling
+// the gap between them. Both are read defensively: a record missing either field is possible
+// in older synced data, and a bare .toLowerCase() on it would throw and blank the whole list.
+function foodMatchesQuery(food, q) {
+  if (!food) return false;
+  if (String(food.name || "").toLowerCase().indexOf(q) >= 0) return true;
+  return String(food.brand || "").toLowerCase().indexOf(q) >= 0;
+}
+
 function localFoodMatches(q) {
   const seen = new Set();
   const out = [];
   function addFrom(list, cached) {
     list.forEach(function(f) {
-      if (seen.has(f.id) || f.name.toLowerCase().indexOf(q) < 0) return;
+      if (seen.has(f.id) || !foodMatchesQuery(f, q)) return;
       seen.add(f.id);
       out.push(cached ? Object.assign({}, f, { source: f.source + " (Cached)" }) : f);
     });
@@ -2119,10 +2264,10 @@ function localFoodMatches(q) {
   return out;
 }
 
-function filterFoodsByName(list, query) {
+function filterFoodsByQuery(list, query) {
   const q = (query || "").trim().toLowerCase();
   if (!q) return list;
-  return list.filter(function(f){ return f.name.toLowerCase().indexOf(q) >= 0; });
+  return list.filter(function(f){ return foodMatchesQuery(f, q); });
 }
 
 // Split out of renderFoodTab, same reason as renderFoodResultsBlock above: patched into
@@ -2132,7 +2277,7 @@ function renderHistoryListBlock(fu) {
   if (state.recentFoods.length === 0) {
     return card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No food history yet</div>');
   }
-  const list = filterFoodsByName(state.recentFoods, fu.historyQuery);
+  const list = filterFoodsByQuery(state.recentFoods, fu.historyQuery);
   if (list.length === 0) {
     return '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No matches for “' + esc(fu.historyQuery) + '”</div>';
   }
@@ -2220,15 +2365,18 @@ function renderFoodRecordEditor(food) {
 // those places uses the corrected data, not just the one list the user happened to edit from.
 // Mirrors propagateCustomFoodEdit's reasoning (a log-entry edit propagating to its source) but
 // generalized to any food, editable directly rather than only via a logged instance.
+// Each store is updated independently: a food can legitimately be in the cache but not in
+// History (History is capped at 500 and old entries fall off), and bailing out on the first
+// miss used to mean a correction reached none of the others. Returns whether anything matched.
 function updateFoodRecordEverywhere(foodId, updates) {
+  if (!foodId) return false;
+  let touched = false;
   const idx = state.recentFoods.findIndex(function(f){ return f.id === foodId; });
-  if (idx < 0) return false;
-  state.recentFoods[idx] = Object.assign({}, state.recentFoods[idx], updates);
-  saveRecentFoods();
+  if (idx >= 0) { state.recentFoods[idx] = Object.assign({}, state.recentFoods[idx], updates); saveRecentFoods(); touched = true; }
   const favIdx = state.favorites.findIndex(function(f){ return f.id === foodId; });
-  if (favIdx >= 0) { state.favorites[favIdx] = Object.assign({}, state.favorites[favIdx], updates); saveFavorites(); }
-  if (state.foodCache[foodId]) { state.foodCache[foodId] = Object.assign({}, state.foodCache[foodId], updates); saveFoodCache(); }
-  return true;
+  if (favIdx >= 0) { state.favorites[favIdx] = Object.assign({}, state.favorites[favIdx], updates); saveFavorites(); touched = true; }
+  if (state.foodCache[foodId]) { state.foodCache[foodId] = Object.assign({}, state.foodCache[foodId], updates); saveFoodCache(); touched = true; }
+  return touched;
 }
 
 function closeFoodRecordEditor() {
@@ -2266,11 +2414,19 @@ actions.saveFoodRecordMacros = function(foodId) {
   // Calories comes from its own (auto-calculated-but-editable) field, not always recomputed
   // from P/C/F -- so it can account for alcohol's extra ~7 kcal/g, which P/C/F alone misses.
   const cal = Math.max(0, parseFloat(document.getElementById("editMacroCaloriesInput").value) || 0);
-  const updates = { protein: p, carbs: c, fat: f, fiber: fib, calories: cal };
+  // baseGrams is written explicitly (not left to be re-derived) because the edit form above
+  // states the basis to the user -- "Values are for 83g" -- so that basis has to be pinned to
+  // what they were shown, not re-inferred later from a field a re-log may have moved.
+  const updates = { protein: p, carbs: c, fat: f, fiber: fib, calories: cal, baseGrams: foodBaseGrams(food) };
   // Rescale the "last logged" snapshot to the corrected base, at the same weight as before --
   // otherwise re-adding this food would still show the old numbers via loggedMacros
   // (addFoodToLog prefers loggedMacros over the base fields whenever both are present).
-  if (food.loggedWeight) updates.loggedMacros = calcMacrosForWeight(Object.assign({}, food, updates), food.loggedWeight);
+  // Restated unconditionally rather than only when loggedWeight is set: a record carrying a
+  // stale loggedMacros but no usable loggedWeight would otherwise keep that stale snapshot
+  // winning over every corrected field above.
+  const lastWeight = positiveGramsOr(food.loggedWeight, updates.baseGrams);
+  updates.loggedWeight = lastWeight;
+  updates.loggedMacros = calcMacrosForWeight(Object.assign({}, food, updates), lastWeight);
   updateFoodRecordEverywhere(foodId, updates);
   closeFoodRecordEditor();
   rerender();
@@ -2292,7 +2448,7 @@ function renderFavoritesListBlock(fu) {
   if (state.favorites.length === 0) {
     return card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No favorites yet. Star foods to add them here.</div>');
   }
-  const list = filterFoodsByName(state.favorites, fu.favoritesQuery);
+  const list = filterFoodsByQuery(state.favorites, fu.favoritesQuery);
   if (list.length === 0) {
     return '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No matches for “' + esc(fu.favoritesQuery) + '”</div>';
   }
@@ -2574,13 +2730,12 @@ actions.saveCustomBarcode = function() {
   const code = fu.scanNotFoundCode;
   const m = fu.customBarcodeManual;
   if (!code || !m.name.trim()) return;
-  const weightParsed = parseFloat(m.weight);
-  const weight = isNaN(weightParsed) ? 100 : Math.max(0, weightParsed);
+  const weight = positiveGramsOr(m.weight, 100);
   const food = {
     id: "barcode_" + code, name: m.name.trim(), brand: "", source: "Custom Barcode Entry",
     per100g: false, calories: Math.max(0, parseFloat(m.calories) || 0), protein: Math.max(0, parseFloat(m.protein) || 0),
     carbs: Math.max(0, parseFloat(m.carbs) || 0), fat: Math.max(0, parseFloat(m.fat) || 0), fiber: Math.max(0, parseFloat(m.fiber) || 0),
-    state: "—", servingSizes: [{ label: weight + "g", grams: weight }],
+    state: "—", baseGrams: weight, servingSizes: [{ label: round1(weight) + "g", grams: weight }],
   };
   state.customBarcodes[code] = food;
   saveCustomBarcodes();
@@ -2931,17 +3086,21 @@ actions.confirmLogRecipe = function() {
   const fu = foodUi();
   const recipe = fu.loggingRecipe;
   if (!recipe) return;
+  const w = parseFloat(fu.loggingWeight);
+  // Guard before the debounce lock is spent, and before logging a 0g/0-macro placeholder entry
+  // the user would then have to hunt down and delete (the Add button isn't disabled here).
+  if (!(w > 0)) return;
   const now = Date.now();
   if (fu._confirmLock && now - fu._confirmLock < 600) return;
   fu._confirmLock = now;
   const totals = sumRecipeIngredients(recipe.ingredients);
-  const w = parseFloat(fu.loggingWeight) || 0;
   const ratio = totals.weight > 0 ? w / totals.weight : 0;
   const m = { calories: Math.round(totals.calories * ratio), protein: round1(totals.protein * ratio), carbs: round1(totals.carbs * ratio), fat: round1(totals.fat * ratio), fiber: round1(totals.fiber * ratio) };
   addFoodToLog({
     id: "recipe_food_" + recipe.id, name: recipe.name, source: "Recipe",
     calories: m.calories, protein: m.protein, carbs: m.carbs, fat: m.fat, fiber: m.fiber,
-    state: "—", loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString(),
+    // The macros above are absolute for exactly w grams of the recipe, so w is the base.
+    state: "—", loggedWeight: w, baseGrams: w, loggedMacros: m, timestamp: new Date().toISOString(),
   });
   stepBackOneLevel();
 };
@@ -2960,7 +3119,7 @@ function renderLogRecipeScreen(fu) {
   inner += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:20px">Full recipe is ' + round1(totals.weight) + 'g</div>';
   inner += '<div style="text-align:center;margin-bottom:16px"><div style="font-size:32px;font-weight:800;color:' + C.calories + '">' + m.calories + ' <span style="font-size:16px;font-weight:400">kcal</span></div></div>';
   inner += '<div style="display:flex;justify-content:space-around;margin-bottom:20px">' + macroStat("Protein", m.protein, C.protein) + macroStat("Carbs", m.carbs, C.carbs) + macroStat("Fat", m.fat, C.fat) + '</div>';
-  inner += btn({ label: "Add to Log", action: "confirmLogRecipe", full: true });
+  inner += btn({ label: "Add to Log", action: "confirmLogRecipe", full: true, disabled: !(w > 0) });
   html += card(inner);
   return html;
 }
@@ -3102,7 +3261,13 @@ actions.confirmAddFood = function() {
   if (fu._confirmLock && now - fu._confirmLock < 600) return;
   fu._confirmLock = now;
   const m = calcMacrosForWeight(food, w);
-  addFoodToLog(Object.assign({}, food, { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString() }));
+  // anchorFoodBase BEFORE loggedWeight is overwritten: addFoodToLog writes this object straight
+  // into recentFoods (History), and for a food with no servingSizes -- every AI Estimate, every
+  // recipe log -- loggedWeight IS what foodBaseGrams falls back to. Re-logging at a new weight
+  // without freezing the base first re-anchored the food's unchanged absolute macros to the new
+  // portion, so each re-add silently rescaled the food (400g/500kcal re-added at 200g then back
+  // at 400g came out as 1000 kcal), compounding every time.
+  addFoodToLog(Object.assign({}, anchorFoodBase(food), { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString() }));
   fu.query = ""; fu.results = []; fu.historyResults = [];
   stepBackOneLevel();
 };
@@ -3175,8 +3340,7 @@ actions.addManualEntry = function() {
   const m = fu.manual;
   const cal = Math.max(0, parseFloat(m.calories) || 0), pro = Math.max(0, parseFloat(m.protein) || 0),
     carb = Math.max(0, parseFloat(m.carbs) || 0), ft = Math.max(0, parseFloat(m.fat) || 0), fib = Math.max(0, parseFloat(m.fiber) || 0);
-  const weightParsed = parseFloat(m.weight);
-  const weight = isNaN(weightParsed) ? 100 : Math.max(0, weightParsed);
+  const weight = positiveGramsOr(m.weight, 100);
   const food = {
     id: "manual_" + Date.now(), name: m.name || "Custom Food", source: "Manual Entry",
     calories: cal, protein: pro, carbs: carb, fat: ft, fiber: fib,
@@ -3185,6 +3349,7 @@ actions.addManualEntry = function() {
     loggedMacros: { calories: cal, protein: pro, carbs: carb, fat: ft, fiber: fib },
     // Anchors the absolute macros above to the portion they describe, so re-adding this from
     // History later doesn't rescale them against an assumed 100g base (see foodBaseGrams).
+    baseGrams: weight,
     timestamp: new Date().toISOString(), per100g: false,
     servingSizes: [{ label: round1(weight) + "g", grams: weight }],
   };
@@ -3384,6 +3549,13 @@ actions.runAIEstimate = async function() {
   rerender();
 };
 
+// AI results carry absolute macros for an estimated portion, so that portion has to be recorded
+// as the base (see foodBaseGrams) -- and the model does sometimes omit or zero quantity_grams,
+// which previously left the food with no usable anchor at all.
+function aiItemGrams(item) {
+  return positiveGramsOr(item && item.quantity_grams, 100);
+}
+
 actions.addAiResult = function(idxStr) {
   const fu = foodUi();
   const now = Date.now();
@@ -3391,10 +3563,11 @@ actions.addAiResult = function(idxStr) {
   fu._aiAddLock = now;
   const item = fu.aiResults[parseInt(idxStr, 10)];
   if (!item) return;
+  const grams = aiItemGrams(item);
   addFoodToLog({
     id: "ai_" + Date.now() + "_" + idxStr, name: item.name, source: "AI Estimate",
     calories: item.calories, protein: item.protein, carbs: item.carbs, fat: item.fat, fiber: item.fiber || 0,
-    state: "\u2014", loggedWeight: item.quantity_grams,
+    state: "\u2014", loggedWeight: grams, baseGrams: grams,
     loggedMacros: { calories: item.calories, protein: item.protein, carbs: item.carbs, fat: item.fat, fiber: item.fiber || 0 },
     timestamp: new Date().toISOString(), photo: fu.aiPhoto || null,
   });
@@ -3410,10 +3583,11 @@ actions.addAiResultsCombined = function() {
   if (items.length === 0) return;
   const totals = sumAiItems(items);
   const name = fu.aiDesc.trim() || items.map(function(i){ return i.name; }).join(", ");
+  const grams = positiveGramsOr(round1(totals.weight), 100);
   addFoodToLog({
     id: "ai_" + Date.now() + "_combined", name: name, source: "AI Estimate",
     calories: Math.round(totals.calories), protein: round1(totals.protein), carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber),
-    state: "\u2014", loggedWeight: round1(totals.weight),
+    state: "\u2014", loggedWeight: grams, baseGrams: grams,
     loggedMacros: { calories: Math.round(totals.calories), protein: round1(totals.protein), carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber) },
     timestamp: new Date().toISOString(), photo: fu.aiPhoto || null,
   });
@@ -3431,10 +3605,11 @@ actions.addAiCompareResult = function(idxStr) {
   fu._aiAddLock = now;
   const item = fu.aiCompareResults[parseInt(idxStr, 10)];
   if (!item) return;
+  const grams = aiItemGrams(item);
   addFoodToLog({
     id: "ai_" + Date.now() + "_cmp" + idxStr, name: item.name, source: "AI Estimate",
     calories: item.calories, protein: item.protein, carbs: item.carbs, fat: item.fat, fiber: item.fiber || 0,
-    state: "—", loggedWeight: item.quantity_grams,
+    state: "—", loggedWeight: grams, baseGrams: grams,
     loggedMacros: { calories: item.calories, protein: item.protein, carbs: item.carbs, fat: item.fat, fiber: item.fiber || 0 },
     timestamp: new Date().toISOString(), photo: fu.aiPhoto || null,
   });
@@ -3450,10 +3625,11 @@ actions.addAiCompareResultsCombined = function() {
   if (items.length === 0) return;
   const totals = sumAiItems(items);
   const name = fu.aiDesc.trim() || items.map(function(i){ return i.name; }).join(", ");
+  const grams = positiveGramsOr(round1(totals.weight), 100);
   addFoodToLog({
     id: "ai_" + Date.now() + "_cmpcombined", name: name, source: "AI Estimate",
     calories: Math.round(totals.calories), protein: round1(totals.protein), carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber),
-    state: "—", loggedWeight: round1(totals.weight),
+    state: "—", loggedWeight: grams, baseGrams: grams,
     loggedMacros: { calories: Math.round(totals.calories), protein: round1(totals.protein), carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber) },
     timestamp: new Date().toISOString(), photo: fu.aiPhoto || null,
   });
@@ -3675,14 +3851,16 @@ actions.wizardAiEstimate = async function() {
   const compareEst = (compareResult && !compareResult.error && compareResult.data && compareResult.data.length > 0) ? compareResult.data[0] : null;
 
   if (!compareEst) {
+    const estGrams = aiItemGrams(primaryEst);
     wiz.selectedFood = {
       id: "ai_" + Date.now(), name: primaryEst.name || fullDesc, source: "AI Estimate",
       calories: primaryEst.calories, protein: primaryEst.protein, carbs: primaryEst.carbs, fat: primaryEst.fat, fiber: primaryEst.fiber || 0,
       state: wiz.selections.prep || "\u2014",
-      servingSizes: [{ label: primaryEst.quantity_grams + "g", grams: primaryEst.quantity_grams }],
+      baseGrams: estGrams,
+      servingSizes: [{ label: round1(estGrams) + "g", grams: estGrams }],
       per100g: false, reason: primaryEst.reason || "",
     };
-    wiz.weight = String(primaryEst.quantity_grams || 100);
+    wiz.weight = String(estGrams);
     wiz.servingBasis = null; wiz.qty = "1";
     wiz.searchResults = [];
   } else {
@@ -3691,7 +3869,7 @@ actions.wizardAiEstimate = async function() {
     // new UI. That list renders each candidate's calories as a per-100g rate, so convert each
     // estimate to one instead of leaving it as an absolute value for the estimated portion.
     const toPer100gFood = function(est, providerLabel) {
-      const grams = est.quantity_grams || 100;
+      const grams = aiItemGrams(est);
       const scale = 100 / grams;
       return {
         id: "ai_" + Date.now() + "_" + providerLabel,
@@ -3723,7 +3901,8 @@ actions.wizardConfirmAdd = function() {
   if (fu._confirmLock && now - fu._confirmLock < 600) return;
   fu._confirmLock = now;
   const m = calcMacrosForWeight(wiz.selectedFood, w);
-  addFoodToLog(Object.assign({}, wiz.selectedFood, { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString(), wizardUsed: true }));
+  // Same base-anchor rule as confirmAddFood -- freeze before loggedWeight is overwritten.
+  addFoodToLog(Object.assign({}, anchorFoodBase(wiz.selectedFood), { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString(), wizardUsed: true }));
   fu.query = ""; fu.results = []; fu.historyResults = [];
   stepBackOneLevel();
 };
@@ -4645,17 +4824,30 @@ actions.saveEditBarcode = function() {
   const code = su.editingBarcodeCode;
   const m = su.editBarcodeManual;
   if (!code || !m || !m.name.trim()) return;
-  const weightParsed = parseFloat(m.weight);
-  const weight = isNaN(weightParsed) ? 100 : Math.max(0, weightParsed);
+  const weight = positiveGramsOr(m.weight, 100);
   const food = {
     id: "barcode_" + code, name: m.name.trim(), brand: "", source: "Custom Barcode Entry",
     per100g: false, calories: Math.max(0, parseFloat(m.calories) || 0), protein: Math.max(0, parseFloat(m.protein) || 0),
     carbs: Math.max(0, parseFloat(m.carbs) || 0), fat: Math.max(0, parseFloat(m.fat) || 0), fiber: Math.max(0, parseFloat(m.fiber) || 0),
-    state: "—", servingSizes: [{ label: weight + "g", grams: weight }],
+    state: "—", baseGrams: weight, servingSizes: [{ label: round1(weight) + "g", grams: weight }],
   };
   state.customBarcodes[code] = food;
   saveCustomBarcodes();
-  if (state.foodCache["barcode_" + code]) { state.foodCache["barcode_" + code] = food; saveFoodCache(); }
+  // History and Favorites hold their own copies of this same food id and were keeping the
+  // pre-edit numbers, so re-adding it from either list handed back exactly the values just
+  // corrected here. Field-wise (not a wholesale replace) so per-list fields -- lastUsed,
+  // addedAt -- survive; loggedMacros is restated because addFoodToLog prefers it over the base
+  // fields, and a stale one would win over everything above.
+  updateFoodRecordEverywhere(food.id, {
+    name: food.name, calories: food.calories, protein: food.protein, carbs: food.carbs,
+    fat: food.fat, fiber: food.fiber, per100g: false,
+    // Fresh array, not food.servingSizes: that same reference is already stored in
+    // state.customBarcodes, and handing it to three more stores would alias one mutable array
+    // across four of them.
+    baseGrams: weight, servingSizes: [{ label: round1(weight) + "g", grams: weight }],
+    loggedWeight: weight,
+    loggedMacros: { calories: food.calories, protein: food.protein, carbs: food.carbs, fat: food.fat, fiber: food.fiber },
+  });
   su.editingBarcodeCode = null;
   su.editBarcodeManual = null;
   rerender();
