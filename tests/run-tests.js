@@ -111,7 +111,7 @@ const exportLine =
   "anchorFoodBase: anchorFoodBase, positiveGramsOr: positiveGramsOr, aiItemGrams: aiItemGrams, " +
   "entryMatchesFood: entryMatchesFood, rescaleEntryMacros: rescaleEntryMacros, " +
   "groupEntriesByHourNewestFirst: groupEntriesByHourNewestFirst, foodMatchesQuery: foodMatchesQuery, " +
-  "propagateCustomFoodEdit: propagateCustomFoodEdit, " +
+  "propagateCustomFoodEdit: propagateCustomFoodEdit, foodUi: foodUi, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -1442,6 +1442,269 @@ test("localFoodMatches: the search screen's 'Eaten before' group also matches on
   M.state.favorites = []; M.state.foodCache = {};
   assertEqual(M.localFoodMatches("schneiders").length, 1, "found by brand with no network round trip");
   assertEqual(M.localFoodMatches("loonie").length, 1, "still found by name");
+});
+
+// ============================================================
+// PROPERTY: every food-creation path anchors its macros to a real portion
+// ============================================================
+// This is the test that would have caught BOTH base-grams bugs before they shipped, and
+// it's what keeps catching them as new logging paths get added. It deliberately asserts
+// nothing about any individual path's arithmetic -- only the one invariant all of them
+// must satisfy:
+//
+//   The food record left behind in History, asked for its macros at the weight that was
+//   just logged, returns exactly the macros that were just logged -- and keeps doing so
+//   after the food is re-logged at some other weight.
+//
+// Both shipped bugs were violations of that, in different paths: a macro correction that
+// moved the numbers without moving the base, and a re-log that moved the base without
+// moving the numbers. Per-path tests missed them because each path looked right in
+// isolation; the invariant is what ties them together.
+//
+// Adding a food-creation action without setting baseGrams fails this by name, so nobody
+// has to re-derive why the anchor matters. Register new paths in FOOD_CREATION_PATHS.
+
+function assertMacrosClose(actual, expected, msg) {
+  const keys = ["calories", "protein", "carbs", "fat", "fiber"];
+  // Tolerances match calcMacrosForWeight's own rounding: whole-number calories (max 0.5
+  // divergence), 1dp macros (max 0.05). Anything larger is a real anchor mismatch.
+  const bad = keys.filter(function (k) {
+    const tol = k === "calories" ? 1 : 0.15;
+    return Math.abs((actual[k] || 0) - (expected[k] || 0)) > tol;
+  });
+  if (bad.length === 0) { pass++; }
+  else {
+    fail++;
+    console.error("FAIL: " + msg + "\n  diverged on: " + bad.join(", ") +
+      "\n  expected: " + JSON.stringify(expected) + "\n  actual:   " + JSON.stringify(actual));
+  }
+}
+
+function resetForPathTest() {
+  M.state.date = "2026-07-22";
+  M.state.foodLogs = {};
+  M.state.recentFoods = [];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+  M.state.customBarcodes = {};
+  M.state.recipes = [];
+  M.state.ui = {}; // let foodUi() rebuild its real defaults, as on a fresh boot
+  return M.foodUi();
+}
+
+// Each path: set up exactly the UI state its action reads, then invoke it. Anything that
+// lands one entry in the log via addFoodToLog belongs here.
+const FOOD_CREATION_PATHS = [
+  {
+    name: "Manual Entry (addManualEntry)",
+    covers: ["addManualEntry"],
+    run: function (fu) {
+      fu.manual = { name: "Loonie Dog", calories: "235", protein: "10", carbs: "20", fat: "13", fiber: "1", weight: "83" };
+      M.actions.addManualEntry();
+    },
+  },
+  {
+    name: "AI Estimate, single result (addAiResult)",
+    covers: ["addAiResult"],
+    run: function (fu) {
+      fu.aiResults = [{ name: "Chili", calories: 500, protein: 30, carbs: 40, fat: 22, fiber: 5, quantity_grams: 400 }];
+      M.actions.addAiResult("0");
+    },
+  },
+  {
+    name: "AI Estimate, combined (addAiResultsCombined)",
+    covers: ["addAiResultsCombined"],
+    run: function (fu) {
+      fu.aiDesc = "steak and potatoes";
+      fu.aiResults = [
+        { name: "Steak", calories: 400, protein: 40, carbs: 0, fat: 26, fiber: 0, quantity_grams: 200 },
+        { name: "Potatoes", calories: 180, protein: 4, carbs: 38, fat: 1, fiber: 4, quantity_grams: 150 },
+      ];
+      M.actions.addAiResultsCombined();
+    },
+  },
+  {
+    name: "AI compare result, single (addAiCompareResult)",
+    covers: ["addAiCompareResult"],
+    run: function (fu) {
+      fu.aiCompareResults = [{ name: "Curry", calories: 620, protein: 25, carbs: 60, fat: 30, fiber: 6, quantity_grams: 350 }];
+      M.actions.addAiCompareResult("0");
+    },
+  },
+  {
+    name: "AI compare result, combined (addAiCompareResultsCombined)",
+    covers: ["addAiCompareResultsCombined"],
+    run: function (fu) {
+      fu.aiDesc = "curry and rice";
+      fu.aiCompareResults = [
+        { name: "Curry", calories: 620, protein: 25, carbs: 60, fat: 30, fiber: 6, quantity_grams: 350 },
+        { name: "Rice", calories: 200, protein: 4, carbs: 44, fat: 0.5, fiber: 1, quantity_grams: 150 },
+      ];
+      M.actions.addAiCompareResultsCombined();
+    },
+  },
+  {
+    name: "Recipe (confirmLogRecipe)",
+    covers: ["confirmLogRecipe"],
+    run: function (fu) {
+      fu.loggingRecipe = {
+        id: "r1", name: "Chili Batch",
+        ingredients: [
+          { id: "i1", name: "Beef", weight: 500, calories: 1250, protein: 100, carbs: 0, fat: 90, fiber: 0 },
+          { id: "i2", name: "Beans", weight: 400, calories: 440, protein: 28, carbs: 76, fat: 2, fiber: 20 },
+        ],
+      };
+      fu.loggingWeight = "300"; // a third of the batch
+      M.actions.confirmLogRecipe();
+    },
+  },
+  {
+    name: "Database food re-added from search (confirmAddFood, per100g)",
+    covers: ["confirmAddFood"],
+    run: function (fu) {
+      fu.addingFood = {
+        id: "usda_1", name: "Chicken Breast", source: "USDA", per100g: true,
+        calories: 165, protein: 31, carbs: 0, fat: 3.6, fiber: 0, servingSizes: [],
+      };
+      fu.addWeight = "175";
+      M.actions.confirmAddFood();
+    },
+  },
+  {
+    name: "Absolute-macro food re-added from History (confirmAddFood, no servingSizes)",
+    covers: [],
+    run: function (fu) {
+      // The exact shape bug 2 lived in, and deliberately a LEGACY record: no servingSizes and
+      // no baseGrams, so loggedWeight is the only thing the base can be inferred from -- which
+      // is the field confirmAddFood is about to overwrite. Seeding baseGrams here (as an
+      // earlier version of this fixture did) pre-applies the fix and lets the path pass even
+      // with anchorFoodBase removed, which mutation testing caught. Leave it off: this is the
+      // record shape already sitting in the live cloud data from before the fix.
+      fu.addingFood = {
+        id: "ai_hist", name: "Leftover Chili", source: "AI Estimate", per100g: false,
+        calories: 500, protein: 30, carbs: 40, fat: 22, fiber: 5,
+        loggedWeight: 400,
+      };
+      fu.addWeight = "250";
+      M.actions.confirmAddFood();
+    },
+  },
+  {
+    name: "Wizard (wizardConfirmAdd)",
+    covers: ["wizardConfirmAdd"],
+    run: function (fu) {
+      fu.wizardType = "steak";
+      fu.wizard = {
+        step: 2, selections: { prep: "Cooked" }, weight: "220", servingBasis: null, qty: "1",
+        showAI: false, aiDesc: "", aiLoading: false, aiError: null, searchResults: [], searching: false,
+        selectedFood: {
+          id: "ai_wiz", name: "Ribeye", source: "AI Estimate", state: "Cooked", per100g: false,
+          calories: 600, protein: 48, carbs: 0, fat: 45, fiber: 0,
+          baseGrams: 250, servingSizes: [{ label: "250g", grams: 250 }],
+        },
+      };
+      M.actions.wizardConfirmAdd();
+    },
+  },
+  {
+    name: "Custom barcode entry (saveCustomBarcode then confirmAddFood)",
+    covers: [],
+    run: function (fu) {
+      fu.scanNotFoundCode = "0123456789012";
+      fu.customBarcodeManual = { name: "Protein Bar", weight: "60", calories: "220", protein: "20", carbs: "22", fat: "7", fiber: "3" };
+      M.actions.saveCustomBarcode(); // sets fu.addingFood + fu.addWeight for the next screen
+      M.actions.confirmAddFood();
+    },
+  },
+];
+
+FOOD_CREATION_PATHS.forEach(function (path) {
+  test("food-creation invariant: " + path.name, function () {
+    const fu = resetForPathTest();
+    path.run(fu);
+
+    const entries = M.state.foodLogs[M.state.date] || [];
+    assertEqual(entries.length, 1, path.name + " logged exactly one entry");
+    if (entries.length !== 1) return;
+    const entry = entries[0];
+    const record = M.state.recentFoods.find(function (f) { return f.id === entry.foodId; });
+    assertEqual(!!record, true, path.name + " left a History record behind");
+    if (!record) return;
+
+    // (1) The anchor exists and is the one actually in force.
+    const base = M.foodBaseGrams(record);
+    assertEqual(typeof record.baseGrams === "number" && record.baseGrams > 0 && isFinite(record.baseGrams), true,
+      path.name + ": record carries an explicit positive baseGrams (got " + JSON.stringify(record.baseGrams) + ")");
+    assertEqual(base, record.baseGrams, path.name + ": foodBaseGrams returns the explicit anchor, not an inference");
+
+    // (2) Round-trip: asking the record for the weight just logged returns what was logged.
+    // This is the property both bugs broke.
+    assertMacrosClose(M.calcMacrosForWeight(record, entry.weight), entry.macros,
+      path.name + ": record re-derives the logged macros at the logged weight");
+
+    // (3) Re-logging at another weight must not move the anchor. Bug 2 compounded here --
+    // every round trip through the adding-food screen doubled the food.
+    const originalWeight = entry.weight;
+    const originalMacros = entry.macros;
+    M.actions.selectFoodForAdd(record.id, "history");
+    M.state.ui.food.addWeight = String(originalWeight * 2);
+    M.state.ui.food._confirmLock = 0;
+    M.actions.confirmAddFood();
+
+    M.actions.selectFoodForAdd(record.id, "history");
+    M.state.ui.food.addWeight = String(originalWeight);
+    M.state.ui.food._confirmLock = 0;
+    M.actions.confirmAddFood();
+
+    const roundTripped = (M.state.foodLogs[M.state.date] || []).slice(-1)[0];
+    assertEqual(roundTripped.weight, originalWeight, path.name + ": round-tripped entry is back at the original weight");
+    assertMacrosClose(roundTripped.macros, originalMacros,
+      path.name + ": re-logging at 2x then back at 1x returns the original macros (no drift)");
+    assertEqual(M.foodBaseGrams(M.state.recentFoods.find(function (f) { return f.id === entry.foodId; })), base,
+      path.name + ": the base survived two re-logs unchanged");
+  });
+});
+
+test("food-creation invariant: the suite actually covers every addFoodToLog caller", function () {
+  // Guards the guard. If someone adds a logging path and doesn't register it in
+  // FOOD_CREATION_PATHS, the property test above silently stops being exhaustive -- it would
+  // still pass, while covering less. So derive the real list of logging actions from the
+  // source and compare it to what the suite exercises. Named rather than counted: a count
+  // nets to zero when one path is removed and another added on the same commit.
+  // Rename the declaration so it doesn't read as a call site of itself.
+  const src = require("fs").readFileSync(indexPath, "utf8").replace(/function addFoodToLog\(/g, "function __addFoodToLogDecl(");
+  const blocks = [...src.matchAll(/\nactions\.([A-Za-z0-9_]+)\s*=/g)];
+  // An action's body ends at the next actions.X OR the next top-level function, whichever
+  // comes first -- without the second bound the slice runs past the action into unrelated
+  // top-level code and misattributes its calls to whichever action happened to precede it.
+  const nextTopLevelFn = function (from) {
+    const i = src.indexOf("\nfunction ", from);
+    return i < 0 ? src.length : i;
+  };
+  const loggingActions = blocks
+    .filter(function (m, i) {
+      const nextAction = i + 1 < blocks.length ? blocks[i + 1].index : src.length;
+      const end = Math.min(nextAction, nextTopLevelFn(m.index + 1));
+      return src.slice(m.index, end).indexOf("addFoodToLog(") >= 0;
+    })
+    .map(function (m) { return m[1]; })
+    .sort();
+
+  const covered = [];
+  FOOD_CREATION_PATHS.forEach(function (p) { p.covers.forEach(function (a) { if (covered.indexOf(a) < 0) covered.push(a); }); });
+  covered.sort();
+
+  assertEqual(loggingActions, covered,
+    "every action that calls addFoodToLog must be registered in FOOD_CREATION_PATHS -- " +
+    "uncovered: [" + loggingActions.filter(function (a) { return covered.indexOf(a) < 0; }) + "], " +
+    "stale entries: [" + covered.filter(function (a) { return loggingActions.indexOf(a) < 0; }) + "]");
+
+  // Second, weaker net: catches a logging path added as a bare function rather than an
+  // actions.X entry, which the block scan above would not see at all.
+  const callSites = (src.match(/addFoodToLog\(/g) || []).length; // declaration already renamed out
+  assertEqual(callSites, loggingActions.length,
+    "all " + callSites + " addFoodToLog call sites live inside an actions.X handler; " +
+    "if this diverges, a logging path was added somewhere the coverage scan can't see it");
 });
 
 console.log("\n" + pass + " passed, " + fail + " failed");
