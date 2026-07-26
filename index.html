@@ -187,7 +187,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.09";
+const APP_VERSION = "1.10";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -227,14 +227,32 @@ const positiveGramsOr = (v, fallback) => { const n = parseFloat(v); return n > 0
 // ============================================================
 // STORAGE (localStorage)
 // ============================================================
+// Last localStorage write failure, or null. Module-level rather than on `state` because db is
+// defined before state and is used while state is being built.
+//
+// This exists because a failed write was previously a console.error and a `false` nobody read.
+// localStorage is the app's source of truth -- if a write fails (quota exhausted is the real
+// case, and the most likely one given the food cache grows), the food just logged is gone on
+// reload and nothing anywhere says so. On a phone there is no console to find that in. The
+// banner this drives is deliberately loud and non-dismissable: silent data loss is the single
+// worst failure this app has.
+let storageWriteError = null;
 const db = {
   get: function(key, fallback) {
     try { const v = localStorage.getItem("ml_" + key); return v ? JSON.parse(v) : fallback; }
     catch (e) { return fallback; }
   },
   set: function(key, val) {
-    try { localStorage.setItem("ml_" + key, JSON.stringify(val)); return true; }
-    catch (e) { console.error("Storage write failed:", e); return false; }
+    try {
+      localStorage.setItem("ml_" + key, JSON.stringify(val));
+      if (storageWriteError && storageWriteError.key === key) storageWriteError = null; // recovered
+      return true;
+    }
+    catch (e) {
+      console.error("Storage write failed:", e);
+      storageWriteError = { key: key, message: e && e.message ? e.message : String(e), at: Date.now() };
+      return false;
+    }
   },
 };
 
@@ -256,6 +274,7 @@ const state = {
   authError: null,
   authLoading: false,
   lastSyncedAt: null,
+  lastSyncError: null, // {kind, message, at} of the most recent failed push; cleared on success
   ui: {}
 };
 
@@ -480,6 +499,16 @@ async function pullWeightsFromCloud() {
 // pagehide below) can fire it immediately instead of waiting out the debounce.
 const syncDebounceTimers = {};
 const pendingSyncPushFns = {};
+// A failed push used to be discarded entirely: lastSyncedAt simply wasn't advanced, which looks
+// identical to "nothing has changed since then". So a device that had silently stopped syncing
+// -- expired token, offline, RLS rejection -- reported the same thing as a device with nothing
+// to do, and the only symptom was data quietly not reaching the other device. Recorded here and
+// shown in Strategy > Data. Deliberately does NOT rerender: this fires on a debounce timer that
+// can land mid-keystroke, and a surprise rerender would steal focus (same reasoning as the
+// success path right below).
+function recordSyncFailure(kind, message) {
+  state.lastSyncError = { kind: kind, message: message, at: Date.now() };
+}
 function scheduleCloudSync(kind, pushFn) {
   if (!state.session) return;
   if (syncDebounceTimers[kind]) clearTimeout(syncDebounceTimers[kind]);
@@ -491,8 +520,9 @@ function scheduleCloudSync(kind, pushFn) {
     // keystroke elsewhere in the app, and a surprise rerender would steal focus. The "last
     // synced" status just picks up the new value next time that screen is naturally rendered.
     pushFn().then(function(result) {
-      if (!result.error) state.lastSyncedAt = Date.now();
-    });
+      if (result.error) recordSyncFailure(kind, result.error);
+      else { state.lastSyncedAt = Date.now(); state.lastSyncError = null; }
+    }).catch(function(e) { recordSyncFailure(kind, e && e.message ? e.message : String(e)); });
   }, 2500);
 }
 function flushPendingCloudSyncs() {
@@ -502,8 +532,9 @@ function flushPendingCloudSyncs() {
     const pushFn = pendingSyncPushFns[kind];
     delete pendingSyncPushFns[kind];
     pushFn().then(function(result) {
-      if (!result.error) state.lastSyncedAt = Date.now();
-    });
+      if (result.error) recordSyncFailure(kind, result.error);
+      else { state.lastSyncedAt = Date.now(); state.lastSyncError = null; }
+    }).catch(function(e) { recordSyncFailure(kind, e && e.message ? e.message : String(e)); });
   });
 }
 
@@ -615,36 +646,88 @@ async function pullAppDataFromCloud(key) {
   return supabaseTable("user_app_data?user_id=eq." + state.session.userId + "&key=eq." + key + "&select=data");
 }
 
+// The whole-blob food collections were additive-only by id: a food already present locally
+// kept the local copy no matter what, so a correction made on one device could never reach a
+// second device that already had that food -- they just stayed permanently disagreed. (Real
+// consequence: the baseGrams fix repaired a drifted record per-device only.) Newer-wins by
+// `updatedAt` fixes that, reusing the resolution rule food_log_entries already uses.
+//
+// Backward-compatible by construction: records written before `updatedAt` existed don't carry
+// one, and this only prefers the cloud copy when the cloud actually claims a NEWER stamp.
+// Neither side stamped -> local wins, exactly as before. Existing data therefore behaves
+// identically until something touches it, and convergence phases in from there instead of
+// reshuffling every record on the first pull after deploy.
+function foodRecordIsNewer(cloudRecord, localRecord) {
+  const c = Date.parse((cloudRecord && cloudRecord.updatedAt) || "");
+  if (isNaN(c)) return false; // cloud makes no claim to being newer
+  const l = Date.parse((localRecord && localRecord.updatedAt) || "");
+  return isNaN(l) ? true : c > l;
+}
+
+// Shared by favorites and recentFoods. Mutates the local array IN PLACE (never reassigns it)
+// for the same reason the food-log merge does -- a concurrent local mutation elsewhere must
+// not be dropped by swapping the array out from under it.
+function mergeFoodListFromCloud(localList, cloudArr) {
+  const indexById = new Map();
+  localList.forEach(function(f, i) { if (f && f.id) indexById.set(f.id, i); });
+  let changed = 0;
+  (cloudArr || []).forEach(function(f) {
+    if (!f || !f.id) return;
+    if (!indexById.has(f.id)) { indexById.set(f.id, localList.length); localList.push(f); changed++; return; }
+    const i = indexById.get(f.id);
+    if (foodRecordIsNewer(f, localList[i])) { localList[i] = f; changed++; }
+  });
+  return changed;
+}
+
 async function pushFavoritesToCloud() { return pushAppDataToCloud("favorites", state.favorites); }
 async function pullFavoritesFromCloud() { return pullAppDataFromCloud("favorites"); }
+// addFoodToLog caps these lists (500 / 100) but the merge appended without re-applying the cap,
+// so a pull could push either past its limit and leave it there until the next log -- on a blob
+// that is re-uploaded whole on every sync. Re-sorting by recency first also fixes an ordering
+// wart: History is meant to be recency-ordered, but merged-in foods landed at the bottom in
+// arrival order regardless of when they were actually last eaten on the other device.
+// Sorted and truncated IN PLACE -- these arrays must never be reassigned (see mergeFoodListFromCloud).
+function capFoodListInPlace(list, cap, recencyKey) {
+  list.sort(function(a, b) {
+    const at = Date.parse((a && a[recencyKey]) || (a && a.updatedAt) || "") || 0;
+    const bt = Date.parse((b && b[recencyKey]) || (b && b.updatedAt) || "") || 0;
+    return bt - at; // most recent first
+  });
+  if (list.length > cap) list.length = cap;
+}
+
 function mergeFavoritesFromCloud(cloudArr) {
   if (!cloudArr) return 0;
-  const localIds = new Set(state.favorites.map(function(f){ return f.id; }));
-  let added = 0;
-  cloudArr.forEach(function(f) { if (!localIds.has(f.id)) { state.favorites.push(f); added++; } });
+  const changed = mergeFoodListFromCloud(state.favorites, cloudArr);
+  capFoodListInPlace(state.favorites, 100, "addedAt");
   db.set("favorites", state.favorites);
-  return added;
+  return changed;
 }
 
 async function pushRecentFoodsToCloud() { return pushAppDataToCloud("recentFoods", state.recentFoods); }
 async function pullRecentFoodsFromCloud() { return pullAppDataFromCloud("recentFoods"); }
 function mergeRecentFoodsFromCloud(cloudArr) {
   if (!cloudArr) return 0;
-  const localIds = new Set(state.recentFoods.map(function(f){ return f.id; }));
-  let added = 0;
-  cloudArr.forEach(function(f) { if (!localIds.has(f.id)) { state.recentFoods.push(f); added++; } });
+  const changed = mergeFoodListFromCloud(state.recentFoods, cloudArr);
+  capFoodListInPlace(state.recentFoods, 500, "lastUsed");
   db.set("recentFoods", state.recentFoods);
-  return added;
+  return changed;
 }
 
 async function pushFoodCacheToCloud() { return pushAppDataToCloud("foodCache", state.foodCache); }
 async function pullFoodCacheFromCloud() { return pullAppDataFromCloud("foodCache"); }
 function mergeFoodCacheFromCloud(cloudDict) {
   if (!cloudDict) return 0;
-  let added = 0;
-  Object.keys(cloudDict).forEach(function(id) { if (!state.foodCache[id]) { state.foodCache[id] = cloudDict[id]; added++; } });
+  let changed = 0;
+  Object.keys(cloudDict).forEach(function(id) {
+    if (!state.foodCache[id] || foodRecordIsNewer(cloudDict[id], state.foodCache[id])) {
+      state.foodCache[id] = cloudDict[id];
+      changed++;
+    }
+  });
   db.set("foodCache", state.foodCache);
-  return added;
+  return changed;
 }
 
 // ---- Recipes: one row per recipe, upsert on push, explicit delete on removal ----
@@ -1271,6 +1354,19 @@ function card(innerHtml, extraStyle) {
 // ============================================================
 // APP SHELL
 // ============================================================
+// localStorage is the source of truth -- if a write fails, whatever was just logged is gone on
+// reload. That has to be visible immediately and everywhere, not left as a console.error on a
+// device with no console, and not tucked inside a settings tab the user has no reason to open.
+// Quota exhaustion is the realistic cause, so the copy names the concrete fix.
+function renderStorageErrorBanner() {
+  if (!storageWriteError) return '';
+  return '<div style="margin:0 16px 12px;padding:10px 12px;background:' + C.danger + '22;border:1px solid ' + C.danger + ';border-radius:10px;color:' + C.danger + ';font-size:12px;line-height:1.4">' +
+    '<strong>⚠ Couldn\'t save to this device</strong><br>' +
+    'The last change to <strong>' + esc(storageWriteError.key) + '</strong> was not written to storage, so it will be lost if you reload. ' +
+    'This is usually a full storage quota — try Strategy &gt; Data &gt; Export to back up, then clear some space.' +
+    '</div>';
+}
+
 function renderApp() {
   const s = state;
   if (!s.session) return renderLoginScreen();
@@ -1284,6 +1380,7 @@ function renderApp() {
       '</div>' +
       '<button class="settingsBtn" data-action="setTab" data-arg="strategy">\u2699</button>' +
     '</div>' +
+    renderStorageErrorBanner() +
     '<div class="content">' + renderTabContent() + '</div>' +
     '<div class="bottomBar">' +
       '<div class="quickActions">' +
@@ -1404,8 +1501,13 @@ function addFoodToLog(food) {
   state.foodLogs[state.date].push(entry);
   saveFoodLogs();
 
+  // stampedAt is written onto every copy of the food record below. It's what the whole-blob
+  // merges resolve conflicts on (see foodRecordIsNewer) -- without it a record already present
+  // on another device can never be updated by this one, only added.
+  const stampedAt = new Date().toISOString();
+
   if (food.wizardUsed && !state.favorites.find(function(f){ return f.id === food.id; })) {
-    state.favorites.unshift(Object.assign({}, food, { addedAt: new Date().toISOString() }));
+    state.favorites.unshift(Object.assign({}, food, { addedAt: stampedAt, updatedAt: stampedAt }));
     state.favorites = state.favorites.slice(0, 100);
     saveFavorites();
   }
@@ -1414,16 +1516,50 @@ function addFoodToLog(food) {
   // deliberately high (was 50, which quietly dropped anything older). 500 distinct foods is
   // effectively "everything" for one person over years while keeping the synced JSON blob a
   // sane size; only the very oldest, least-recently-used items fall off past that.
-  state.recentFoods = [Object.assign({}, food, { lastUsed: new Date().toISOString() })]
+  state.recentFoods = [Object.assign({}, food, { lastUsed: stampedAt, updatedAt: stampedAt })]
     .concat(state.recentFoods.filter(function(r){ return r.id !== food.id; }))
     .slice(0, 500);
   saveRecentFoods();
 
   if (!state.foodCache[food.id]) {
-    state.foodCache[food.id] = food;
+    state.foodCache[food.id] = Object.assign({}, food, { updatedAt: stampedAt });
+    pruneFoodCache();
     saveFoodCache();
   }
   showToast("Food Added");
+}
+
+// state.foodCache is the only food collection with no cap -- recentFoods stops at 500 and
+// favorites at 100, but every food ever searched-then-logged used to stay here forever, and
+// the whole dictionary is re-uploaded as one JSON blob on every debounced sync. Left alone
+// that becomes a steadily growing upload on every save and real pressure on the ~5MB
+// localStorage budget, on the platform whose eviction behaviour already caused a data-loss bug.
+//
+// Deliberately a reachability sweep rather than an LRU: cache records carry no access time, so
+// "least recently used" isn't knowable, but "referenced by something the user can still see"
+// is exactly knowable. Anything a logged entry, History, Favorites or a custom barcode can
+// still reach is kept regardless of the cap -- dropping one of those would break the portion
+// re-derivation in rescaleEntryMacros. Only genuinely unreachable records are discarded, and
+// only once the cache is over budget.
+const FOOD_CACHE_CAP = 1500;
+function pruneFoodCache() {
+  const ids = Object.keys(state.foodCache);
+  if (ids.length <= FOOD_CACHE_CAP) return 0;
+  const referenced = new Set();
+  state.recentFoods.forEach(function(f){ if (f && f.id) referenced.add(f.id); });
+  state.favorites.forEach(function(f){ if (f && f.id) referenced.add(f.id); });
+  Object.keys(state.customBarcodes).forEach(function(code) {
+    const f = state.customBarcodes[code];
+    if (f && f.id) referenced.add(f.id);
+  });
+  Object.keys(state.foodLogs).forEach(function(date) {
+    (state.foodLogs[date] || []).forEach(function(e){ if (e && e.foodId) referenced.add(e.foodId); });
+  });
+  let dropped = 0;
+  ids.forEach(function(id) {
+    if (!referenced.has(id)) { delete state.foodCache[id]; dropped++; }
+  });
+  return dropped;
 }
 
 function removeFoodFromLog(entryId) {
@@ -1761,6 +1897,16 @@ actions.saveEntryPortion = function() {
   rerender();
 };
 
+// Tolerances for entryMatchesFood, sized to calcMacrosForWeight's own rounding rather than
+// picked by feel: calories go through Math.round (max 0.5 divergence between two roundings of
+// the same value) and macros through round1 (max 0.05). Anything outside these is a real
+// difference, not a rounding artefact -- so they're tight enough that a genuine hand
+// correction is never mistaken for noise, and loose enough that an untouched entry never
+// reads as edited.
+const MATCH_TOLERANCE_KCAL = 1;
+const MATCH_TOLERANCE_GRAMS = 0.15;
+const MACRO_KEYS_FOR_MATCH = ["calories", "protein", "carbs", "fat", "fiber"];
+
 // True when `entry`'s macros are still exactly what `food` predicts at the entry's own weight,
 // i.e. nobody has hand-corrected this entry away from its source food. Compared against a
 // re-derivation rather than a stored flag so it also holds for entries logged before any of
@@ -1774,13 +1920,10 @@ function entryMatchesFood(entry, food) {
   // Fiber is checked too, not just P/C/F: it's one of the four editable fields on the Macros
   // tab, and leaving it out would classify a fiber-only correction as "unmodified" and then
   // discard it on the next portion change -- the exact failure this function exists to prevent.
-  // Tolerances are sized to the rounding: calories are whole numbers (max 0.5 divergence),
-  // macros are 1dp (max 0.05), so nothing legitimate lands outside them.
-  return Math.abs((m.calories || 0) - (entry.macros.calories || 0)) <= 1 &&
-    Math.abs((m.protein || 0) - (entry.macros.protein || 0)) <= 0.15 &&
-    Math.abs((m.carbs || 0) - (entry.macros.carbs || 0)) <= 0.15 &&
-    Math.abs((m.fat || 0) - (entry.macros.fat || 0)) <= 0.15 &&
-    Math.abs((m.fiber || 0) - (entry.macros.fiber || 0)) <= 0.15;
+  return MACRO_KEYS_FOR_MATCH.every(function(k) {
+    const tol = k === "calories" ? MATCH_TOLERANCE_KCAL : MATCH_TOLERANCE_GRAMS;
+    return Math.abs((m[k] || 0) - (entry.macros[k] || 0)) <= tol;
+  });
 }
 
 // Macros for `entry` at a new weight. Re-deriving from the source food is preferred (it scales
@@ -2047,7 +2190,7 @@ actions.copyEntryCustomDate = function() {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null, editingFoodId: null, foodEditSection: "macros", foodEditNameInput: null, foodEditBrandInput: null, foodEditAnimalOverrideInput: undefined };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null, editingFoodId: null, foodEditSection: "macros", foodEditBaseInput: null, foodEditNameInput: null, foodEditBrandInput: null, foodEditAnimalOverrideInput: undefined };
   return state.ui.food;
 }
 
@@ -2327,8 +2470,24 @@ function renderFoodRecordEditor(food) {
       '<button class="sectionBtn' + (section === "details" ? " active" : "") + '" data-action="setFoodEditSection" data-arg="details">Details</button>' +
     '</div>';
   if (section === "macros") {
-    const basisLabel = food.per100g ? "per 100g" : ("for " + round1(foodBaseGrams(food)) + "g");
-    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Values are ' + basisLabel + ' — matches how this food is stored.</div>';
+    // The portion these macros describe is EDITABLE here, not just displayed. It used to be a
+    // read-only label, which left no way at all to repair a food whose base had drifted -- the
+    // recommended fix ("edit it from History") couldn't actually be carried out. A per-100g
+    // database food has a fixed 100g basis by definition, so the field is only offered for
+    // absolute-portion foods, which are the ones that can drift.
+    if (food.per100g) {
+      html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Values are per 100g — matches how this food is stored.</div>';
+    } else {
+      const basisVal = fu.foodEditBaseInput != null ? fu.foodEditBaseInput : String(round1(foodBaseGrams(food)));
+      html += '<div style="margin-bottom:8px">' +
+        '<label class="label">These values are for (g)</label>' +
+        '<div class="row" style="align-items:center">' +
+          textInput({ id: "foodEditBaseInput", value: basisVal, type: "number", bind: "foodEditBaseInput", enter: "saveFoodRecordMacros", style: "flex:1" }) +
+          '<span style="color:' + C.textMut + ';font-size:12px">grams</span>' +
+        '</div>' +
+        '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">The portion the numbers below describe. Change it if this food scales wrongly when you adjust the weight.</div>' +
+      '</div>';
+    }
     html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">' +
       '<div><label class="label" style="color:' + C.calories + '">Calories (kcal)</label>' +
         '<input class="input" type="number" id="editMacroCaloriesInput" value="' + food.calories + '" data-enter="saveFoodRecordMacros" style="padding:6px;font-size:13px"></div>' +
@@ -2370,12 +2529,16 @@ function renderFoodRecordEditor(food) {
 // miss used to mean a correction reached none of the others. Returns whether anything matched.
 function updateFoodRecordEverywhere(foodId, updates) {
   if (!foodId) return false;
+  // Stamped so the whole-blob merges can carry this correction to other devices. Without it
+  // the fix is local-only: a device that already holds this food id keeps its own stale copy
+  // forever, because those merges can only ever ADD (see foodRecordIsNewer).
+  const stamped = Object.assign({}, updates, { updatedAt: new Date().toISOString() });
   let touched = false;
   const idx = state.recentFoods.findIndex(function(f){ return f.id === foodId; });
-  if (idx >= 0) { state.recentFoods[idx] = Object.assign({}, state.recentFoods[idx], updates); saveRecentFoods(); touched = true; }
+  if (idx >= 0) { state.recentFoods[idx] = Object.assign({}, state.recentFoods[idx], stamped); saveRecentFoods(); touched = true; }
   const favIdx = state.favorites.findIndex(function(f){ return f.id === foodId; });
-  if (favIdx >= 0) { state.favorites[favIdx] = Object.assign({}, state.favorites[favIdx], updates); saveFavorites(); touched = true; }
-  if (state.foodCache[foodId]) { state.foodCache[foodId] = Object.assign({}, state.foodCache[foodId], updates); saveFoodCache(); touched = true; }
+  if (favIdx >= 0) { state.favorites[favIdx] = Object.assign({}, state.favorites[favIdx], stamped); saveFavorites(); touched = true; }
+  if (state.foodCache[foodId]) { state.foodCache[foodId] = Object.assign({}, state.foodCache[foodId], stamped); saveFoodCache(); touched = true; }
   return touched;
 }
 
@@ -2383,6 +2546,9 @@ function closeFoodRecordEditor() {
   const fu = foodUi();
   fu.editingFoodId = null;
   fu.foodEditSection = "macros";
+  // Must be cleared with the rest: a base left over from the previously-edited food would be
+  // applied to the next one opened, silently re-anchoring a food the user never touched.
+  fu.foodEditBaseInput = null;
   fu.foodEditNameInput = null;
   fu.foodEditBrandInput = null;
   fu.foodEditAnimalOverrideInput = undefined;
@@ -2398,6 +2564,7 @@ actions.toggleFoodRecordEditor = function(foodId) {
   rerender();
 };
 actions.setFoodEditSection = function(section) { foodUi().foodEditSection = section; rerender(); };
+inputActions.foodEditBaseInput = function(val) { foodUi().foodEditBaseInput = val; };
 inputActions.foodEditNameInput = function(val) { foodUi().foodEditNameInput = val; };
 inputActions.foodEditBrandInput = function(val) { foodUi().foodEditBrandInput = val; };
 actions.setFoodEditAnimalOverride = function(arg) {
@@ -2414,10 +2581,14 @@ actions.saveFoodRecordMacros = function(foodId) {
   // Calories comes from its own (auto-calculated-but-editable) field, not always recomputed
   // from P/C/F -- so it can account for alcohol's extra ~7 kcal/g, which P/C/F alone misses.
   const cal = Math.max(0, parseFloat(document.getElementById("editMacroCaloriesInput").value) || 0);
-  // baseGrams is written explicitly (not left to be re-derived) because the edit form above
-  // states the basis to the user -- "Values are for 83g" -- so that basis has to be pinned to
-  // what they were shown, not re-inferred later from a field a re-log may have moved.
-  const updates = { protein: p, carbs: c, fat: f, fiber: fib, calories: cal, baseGrams: foodBaseGrams(food) };
+  // baseGrams is written explicitly (not left to be re-derived) because the edit form states
+  // the basis to the user, so that basis has to be pinned to what they were shown rather than
+  // re-inferred later from a field a re-log may have moved. For an absolute-portion food the
+  // user can now edit that basis directly (the repair path for a drifted record); a per-100g
+  // food has no editable basis, so it keeps its derived 100.
+  const editedBase = food.per100g ? null : foodUi().foodEditBaseInput;
+  const base = editedBase != null ? positiveGramsOr(editedBase, foodBaseGrams(food)) : foodBaseGrams(food);
+  const updates = { protein: p, carbs: c, fat: f, fiber: fib, calories: cal, baseGrams: base };
   // Rescale the "last logged" snapshot to the corrected base, at the same weight as before --
   // otherwise re-adding this food would still show the old numbers via loggedMacros
   // (addFoodToLog prefers loggedMacros over the base fields whenever both are present).
@@ -3126,7 +3297,10 @@ function renderLogRecipeScreen(fu) {
 
 actions.selectFoodForAdd = function(foodId, srcTab) {
   const fu = foodUi();
-  let food = fu.results.find(function(f){ return f.id === foodId; });
+  // Every list below is read defensively: foodUi() seeds them all, but this action is also
+  // reachable from a restored/partially-initialised ui object, and an unguarded .find on an
+  // undefined list throws inside the click handler and takes the whole screen down.
+  let food = (fu.results || []).find(function(f){ return f.id === foodId; });
   // The search screen's "Eaten before" group lives in its own list, separate from the database
   // results, so it has to be searched too -- those rows can come from favorites or the food
   // cache, not just recentFoods, and would otherwise fall through the srcTab checks below.
@@ -3278,8 +3452,9 @@ actions.toggleFavorite = function(foodId) {
   if (existing) {
     state.favorites = state.favorites.filter(function(f){ return f.id !== foodId; });
   } else {
-    let food = fu.addingFood && fu.addingFood.id === foodId ? fu.addingFood : (fu.results.find(function(f){ return f.id === foodId; }) || state.foodCache[foodId]);
-    if (food) state.favorites.unshift(Object.assign({}, food, { addedAt: new Date().toISOString() }));
+    const now = new Date().toISOString();
+    let food = fu.addingFood && fu.addingFood.id === foodId ? fu.addingFood : ((fu.results || []).find(function(f){ return f.id === foodId; }) || state.foodCache[foodId]);
+    if (food) state.favorites.unshift(Object.assign({}, food, { addedAt: now, updatedAt: now }));
   }
   saveFavorites();
   rerender();
@@ -4716,6 +4891,14 @@ function renderDataSection() {
         btn({ label: "Sign Out", action: "supabaseSignOut", outline: true, small: true, color: "danger" }) +
       '</div>' +
       '<div style="color:' + C.textMut + ';font-size:11px;margin-top:8px">' + (state.lastSyncedAt ? "Auto-syncs in the background — last synced " + new Date(state.lastSyncedAt).toLocaleTimeString() : "Auto-syncs in the background after changes — not synced yet this session") + '</div>' +
+      // A stale "last synced" time reads exactly like "nothing has changed" -- so a real
+      // failure has to say so explicitly, not just fail to advance the timestamp.
+      (state.lastSyncError ?
+        '<div style="color:' + C.danger + ';font-size:11px;margin-top:6px">⚠ Last sync failed at ' +
+          new Date(state.lastSyncError.at).toLocaleTimeString() + ' (' + esc(state.lastSyncError.kind) + '): ' +
+          esc(state.lastSyncError.message) +
+          '<br>Your data is still saved on this device. It will retry on the next change.</div>'
+        : '') +
       '<div style="margin-top:10px">' + btn({ label: su.syncTesting ? "Syncing..." : "\u{1F504} Sync All Data Now (test)", action: "testFullSync", outline: true, small: true, full: true, disabled: su.syncTesting }) + '</div>' +
       (su.syncTestMsg ? '<div style="margin-top:8px;font-size:12px;color:' + (su.syncTestMsg.ok ? C.success : C.danger) + '">' + esc(su.syncTestMsg.text) + '</div>' : '') +
     '</div>';

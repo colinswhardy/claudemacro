@@ -112,6 +112,9 @@ const exportLine =
   "entryMatchesFood: entryMatchesFood, rescaleEntryMacros: rescaleEntryMacros, " +
   "groupEntriesByHourNewestFirst: groupEntriesByHourNewestFirst, foodMatchesQuery: foodMatchesQuery, " +
   "propagateCustomFoodEdit: propagateCustomFoodEdit, foodUi: foodUi, " +
+  "foodRecordIsNewer: foodRecordIsNewer, mergeFoodListFromCloud: mergeFoodListFromCloud, " +
+  "pruneFoodCache: pruneFoodCache, FOOD_CACHE_CAP: FOOD_CACHE_CAP, recordSyncFailure: recordSyncFailure, " +
+  "pushAppDataToCloud: pushAppDataToCloud, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -1705,6 +1708,207 @@ test("food-creation invariant: the suite actually covers every addFoodToLog call
   assertEqual(callSites, loggingActions.length,
     "all " + callSites + " addFoodToLog call sites live inside an actions.X handler; " +
     "if this diverges, a logging path was added somewhere the coverage scan can't see it");
+});
+
+// ============================================================
+// CROSS-DEVICE CONVERGENCE (newer-wins on the whole-blob collections)
+// ============================================================
+test("foodRecordIsNewer: only prefers the cloud copy when it actually claims to be newer", function () {
+  const older = { updatedAt: "2026-07-20T10:00:00.000Z" };
+  const newer = { updatedAt: "2026-07-22T10:00:00.000Z" };
+  assertEqual(M.foodRecordIsNewer(newer, older), true, "newer cloud wins");
+  assertEqual(M.foodRecordIsNewer(older, newer), false, "older cloud loses");
+  // Backward compatibility: everything already stored predates updatedAt entirely.
+  assertEqual(M.foodRecordIsNewer({}, {}), false, "neither stamped -> local wins, as before");
+  assertEqual(M.foodRecordIsNewer({}, newer), false, "unstamped cloud never beats a stamped local");
+  assertEqual(M.foodRecordIsNewer(newer, {}), true, "stamped cloud beats an unstamped local");
+  assertEqual(M.foodRecordIsNewer({ updatedAt: "garbage" }, older), false, "unparseable cloud stamp makes no claim");
+});
+test("mergeFoodListFromCloud: adds unknown foods and updates known ones only when newer", function () {
+  const local = [
+    { id: "a", calories: 100, updatedAt: "2026-07-20T10:00:00.000Z" },
+    { id: "b", calories: 200, updatedAt: "2026-07-25T10:00:00.000Z" },
+    { id: "c", calories: 300 },
+  ];
+  const changed = M.mergeFoodListFromCloud(local, [
+    { id: "a", calories: 111, updatedAt: "2026-07-24T10:00:00.000Z" }, // newer -> wins
+    { id: "b", calories: 222, updatedAt: "2026-07-21T10:00:00.000Z" }, // older -> loses
+    { id: "c", calories: 333 },                                        // unstamped -> loses
+    { id: "d", calories: 444 },                                        // unknown -> added
+  ]);
+  assertEqual(changed, 2, "one updated, one added");
+  assertEqual(local.map(function (f) { return f.id + ":" + f.calories; }),
+    ["a:111", "b:200", "c:300", "d:444"], "only the genuinely newer record was replaced");
+});
+test("mergeFoodListFromCloud: mutates in place and tolerates junk rows", function () {
+  const local = [];
+  const ref = local;
+  M.mergeFoodListFromCloud(local, [null, {}, { id: "x", calories: 1 }]);
+  assertEqual(ref === local, true, "same array object -- a concurrent local mutation isn't dropped");
+  assertEqual(local.length, 1, "rows with no id are skipped rather than throwing");
+});
+// The gap called out after the baseGrams fix shipped: the repair was per-device only, because
+// a second device holding that food id would never accept the corrected copy.
+test("convergence: a correction on device A reaches device B through the cloud blob", function () {
+  const drifted = { id: "manual_1", name: "Dog", calories: 500, baseGrams: 200 };
+
+  // Device A holds the drifted record and corrects it.
+  M.state.recentFoods = [Object.assign({}, drifted)];
+  M.state.favorites = []; M.state.foodCache = { manual_1: Object.assign({}, drifted) };
+  M.updateFoodRecordEverywhere("manual_1", { calories: 235, baseGrams: 83 });
+  const corrected = M.state.recentFoods[0];
+  assertEqual(typeof corrected.updatedAt, "string", "a correction stamps updatedAt, or it can never propagate");
+
+  // Device B still holds the drifted copy, and pulls A's blob.
+  M.state.recentFoods = [Object.assign({}, drifted)];
+  M.state.foodCache = { manual_1: Object.assign({}, drifted) };
+  M.mergeRecentFoodsFromCloud([corrected]);
+  M.mergeFoodCacheFromCloud({ manual_1: corrected });
+  assertEqual(M.state.recentFoods[0].calories, 235, "History on device B took the correction");
+  assertEqual(M.state.recentFoods[0].baseGrams, 83, "including the repaired base");
+  assertEqual(M.state.foodCache.manual_1.baseGrams, 83, "and the cache, which drives portion re-derivation");
+});
+test("convergence: device B's stale copy cannot overwrite device A's correction on the way back", function () {
+  const stale = { id: "manual_1", calories: 500, baseGrams: 200 };
+  const corrected = { id: "manual_1", calories: 235, baseGrams: 83, updatedAt: "2026-07-25T12:00:00.000Z" };
+  M.state.recentFoods = [Object.assign({}, corrected)];
+  M.state.favorites = []; M.state.foodCache = {};
+  M.mergeRecentFoodsFromCloud([stale]);
+  assertEqual(M.state.recentFoods[0].calories, 235, "an unstamped stale record never wins");
+});
+// Round-trip through the actual sync serialisation, which no earlier test crossed.
+test("sync round-trip: baseGrams survives push serialisation and pull merge", function () {
+  M.state.recentFoods = [{ id: "m1", name: "Dog", calories: 235, baseGrams: 83, loggedWeight: 83, updatedAt: "2026-07-25T12:00:00.000Z" }];
+  M.state.favorites = []; M.state.foodCache = {};
+  // pushAppDataToCloud sends state.recentFoods as-is inside a JSON body; emulate the wire.
+  const onWire = JSON.parse(JSON.stringify(M.state.recentFoods));
+  assertEqual(onWire[0].baseGrams, 83, "baseGrams is a plain number and survives JSON");
+  // A fresh device pulls it.
+  M.state.recentFoods = [];
+  M.mergeRecentFoodsFromCloud(onWire);
+  assertEqual(M.state.recentFoods[0].baseGrams, 83, "arrives intact on the other side");
+  assertEqual(M.calcMacrosForWeight(M.state.recentFoods[0], 166).calories, 470,
+    "and still scales correctly after the round trip");
+});
+
+test("mergeRecentFoodsFromCloud: a pull cannot grow History past its 500 cap", function () {
+  M.state.recentFoods = [];
+  M.state.favorites = []; M.state.foodCache = {};
+  const cloud = [];
+  for (let i = 0; i < 600; i++) cloud.push({ id: "f" + i, name: "Food " + i, lastUsed: new Date(2026, 0, 1, 0, 0, i).toISOString() });
+  M.mergeRecentFoodsFromCloud(cloud);
+  assertEqual(M.state.recentFoods.length, 500, "capped after the merge, not just after the next log");
+  // Sorted most-recent-first, so the cap drops the oldest rather than an arbitrary 100.
+  assertEqual(M.state.recentFoods[0].id, "f599", "most recently used survives at the top");
+  assertEqual(M.state.recentFoods.some(function (f) { return f.id === "f0"; }), false, "the oldest is what got dropped");
+});
+test("mergeFavoritesFromCloud: a pull cannot grow Favorites past its 100 cap", function () {
+  M.state.favorites = []; M.state.recentFoods = []; M.state.foodCache = {};
+  const cloud = [];
+  for (let i = 0; i < 150; i++) cloud.push({ id: "v" + i, addedAt: new Date(2026, 0, 1, 0, 0, i).toISOString() });
+  M.mergeFavoritesFromCloud(cloud);
+  assertEqual(M.state.favorites.length, 100, "capped after the merge");
+});
+test("merge cap: the local array object is preserved, never reassigned", function () {
+  M.state.recentFoods = [{ id: "keep", lastUsed: "2026-07-25T10:00:00.000Z" }];
+  const ref = M.state.recentFoods;
+  M.mergeRecentFoodsFromCloud([{ id: "new", lastUsed: "2026-07-26T10:00:00.000Z" }]);
+  assertEqual(ref === M.state.recentFoods, true, "in-place: a concurrent local mutation isn't dropped by a swap");
+  assertEqual(M.state.recentFoods[0].id, "new", "and it's recency-ordered");
+});
+
+// ============================================================
+// FOOD CACHE GROWTH
+// ============================================================
+test("pruneFoodCache: does nothing while under the cap", function () {
+  M.state.foodCache = { a: { id: "a" }, b: { id: "b" } };
+  M.state.recentFoods = []; M.state.favorites = []; M.state.customBarcodes = {}; M.state.foodLogs = {};
+  assertEqual(M.pruneFoodCache(), 0, "no eviction below the cap");
+  assertEqual(Object.keys(M.state.foodCache).length, 2, "nothing dropped");
+});
+test("pruneFoodCache: over the cap, keeps everything still reachable and drops only orphans", function () {
+  M.state.foodCache = {};
+  for (let i = 0; i < M.FOOD_CACHE_CAP + 50; i++) M.state.foodCache["orphan_" + i] = { id: "orphan_" + i };
+  // One reference of each kind, all of which must survive.
+  M.state.foodCache.keep_history = { id: "keep_history" };
+  M.state.foodCache.keep_fav = { id: "keep_fav" };
+  M.state.foodCache.keep_barcode = { id: "keep_barcode" };
+  M.state.foodCache.keep_logged = { id: "keep_logged" };
+  M.state.recentFoods = [{ id: "keep_history" }];
+  M.state.favorites = [{ id: "keep_fav" }];
+  M.state.customBarcodes = { "999": { id: "keep_barcode" } };
+  M.state.foodLogs = { "2026-07-25": [{ id: "log_1", foodId: "keep_logged" }] };
+
+  const dropped = M.pruneFoodCache();
+  assertEqual(dropped > 0, true, "orphans were evicted");
+  assertEqual(!!M.state.foodCache.keep_history, true, "a History-referenced food is kept");
+  assertEqual(!!M.state.foodCache.keep_fav, true, "a Favorites-referenced food is kept");
+  assertEqual(!!M.state.foodCache.keep_barcode, true, "a custom-barcode food is kept");
+  // This one matters most: dropping it would break rescaleEntryMacros for that logged entry.
+  assertEqual(!!M.state.foodCache.keep_logged, true, "a food referenced by a logged entry is kept");
+  assertEqual(!!M.state.foodCache.orphan_0, false, "an unreachable food is dropped");
+});
+test("pruneFoodCache: a logged entry keeps its food even when the food aged out of History", function () {
+  M.state.foodCache = {};
+  for (let i = 0; i < M.FOOD_CACHE_CAP + 10; i++) M.state.foodCache["o" + i] = { id: "o" + i };
+  M.state.foodCache.old_food = { id: "old_food", calories: 200, baseGrams: 100 };
+  M.state.recentFoods = []; M.state.favorites = []; M.state.customBarcodes = {};
+  M.state.foodLogs = { "2026-01-01": [{ id: "log_old", foodId: "old_food", weight: 100, macros: { calories: 200, protein: 0, carbs: 0, fat: 0, fiber: 0 } }] };
+  M.pruneFoodCache();
+  assertEqual(!!M.state.foodCache.old_food, true, "kept -- History's 500 cap must not silently break old entries' portion maths");
+});
+
+// ============================================================
+// FAILURE VISIBILITY
+// ============================================================
+test("recordSyncFailure: a failed push is recorded rather than leaving a stale 'last synced'", function () {
+  M.state.lastSyncError = null;
+  M.recordSyncFailure("foodLogs", "JWT expired");
+  assertEqual(M.state.lastSyncError.kind, "foodLogs", "which collection failed");
+  assertEqual(M.state.lastSyncError.message, "JWT expired", "and why");
+  assertEqual(typeof M.state.lastSyncError.at, "number", "and when");
+});
+
+// ============================================================
+// EDITABLE BASE PORTION (the repair path for a drifted record)
+// ============================================================
+test("saveFoodRecordMacros: editing the basis re-anchors the food and rescales its snapshot", function () {
+  M.state.recentFoods = [{
+    id: "drift_1", name: "Chili", per100g: false,
+    calories: 500, protein: 30, carbs: 40, fat: 22, fiber: 5,
+    baseGrams: 200, loggedWeight: 200, // drifted: these macros really describe 400g
+    loggedMacros: { calories: 500, protein: 30, carbs: 40, fat: 22, fiber: 5 },
+  }];
+  M.state.favorites = []; M.state.foodCache = {};
+  M.state.ui = {};
+  M.foodUi().foodEditBaseInput = "400"; // the user repairs the basis
+  const originalGetElementById = documentStub.getElementById;
+  documentStub.getElementById = function (id) {
+    const map = { editMacro_protein: "30", editMacro_carbs: "40", editMacro_fat: "22", editMacro_fiber: "5", editMacroCaloriesInput: "500" };
+    return { value: map[id] };
+  };
+  try { M.actions.saveFoodRecordMacros("drift_1"); }
+  finally { documentStub.getElementById = originalGetElementById; }
+
+  const fixed = M.state.recentFoods[0];
+  assertEqual(fixed.baseGrams, 400, "base repaired to the portion the numbers actually describe");
+  assertEqual(M.calcMacrosForWeight(fixed, 400).calories, 500, "400g now reads 500 kcal");
+  assertEqual(M.calcMacrosForWeight(fixed, 200).calories, 250, "and 200g correctly reads half");
+  assertEqual(M.foodUi().foodEditBaseInput, null, "the input is cleared, so it can't re-anchor the next food opened");
+});
+test("saveFoodRecordMacros: a blank or zero basis falls back rather than anchoring to 0g", function () {
+  M.state.recentFoods = [{ id: "d2", per100g: false, calories: 100, protein: 5, carbs: 10, fat: 2, fiber: 0, baseGrams: 50, loggedWeight: 50 }];
+  M.state.favorites = []; M.state.foodCache = {};
+  M.state.ui = {};
+  M.foodUi().foodEditBaseInput = "0";
+  const originalGetElementById = documentStub.getElementById;
+  documentStub.getElementById = function (id) {
+    const map = { editMacro_protein: "5", editMacro_carbs: "10", editMacro_fat: "2", editMacro_fiber: "0", editMacroCaloriesInput: "100" };
+    return { value: map[id] };
+  };
+  try { M.actions.saveFoodRecordMacros("d2"); }
+  finally { documentStub.getElementById = originalGetElementById; }
+  assertEqual(M.state.recentFoods[0].baseGrams, 50, "kept the previous base; 0g would divide by zero in every rescale");
 });
 
 console.log("\n" + pass + " passed, " + fail + " failed");
