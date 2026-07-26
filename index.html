@@ -187,7 +187,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.10";
+const APP_VERSION = "1.11";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -564,7 +564,21 @@ function mergeFoodLogsFromCloud(cloudRows) {
       if (cloudTime <= localTime) return; // local is same-or-newer, keep it
       const list = state.foodLogs[existing.date] || [];
       const idx = list.findIndex(function(e){ return e.id === row.id; });
-      if (idx >= 0) { list[idx] = entry; changed++; }
+      if (idx < 0) return;
+      // The row's log_date is part of what can change (that's what Move Day / Copy edit), so a
+      // newer cloud copy has to be RE-FILED under row.log_date, not just written back over the
+      // slot it currently occupies. Overwriting in place kept a moved entry on the day it used
+      // to be on -- the move never propagated, and since this device would then push its own
+      // stale log_date back up, the two devices disagreed about which day the food was on
+      // permanently, throwing off the calorie total for both days.
+      if (row.log_date && row.log_date !== existing.date) {
+        list.splice(idx, 1);
+        if (!state.foodLogs[row.log_date]) state.foodLogs[row.log_date] = [];
+        state.foodLogs[row.log_date].push(entry);
+      } else {
+        list[idx] = entry;
+      }
+      changed++;
       return;
     }
     if (!state.foodLogs[row.log_date]) state.foodLogs[row.log_date] = [];
@@ -614,6 +628,12 @@ function markRecentlyDeleted(table, id) {
   if (recentlyDeletedIds[table]) recentlyDeletedIds[table].set(id, Date.now());
 }
 function wasRecentlyDeleted(table, id) {
+  // A delete that hasn't been confirmed by the server yet blocks resurrection for as long as it
+  // stays outstanding -- not just for the 30s TTL. The TTL exists to cover the window between a
+  // successful DELETE and the pull that might still return a stale copy; it was never meant to
+  // be the only thing standing between a failed delete and the row coming back. This check is
+  // also the part that survives a reload, since the in-memory map does not.
+  if (hasPendingDelete(table, id)) return true;
   const m = recentlyDeletedIds[table];
   if (!m) return false;
   const t = m.get(id);
@@ -625,10 +645,76 @@ function wasRecentlyDeleted(table, id) {
 // Fire-and-forget row delete; doesn't block or retry. If it fails while offline the row
 // resurfaces on the next pull -- an acceptable edge case at this scale rather than building
 // a full delete queue for a personal app used from one active device at a time.
+// Deletes used to be fire-and-forget: the DELETE was issued, its result thrown away, and the
+// only thing stopping a pull from re-adding the row was a 30-second in-memory tombstone. So a
+// delete made offline, or with an expired token, or that simply lost the race, left the row
+// alive in the cloud -- and once the tombstone aged out (or the app was reloaded, which drops
+// it entirely) the very next pull put the deleted food back. Silently, and permanently, since
+// the local delete was long gone. On a calorie tracker that quietly inflates the day's total.
+//
+// Deletes are now a durable queue persisted to localStorage: enqueue first, then attempt, and
+// only dequeue on confirmed success. A queued delete also counts as a tombstone regardless of
+// TTL (see wasRecentlyDeleted), so the row cannot be resurrected while its removal is still
+// outstanding -- across reloads, and for as long as it takes to get back online.
+// Held in memory as the single source of truth, written through to localStorage on every
+// change. Deliberately NOT re-read from storage per call, for two reasons:
+//   1. wasRecentlyDeleted consults this once per row of every pull, so a read-plus-JSON.parse
+//      per call would mean parsing the whole queue hundreds of times in a single sync.
+//   2. flushPendingDeletes retries with Promise.all, so several deletes confirm concurrently.
+//      A load-filter-save against storage would let two of them race: each reads the same
+//      snapshot, removes only its own entry, and the later write restores the row the earlier
+//      one had just cleared -- leaving an already-confirmed delete queued forever.
+// The key separator is '|': table names are fixed internal constants and ids are UUIDs or
+// log_/recipe_ strings, so neither can contain one.
+function pendingDeleteKey(table, idValue) { return table + "|" + idValue; }
+let pendingDeletes = (function() {
+  const raw = db.get("pendingDeletes", []);
+  return Array.isArray(raw) ? raw : [];
+})();
+function loadPendingDeletes() { return pendingDeletes; }
+function savePendingDeletes(list) {
+  pendingDeletes = Array.isArray(list) ? list : [];
+  db.set("pendingDeletes", pendingDeletes);
+}
+
+function hasPendingDelete(table, idValue) {
+  const key = pendingDeleteKey(table, idValue);
+  return pendingDeletes.some(function(d) { return pendingDeleteKey(d.table, d.idValue) === key; });
+}
+
+function enqueuePendingDelete(table, idColumn, idValue) {
+  if (hasPendingDelete(table, idValue)) return;
+  pendingDeletes.push({ table: table, idColumn: idColumn, idValue: idValue, at: Date.now() });
+  savePendingDeletes(pendingDeletes);
+}
+
+function dequeuePendingDelete(table, idValue) {
+  const key = pendingDeleteKey(table, idValue);
+  savePendingDeletes(pendingDeletes.filter(function(d) { return pendingDeleteKey(d.table, d.idValue) !== key; }));
+}
+async function attemptPendingDelete(d) {
+  const res = await supabaseTable(d.table + "?" + d.idColumn + "=eq." + encodeURIComponent(d.idValue), { method: "DELETE" });
+  if (res.error) { recordSyncFailure("delete:" + d.table, res.error); return false; }
+  dequeuePendingDelete(d.table, d.idValue);
+  return true;
+}
+
+// Retries every outstanding delete. Called at the START of pullAndMergeAll -- before anything
+// is pulled -- so a row whose delete previously failed is gone from the cloud before the merge
+// that would otherwise re-add it.
+async function flushPendingDeletes() {
+  if (!state.session) return 0;
+  const list = loadPendingDeletes();
+  if (list.length === 0) return 0;
+  const results = await Promise.all(list.map(attemptPendingDelete));
+  return results.filter(Boolean).length;
+}
+
 function scheduleCloudDelete(table, idColumn, idValue) {
   markRecentlyDeleted(table, idValue);
-  if (!state.session) return;
-  supabaseTable(table + "?" + idColumn + "=eq." + encodeURIComponent(idValue), { method: "DELETE" });
+  enqueuePendingDelete(table, idColumn, idValue);
+  if (!state.session) return; // stays queued; flushed on the next pull once signed in
+  attemptPendingDelete({ table: table, idColumn: idColumn, idValue: idValue });
 }
 
 // ---- Generic key/blob sync for favorites, recentFoods, foodCache (all stored as one
@@ -791,6 +877,12 @@ function mergeCustomBarcodesFromCloud(cloudRows) {
 // Safe to call anytime (login, or periodically in the background).
 async function pullAndMergeAll() {
   if (!state.session) return { error: "Not signed in" };
+
+  // Retry outstanding deletes BEFORE pulling anything. A row whose DELETE failed earlier is
+  // still in the cloud, and pulling first would merge it straight back into local state -- the
+  // exact resurrection this queue exists to prevent. Failures here are non-fatal: the row stays
+  // queued, and wasRecentlyDeleted keeps blocking it from being re-added in the meantime.
+  await flushPendingDeletes();
 
   // Settings must be pulled BEFORE pushing: a freshly-installed device's local defaults
   // would otherwise overwrite the real account settings the instant it logs in. Only seed
@@ -2092,7 +2184,11 @@ function moveFoodEntryToDate(entryId, toDate) {
   list.splice(idx, 1);
   state.foodLogs[fromDate] = list;
   if (!state.foodLogs[toDate]) state.foodLogs[toDate] = [];
-  state.foodLogs[toDate].push(entry);
+  // updatedAt MUST be bumped: the move is a real edit, and it's the only thing
+  // mergeFoodLogsFromCloud can use to tell that this device's copy is the newer one. Without
+  // it the moved entry keeps its pre-move stamp, the merge sees cloud == local, and whichever
+  // device pushed last silently wins -- the move bounces back to the original day.
+  state.foodLogs[toDate].push(Object.assign({}, entry, { updatedAt: new Date().toISOString() }));
   saveFoodLogs();
   return true;
 }
@@ -5058,13 +5154,36 @@ actions.deleteBarcode = function(code) {
   };
 });
 
+// This is the app's only backup, and the thing the storage-quota banner tells you to reach for,
+// so it has to actually produce a complete file.
+//
+// foodCache was missing from the snapshot. It isn't a throwaway cache any more -- it holds each
+// food's baseGrams anchor, and rescaleEntryMacros reads it to rescale a logged entry when the
+// portion changes. Restoring a backup without it left every logged entry unable to re-derive
+// its macros from its source food, silently falling back to proportional scaling.
+function exportSnapshot() {
+  return {
+    settings: state.settings, foodLogs: state.foodLogs, weights: state.weights,
+    favorites: state.favorites, recentFoods: state.recentFoods, foodCache: state.foodCache,
+    recipes: state.recipes, customBarcodes: state.customBarcodes,
+    exportDate: new Date().toISOString(), version: "1.1",
+  };
+}
+
 actions.exportData = function() {
-  const exportObj = { settings: state.settings, foodLogs: state.foodLogs, weights: state.weights, favorites: state.favorites, recentFoods: state.recentFoods, recipes: state.recipes, customBarcodes: state.customBarcodes, exportDate: new Date().toISOString(), version: "1.0" };
-  const blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify(exportSnapshot(), null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url; a.download = "macrolog-export-" + todayStr() + ".json"; a.click();
-  URL.revokeObjectURL(url);
+  a.href = url;
+  a.download = "macrolog-export-" + todayStr() + ".json";
+  // The anchor has to be in the document for the click to count in Firefox, and the object URL
+  // has to outlive the click -- revoking it synchronously (as this did) races the download and
+  // can hand back an empty or failed file. Detach immediately, revoke on a later tick.
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(function() { URL.revokeObjectURL(url); }, 30000);
 };
 actions.clickImportData = function() { const el = document.getElementById("importFileInput"); if (el) el.click(); };
 changeActions.importData = function(el) {
@@ -5079,6 +5198,9 @@ changeActions.importData = function(el) {
       if (data.weights) { state.weights = data.weights; saveWeights(); }
       if (data.favorites) { state.favorites = data.favorites; saveFavorites(); }
       if (data.recentFoods) { state.recentFoods = data.recentFoods; saveRecentFoods(); }
+      // Older exports (version 1.0) predate this key and simply won't have it -- restoring one
+      // of those leaves the existing cache alone rather than wiping it.
+      if (data.foodCache) { state.foodCache = data.foodCache; saveFoodCache(); }
       if (data.recipes) { state.recipes = data.recipes; saveRecipes(); }
       if (data.customBarcodes) { state.customBarcodes = data.customBarcodes; saveCustomBarcodes(); }
       alert("Data imported successfully!");
@@ -5110,6 +5232,9 @@ actions.clearAllData = async function() {
   }
   state.settings = Object.assign({}, DEFAULT_SETTINGS);
   state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {}; state.recipes = []; state.customBarcodes = {};
+  // Everything those queued deletes referred to is gone from both sides now; leaving them would
+  // keep retrying deletes for rows that no longer exist and keep blocking their ids forever.
+  savePendingDeletes([]);
   saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache(); saveRecipes(); saveCustomBarcodes();
   su.clearing = false;
   su.confirmClear = false;

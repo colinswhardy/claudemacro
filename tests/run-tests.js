@@ -115,6 +115,10 @@ const exportLine =
   "foodRecordIsNewer: foodRecordIsNewer, mergeFoodListFromCloud: mergeFoodListFromCloud, " +
   "pruneFoodCache: pruneFoodCache, FOOD_CACHE_CAP: FOOD_CACHE_CAP, recordSyncFailure: recordSyncFailure, " +
   "pushAppDataToCloud: pushAppDataToCloud, " +
+  "moveFoodEntryToDate: moveFoodEntryToDate, exportSnapshot: exportSnapshot, " +
+  "loadPendingDeletes: loadPendingDeletes, savePendingDeletes: savePendingDeletes, " +
+  "hasPendingDelete: hasPendingDelete, enqueuePendingDelete: enqueuePendingDelete, " +
+  "dequeuePendingDelete: dequeuePendingDelete, removeFoodFromLog: removeFoodFromLog, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -1909,6 +1913,147 @@ test("saveFoodRecordMacros: a blank or zero basis falls back rather than anchori
   try { M.actions.saveFoodRecordMacros("d2"); }
   finally { documentStub.getElementById = originalGetElementById; }
   assertEqual(M.state.recentFoods[0].baseGrams, 50, "kept the previous base; 0g would divide by zero in every rescale");
+});
+
+// ============================================================
+// MOVE DAY MUST SURVIVE SYNC
+// ============================================================
+// A log entry's log_date is editable (Move Day), so it is part of what a merge has to
+// reconcile. It wasn't: a newer cloud copy was written back over the slot the entry already
+// occupied, leaving it filed under the day it used to be on. Combined with moveFoodEntryToDate
+// not bumping updatedAt, a move made on one device never reached the other, each device pushed
+// its own log_date back, and the two disagreed about which day the food belonged to -- wrong
+// calorie totals on both days, indefinitely.
+test("moveFoodEntryToDate: bumps updatedAt so the move can win a conflict", function () {
+  M.state.date = "2026-07-20";
+  M.state.foodLogs = { "2026-07-20": [{ id: "mv1", name: "Lunch", weight: 200, macros: { calories: 400 }, timestamp: "2026-07-20T12:00:00.000Z", updatedAt: "2026-07-20T12:00:00.000Z" }] };
+  assertEqual(M.moveFoodEntryToDate("mv1", "2026-07-25"), true, "move reported success");
+  const moved = M.state.foodLogs["2026-07-25"][0];
+  assertEqual(moved.updatedAt !== "2026-07-20T12:00:00.000Z", true, "updatedAt advanced past the pre-move stamp");
+  assertEqual(M.state.foodLogs["2026-07-20"].length, 0, "and it left the old day");
+});
+test("mergeFoodLogsFromCloud: a newer cloud copy on a different date is RE-FILED, not overwritten in place", function () {
+  M.state.foodLogs = { "2026-07-20": [{ id: "mv2", foodId: "f", name: "Dinner", weight: 300, macros: { calories: 600, protein: 30, carbs: 60, fat: 20, fiber: 4 }, timestamp: "2026-07-20T18:00:00.000Z", updatedAt: "2026-07-20T18:00:00.000Z" }] };
+  M.mergeFoodLogsFromCloud([{
+    id: "mv2", log_date: "2026-07-25", food_id: "f", name: "Dinner", weight: 300,
+    calories: 600, protein: 30, carbs: 60, fat: 20, fiber: 4,
+    logged_at: "2026-07-20T18:00:00.000Z", updated_at: "2026-07-26T09:00:00.000Z",
+  }]);
+  assertEqual((M.state.foodLogs["2026-07-20"] || []).length, 0, "removed from the stale date");
+  assertEqual((M.state.foodLogs["2026-07-25"] || []).length, 1, "landed on the date the cloud says it's on");
+  assertEqual(M.state.foodLogs["2026-07-25"][0].macros.calories, 600, "with its macros intact");
+});
+test("mergeFoodLogsFromCloud: an OLDER cloud copy cannot drag a locally-moved entry back", function () {
+  M.state.foodLogs = { "2026-07-25": [{ id: "mv3", name: "Dinner", weight: 300, macros: { calories: 600 }, timestamp: "2026-07-20T18:00:00.000Z", updatedAt: "2026-07-26T10:00:00.000Z" }] };
+  M.mergeFoodLogsFromCloud([{ id: "mv3", log_date: "2026-07-20", name: "Dinner", weight: 300, calories: 600, protein: 0, carbs: 0, fat: 0, fiber: 0, logged_at: "2026-07-20T18:00:00.000Z", updated_at: "2026-07-20T18:00:00.000Z" }]);
+  assertEqual((M.state.foodLogs["2026-07-25"] || []).length, 1, "the newer local move stands");
+  assertEqual((M.state.foodLogs["2026-07-20"] || []).length, 0, "and nothing reappeared on the old date");
+});
+test("mergeFoodLogsFromCloud: a same-date update still writes in place", function () {
+  M.state.foodLogs = { "2026-07-25": [{ id: "mv4", name: "Old", weight: 100, macros: { calories: 100 }, timestamp: "2026-07-25T08:00:00.000Z", updatedAt: "2026-07-25T08:00:00.000Z" }] };
+  M.mergeFoodLogsFromCloud([{ id: "mv4", log_date: "2026-07-25", name: "New", weight: 200, calories: 250, protein: 0, carbs: 0, fat: 0, fiber: 0, logged_at: "2026-07-25T08:00:00.000Z", updated_at: "2026-07-26T08:00:00.000Z" }]);
+  assertEqual(M.state.foodLogs["2026-07-25"].length, 1, "no duplicate created");
+  assertEqual(M.state.foodLogs["2026-07-25"][0].name, "New", "updated in place");
+});
+
+// ============================================================
+// DELETES MUST BE DURABLE
+// ============================================================
+// A DELETE used to be fired and forgotten, with only a 30s in-memory tombstone standing between
+// a failed delete and the next pull re-adding the row -- silently, permanently, and on a
+// calorie tracker that means the day's total quietly goes back up.
+test("scheduleCloudDelete: queues the delete so it survives a reload", function () {
+  M.savePendingDeletes([]);
+  M.state.session = null; // offline / signed out: the request can't even be attempted
+  M.enqueuePendingDelete("food_log_entries", "id", "log_x");
+  assertEqual(M.hasPendingDelete("food_log_entries", "log_x"), true, "queued");
+  assertEqual(M.loadPendingDeletes().length, 1, "persisted to storage, so a reload doesn't lose it");
+});
+test("enqueuePendingDelete: is idempotent", function () {
+  M.savePendingDeletes([]);
+  M.enqueuePendingDelete("food_log_entries", "id", "dup");
+  M.enqueuePendingDelete("food_log_entries", "id", "dup");
+  assertEqual(M.loadPendingDeletes().length, 1, "the same delete isn't queued twice");
+});
+test("wasRecentlyDeleted: an outstanding delete blocks resurrection regardless of the 30s TTL", function () {
+  M.savePendingDeletes([]);
+  M.recentlyDeletedIds.food_log_entries.clear();
+  M.enqueuePendingDelete("food_log_entries", "id", "log_y");
+  // No in-memory tombstone at all -- this is the post-reload state, where the old code had
+  // nothing left to block the row with.
+  assertEqual(M.wasRecentlyDeleted("food_log_entries", "log_y"), true, "the queue itself is the tombstone");
+});
+test("a deleted entry stays deleted through a pull even after its tombstone expires", function () {
+  M.savePendingDeletes([]);
+  M.recentlyDeletedIds.food_log_entries.clear();
+  M.state.foodLogs = {};
+  M.enqueuePendingDelete("food_log_entries", "id", "log_z"); // its DELETE failed earlier
+  M.mergeFoodLogsFromCloud([{ id: "log_z", log_date: "2026-07-26", name: "Snack", weight: 50, calories: 250, protein: 0, carbs: 0, fat: 0, fiber: 0, logged_at: "2026-07-26T15:00:00.000Z", updated_at: "2026-07-26T15:00:00.000Z" }]);
+  assertEqual((M.state.foodLogs["2026-07-26"] || []).length, 0, "the cloud's stale copy was not merged back in");
+});
+test("pending deletes: concurrent confirmations don't restore each other's entries", function () {
+  // flushPendingDeletes retries the queue with Promise.all, so several deletes confirm at once.
+  // An implementation that re-read the queue from storage on each dequeue would have each call
+  // filter the same stale snapshot and the last write would resurrect the others' entries.
+  M.savePendingDeletes([]);
+  ["a", "b", "c"].forEach(function (id) { M.enqueuePendingDelete("food_log_entries", "id", id); });
+  assertEqual(M.loadPendingDeletes().length, 3, "three queued");
+  M.dequeuePendingDelete("food_log_entries", "a");
+  M.dequeuePendingDelete("food_log_entries", "b");
+  M.dequeuePendingDelete("food_log_entries", "c");
+  assertEqual(M.loadPendingDeletes().length, 0, "all three cleared, none restored by a later write");
+});
+test("dequeuePendingDelete: a confirmed delete stops blocking that id", function () {
+  M.savePendingDeletes([]);
+  M.recentlyDeletedIds.food_log_entries.clear();
+  M.enqueuePendingDelete("food_log_entries", "id", "log_done");
+  M.dequeuePendingDelete("food_log_entries", "log_done");
+  assertEqual(M.hasPendingDelete("food_log_entries", "log_done"), false, "cleared once the server confirmed it");
+});
+test("pending deletes are scoped per table, not global by id", function () {
+  M.savePendingDeletes([]);
+  M.enqueuePendingDelete("weight_entries", "log_date", "2026-07-25");
+  assertEqual(M.hasPendingDelete("weight_entries", "2026-07-25"), true, "blocked for its own table");
+  assertEqual(M.hasPendingDelete("food_log_entries", "2026-07-25"), false, "but not for an unrelated one");
+  M.savePendingDeletes([]);
+});
+
+// ============================================================
+// EXPORT IS THE BACKUP -- IT HAS TO BE COMPLETE
+// ============================================================
+test("exportSnapshot: carries every collection needed to restore, foodCache included", function () {
+  const keys = Object.keys(M.exportSnapshot());
+  ["settings", "foodLogs", "weights", "favorites", "recentFoods", "foodCache", "recipes", "customBarcodes"].forEach(function (k) {
+    assertEqual(keys.indexOf(k) >= 0, true, "export includes " + k);
+  });
+});
+test("exportSnapshot: foodCache round-trips the baseGrams that logged entries depend on", function () {
+  M.state.foodCache = { m1: { id: "m1", per100g: false, calories: 235, protein: 10, carbs: 20, fat: 13, fiber: 1, baseGrams: 83 } };
+  const restored = JSON.parse(JSON.stringify(M.exportSnapshot()));
+  assertEqual(restored.foodCache.m1.baseGrams, 83, "anchor survives the backup");
+  // Without this, a restored entry can no longer re-derive its macros from its source food.
+  assertEqual(M.calcMacrosForWeight(restored.foodCache.m1, 166).calories, 470, "and still scales after a restore");
+});
+
+// ============================================================
+// SOURCE HYGIENE
+// ============================================================
+test("index.html contains no stray control bytes", function () {
+  // A raw NUL byte once landed in a string literal here. JS accepts it, so node --check and the
+  // whole suite passed while git, grep and every text tool reported the file as binary -- and a
+  // control byte in the shipped payload is the kind of thing that breaks a CDN, a minifier or an
+  // editor much later, far from the change that introduced it. Tab/LF/CR are the only control
+  // characters that legitimately appear.
+  const src = require("fs").readFileSync(indexPath, "utf8");
+  const offenders = [];
+  for (let i = 0; i < src.length; i++) {
+    const c = src.charCodeAt(i);
+    if (c < 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d) {
+      offenders.push({ at: i, code: "0x" + c.toString(16), line: src.slice(0, i).split("\n").length });
+      if (offenders.length >= 5) break;
+    }
+  }
+  assertEqual(offenders, [], "no control bytes outside tab/newline/carriage-return");
 });
 
 console.log("\n" + pass + " passed, " + fail + " failed");
