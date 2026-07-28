@@ -187,7 +187,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.12";
+const APP_VERSION = "1.13";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -2444,8 +2444,11 @@ function subTabBtn(key, label) {
 // Split out of renderFoodTab so it can be patched into #foodResultsBlock directly as the user
 // types, instead of a full rerender() -- rerendering the whole #app mid-keystroke would blur
 // the search input and, on mobile, can dismiss the keyboard.
-function foodResultRow(food, srcTab) {
-  return '<div class="foodResult" data-action="selectFoodForAdd" data-arg="' + esc_attr(food.id) + '"' + (srcTab ? ' data-arg2="' + srcTab + '"' : '') + '>' +
+// `action` defaults to the Food tab's own "pick this food to log it" handler; the recipe
+// ingredient picker passes its own so it can reuse this exact row (and therefore the exact
+// same two-group search below) instead of maintaining a second, thinner result row.
+function foodResultRow(food, srcTab, action) {
+  return '<div class="foodResult" data-action="' + (action || "selectFoodForAdd") + '" data-arg="' + esc_attr(food.id) + '"' + (srcTab ? ' data-arg2="' + srcTab + '"' : '') + '>' +
     '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
       '<div style="flex:1;min-width:0">' +
         '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(food.name) + '</div>' +
@@ -2473,6 +2476,31 @@ function resultsSectionHeader(label, color) {
 // deduplicateFoods together -- doing that folded a history item into a database row and
 // stripped its "you've had this before" identity. Instead the database list simply drops
 // anything already shown in the history group (by id), so nothing appears twice.
+// The two-group body itself, shared verbatim by the Food tab's search and the recipe
+// ingredient picker's search -- the picker used to render database hits only, so a food Colin
+// had manually entered or eaten before was unreachable when building a recipe. Keeping one
+// renderer (rather than a parallel copy) is what stops the two screens drifting apart again.
+function renderFoodResultGroups(cfg) {
+  const history = cfg.history || [];
+  const dbResults = cfg.dbResults || [];
+  let html = '';
+
+  if (history.length > 0) {
+    html += resultsSectionHeader("★ Eaten before", C.warning);
+    history.forEach(function(food) { html += foodResultRow(food, "history", cfg.action); });
+  }
+
+  if (dbResults.length > 0) {
+    if (history.length > 0) html += '<div style="height:6px"></div>';
+    html += resultsSectionHeader("Food databases", C.textMut);
+    dbResults.forEach(function(food) { html += foodResultRow(food, null, cfg.action); });
+  }
+
+  if (cfg.searching) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">Searching databases...</div>';
+  else if (history.length === 0 && dbResults.length === 0 && cfg.query) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">' + esc(cfg.emptyText) + '</div>';
+  return html;
+}
+
 function renderFoodResultsBlock(fu) {
   const history = fu.historyResults || [];
   const dbResults = fu.results || [];
@@ -2484,20 +2512,10 @@ function renderFoodResultsBlock(fu) {
       btn({ label: "Open", action: "openWizard", arg: fu.wizardSuggestion, small: true }) +
       '</div>';
   }
-
-  if (history.length > 0) {
-    html += resultsSectionHeader("★ Eaten before", C.warning);
-    history.forEach(function(food) { html += foodResultRow(food, "history"); });
-  }
-
-  if (dbResults.length > 0) {
-    if (history.length > 0) html += '<div style="height:6px"></div>';
-    html += resultsSectionHeader("Food databases", C.textMut);
-    dbResults.forEach(function(food) { html += foodResultRow(food); });
-  }
-
-  if (fu.searching) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">Searching databases...</div>';
-  else if (history.length === 0 && dbResults.length === 0 && fu.query) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No results. Try AI estimation or manual entry.</div>';
+  html += renderFoodResultGroups({
+    history: history, dbResults: dbResults, searching: fu.searching, query: fu.query,
+    action: "selectFoodForAdd", emptyText: "No results. Try AI estimation or manual entry.",
+  });
   return html;
 }
 function patchFoodResultsBlock() {
@@ -3182,7 +3200,7 @@ function renderRecipeBuilderScreen(fu) {
 actions.openIngredientPicker = function() {
   const rb = foodUi().recipeBuilder;
   if (!rb) return;
-  rb.picker = { mode: "search", query: "", results: [], searching: false, selecting: null, weight: "100", servingBasis: null, qty: "1", manual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" } };
+  rb.picker = { mode: "search", query: "", results: [], historyResults: [], searching: false, selecting: null, weight: "100", servingBasis: null, qty: "1", manual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" } };
   rerender();
 };
 actions.closeIngredientPicker = function() {
@@ -3196,16 +3214,89 @@ actions.setPickerMode = function(mode) {
   const rb = foodUi().recipeBuilder;
   if (rb && rb.picker) { rb.picker.mode = mode; rerender(); }
 };
-inputActions.ingredientQuery = function(val) { const rb = foodUi().recipeBuilder; if (rb && rb.picker) rb.picker.query = val; };
+// Ingredient search mirrors the Food tab's search exactly (see inputActions.foodQuery): an
+// instant local "Eaten before" group from the 1st character, plus a debounced database search
+// underneath. Its own seq/timer rather than the Food tab's, so the two can never invalidate
+// each other's in-flight requests.
+let ingredientSearchDebounceTimer = null;
+let ingredientSearchSeq = 0;
+
+// The picker object is recreated on every open and nulled on close, so an async search that
+// resolves after the user backed out (or reopened the picker) must not write into a detached
+// one -- identity, not just the seq counter, is what makes that safe.
+function ingredientPickerIsCurrent(pk) {
+  const rb = foodUi().recipeBuilder;
+  return !!(rb && rb.picker === pk);
+}
+
+function renderIngredientResultsBlock(pk) {
+  return renderFoodResultGroups({
+    history: pk.historyResults, dbResults: pk.results, searching: pk.searching, query: pk.query,
+    action: "selectIngredientFood", emptyText: "No results. Try Manual instead.",
+  });
+}
+function patchIngredientResultsBlock() {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker) return;
+  const el = document.getElementById("ingredientResultsBlock");
+  if (el) el.innerHTML = renderIngredientResultsBlock(rb.picker);
+  const btnEl = document.getElementById("ingredientSearchBtn");
+  if (btnEl) { btnEl.disabled = rb.picker.searching; btnEl.textContent = rb.picker.searching ? "..." : "\u{1F50D}"; }
+}
+
+inputActions.ingredientQuery = function(val) {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker) return;
+  const pk = rb.picker;
+  pk.query = val;
+  ingredientSearchSeq++; // invalidate any live search still in flight from an earlier keystroke
+  clearTimeout(ingredientSearchDebounceTimer);
+
+  const q = val.trim().toLowerCase();
+  pk.historyResults = q.length >= 1 ? localFoodMatches(q) : [];
+  pk.results = [];
+  pk.searching = false;
+  patchIngredientResultsBlock();
+
+  if (q.length < 3) return; // too short to bother the (rate-limited) remote databases
+  const mySeq = ingredientSearchSeq;
+  ingredientSearchDebounceTimer = setTimeout(function() { liveIngredientSearch(q, mySeq, pk); }, 450);
+};
+
+async function liveIngredientSearch(q, mySeq, pk) {
+  if (!ingredientPickerIsCurrent(pk)) return;
+  pk.searching = true;
+  patchIngredientResultsBlock();
+  const usdaP = searchUSDA(q);
+  const offP = searchOpenFoodFacts(q);
+  const usda = await usdaP, off = await offP;
+  if (mySeq !== ingredientSearchSeq || !ingredientPickerIsCurrent(pk)) return;
+  pk.historyResults = localFoodMatches(q);
+  pk.results = dbResultsExcludingHistory(pk.historyResults, usda.concat(off));
+  pk.searching = false;
+  patchIngredientResultsBlock();
+}
+
 actions.doIngredientSearch = async function() {
   const rb = foodUi().recipeBuilder;
-  if (!rb || !rb.picker || !rb.picker.query.trim()) return;
+  if (!rb || !rb.picker) return;
   const pk = rb.picker;
+  const q = (pk.query || "").trim();
+  if (!q) return;
+  clearTimeout(ingredientSearchDebounceTimer);
+  const mySeq = ++ingredientSearchSeq;
+  const qLower = q.toLowerCase();
   pk.searching = true;
+  pk.historyResults = localFoodMatches(qLower);
+  pk.results = [];
   rerender();
-  const usda = await searchUSDA(pk.query);
-  const off = await searchOpenFoodFacts(pk.query);
-  pk.results = deduplicateFoods(usda.concat(off));
+
+  const usdaP = searchUSDA(q);
+  const offP = searchOpenFoodFacts(q);
+  const usda = await usdaP, off = await offP;
+  if (mySeq !== ingredientSearchSeq || !ingredientPickerIsCurrent(pk)) return;
+  pk.historyResults = localFoodMatches(qLower);
+  pk.results = dbResultsExcludingHistory(pk.historyResults, usda.concat(off));
   pk.searching = false;
   rerender();
 };
@@ -3213,8 +3304,14 @@ actions.selectIngredientFood = function(foodId, srcTab) {
   const rb = foodUi().recipeBuilder;
   if (!rb || !rb.picker) return;
   const pk = rb.picker;
-  let food = pk.results.find(function(f){ return f.id === foodId; });
+  // Same defensive lookup order as selectFoodForAdd, and for the same reason: an "Eaten before"
+  // row can originate from favorites or the food cache, not just recentFoods, so the history
+  // list has to be searched directly rather than inferred from srcTab.
+  let food = (pk.results || []).find(function(f){ return f.id === foodId; });
+  if (!food) food = (pk.historyResults || []).find(function(f){ return f.id === foodId; });
+  if (!food && srcTab === "history") food = state.recentFoods.find(function(f){ return f.id === foodId; });
   if (!food && srcTab === "favorites") food = state.favorites.find(function(f){ return f.id === foodId; });
+  if (!food) food = state.foodCache[foodId];
   if (!food) return;
   pk.selecting = food;
   pk.weight = "";
@@ -3329,19 +3426,12 @@ function renderIngredientPickerScreen(fu, rb) {
 
   if (pk.mode === "search") {
     inner += '<div class="row" style="margin-bottom:12px">' +
-      textInput({ value: pk.query, placeholder: "Search foods...", bind: "ingredientQuery", enter: "doIngredientSearch", enterHint: "search", style: "flex:1" }) +
-      btn({ label: pk.searching ? "..." : "\u{1F50D}", action: "doIngredientSearch", disabled: pk.searching }) +
+      textInput({ id: "ingredientQueryInput", value: pk.query, placeholder: "Search foods...", bind: "ingredientQuery", enter: "doIngredientSearch", enterHint: "search", style: "flex:1" }) +
+      btn({ id: "ingredientSearchBtn", label: pk.searching ? "..." : "\u{1F50D}", action: "doIngredientSearch", disabled: pk.searching }) +
     '</div>';
-    pk.results.forEach(function(food) {
-      inner += '<div class="foodResult" data-action="selectIngredientFood" data-arg="' + esc_attr(food.id) + '">' +
-        '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
-          '<div style="flex:1;min-width:0"><div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(food.name) + '</div>' +
-          (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px">' + esc(food.brand) + '</div>' : '') + '</div>' +
-          '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + food.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">' + foodQuantityLabel(food) + '</div></div>' +
-        '</div></div>';
-    });
-    if (pk.searching) inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">Searching databases...</div>';
-    else if (pk.results.length === 0 && pk.query) inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No results. Try Manual instead.</div>';
+    // Patched in place by patchIngredientResultsBlock() as the user types, never via rerender()
+    // -- a full rerender mid-keystroke blurs the input and drops the phone keyboard.
+    inner += '<div id="ingredientResultsBlock">' + renderIngredientResultsBlock(pk) + '</div>';
   } else if (pk.mode === "favorites") {
     if (state.favorites.length === 0) {
       inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No favorites yet.</div>';

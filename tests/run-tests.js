@@ -104,6 +104,7 @@ const exportLine =
   "mergeRecentFoodsFromCloud: mergeRecentFoodsFromCloud, mergeFavoritesFromCloud: mergeFavoritesFromCloud, mergeFoodCacheFromCloud: mergeFoodCacheFromCloud, " +
   "barcodeCodeForEntry: barcodeCodeForEntry, weightChartXPositions: weightChartXPositions, " +
   "dbResultsExcludingHistory: dbResultsExcludingHistory, " +
+  "renderFoodResultGroups: renderFoodResultGroups, renderIngredientResultsBlock: renderIngredientResultsBlock, " +
   "foodBaseGrams: foodBaseGrams, foodQuantityLabel: foodQuantityLabel, " +
   "isAnimalProteinEntry: isAnimalProteinEntry, entryBrandLine: entryBrandLine, entryHasZeroMacros: entryHasZeroMacros, " +
   "addFoodToLog: addFoodToLog, updateFoodEntry: updateFoodEntry, " +
@@ -1091,6 +1092,93 @@ test("localFoodMatches: no match returns an empty array", function () {
   M.state.favorites = [];
   M.state.foodCache = {};
   assertEqual(M.localFoodMatches("zzz").length, 0, "no substring match");
+});
+
+// ==== recipe ingredient picker search (must behave exactly like the Food tab's search) ====
+// The picker used to search USDA/Open Food Facts only, on an explicit tap/Enter: a food Colin
+// had entered by hand or eaten before was simply unreachable while building a recipe, even
+// though the same food was one tap away on the Food tab. These pin the parity.
+function openIngredientPickerForTest() {
+  M.state.tab = "food";
+  M.state.ui = {};
+  const fu = M.foodUi();
+  fu.recipeBuilder = { editingId: null, name: "", ingredients: [], picker: null };
+  M.actions.openIngredientPicker();
+  return M.foodUi().recipeBuilder;
+}
+// Queries stay under 3 characters on purpose: the local group fires from the 1st character,
+// while the remote databases are only hit at 3+, so these never schedule a network call.
+test("ingredientQuery: previously-eaten and manually-added foods appear from the first character", function () {
+  M.state.recentFoods = [{ id: "man1", name: "Loonie Dog", source: "Manual Entry", per100g: false, loggedWeight: 83, calories: 235, protein: 8, carbs: 20, fat: 14 }];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+  const rb = openIngredientPickerForTest();
+  M.inputActions.ingredientQuery("l");
+  assertEqual(rb.picker.historyResults.length, 1, "local match from a single character");
+  assertEqual(rb.picker.historyResults[0].name, "Loonie Dog", "the hand-entered food is reachable while building a recipe");
+  assertEqual(rb.picker.results.length, 0, "database group stays empty until the debounced search returns");
+});
+test("ingredientQuery: also matches by brand, same rule as the Food tab", function () {
+  M.state.recentFoods = [{ id: "man2", name: "Loonie Dog", brand: "Schneiders", source: "Manual Entry", calories: 235, protein: 8, carbs: 20, fat: 14 }];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+  const rb = openIngredientPickerForTest();
+  M.inputActions.ingredientQuery("sc");
+  assertEqual(rb.picker.historyResults.length, 1, "brand match, not just name");
+});
+test("ingredientQuery: clearing the box clears the local group", function () {
+  M.state.recentFoods = [{ id: "man3", name: "Chili", source: "Manual Entry", calories: 100, protein: 8, carbs: 5, fat: 4 }];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+  const rb = openIngredientPickerForTest();
+  M.inputActions.ingredientQuery("ch");
+  assertEqual(rb.picker.historyResults.length, 1, "matched first");
+  M.inputActions.ingredientQuery("");
+  assertEqual(rb.picker.historyResults.length, 0, "empty query shows nothing");
+});
+// The "Eaten before" rows can originate from favorites or the food cache, not just
+// recentFoods, so selectIngredientFood has to search historyResults itself -- inferring the
+// source list from srcTab alone would drop a cache-only hit on the floor (tapped, nothing
+// happens), which is exactly the bug selectFoodForAdd was already fixed for.
+test("selectIngredientFood: resolves a food that only exists in the local history group", function () {
+  M.state.recentFoods = [];
+  M.state.favorites = [];
+  M.state.foodCache = { c9: { id: "c9", name: "Quinoa", source: "USDA", per100g: true, calories: 120, protein: 4, carbs: 21, fat: 2 } };
+  const rb = openIngredientPickerForTest();
+  M.inputActions.ingredientQuery("qu");
+  M.actions.selectIngredientFood("c9", "history");
+  assertEqual(!!rb.picker.selecting, true, "the tapped row actually opened the portion screen");
+  assertEqual(rb.picker.selecting.name, "Quinoa", "resolved the cached food");
+  assertEqual(rb.picker.servingBasis, null, "serving basis reset for the newly picked food");
+  assertEqual(rb.picker.qty, "1", "quantity reset alongside it");
+});
+test("selectIngredientFood: a database hit still resolves from the results list", function () {
+  M.state.recentFoods = [];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+  const rb = openIngredientPickerForTest();
+  rb.picker.results = [{ id: "usda_1", name: "Brown Rice", source: "USDA", per100g: true, calories: 112, protein: 2.6, carbs: 24, fat: 0.9 }];
+  M.actions.selectIngredientFood("usda_1");
+  assertEqual(rb.picker.selecting.name, "Brown Rice", "database group unaffected by the new history lookup");
+});
+test("renderIngredientResultsBlock: labels both groups and wires rows to the picker's own action", function () {
+  const pk = {
+    query: "rice", searching: false,
+    historyResults: [{ id: "h1", name: "Leftover Rice", source: "Manual Entry", calories: 130, protein: 3, carbs: 28, fat: 0 }],
+    results: [{ id: "usda_2", name: "Brown Rice", source: "USDA", calories: 112, protein: 2.6, carbs: 24, fat: 0.9 }],
+  };
+  const html = M.renderIngredientResultsBlock(pk);
+  assertEqual(html.indexOf("Eaten before") >= 0, true, "local group header rendered");
+  assertEqual(html.indexOf("Food databases") >= 0, true, "database group header rendered");
+  assertEqual(html.indexOf('data-action="selectIngredientFood"') >= 0, true, "rows target the picker, not the Food tab");
+  assertEqual(html.indexOf('data-action="selectFoodForAdd"') >= 0, false, "no leakage of the Food tab's action into the picker");
+});
+test("renderFoodResultGroups: the Food tab's own rows keep their default action", function () {
+  const html = M.renderFoodResultGroups({
+    history: [{ id: "h2", name: "Oats", source: "USDA", calories: 389, protein: 17, carbs: 66, fat: 7 }],
+    dbResults: [], searching: false, query: "oats", action: "selectFoodForAdd", emptyText: "none",
+  });
+  assertEqual(html.indexOf('data-action="selectFoodForAdd"') >= 0, true, "unchanged behaviour for the search screen");
 });
 
 // ==== navigation depth (back-button model) ====
