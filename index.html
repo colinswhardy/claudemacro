@@ -187,7 +187,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.13";
+const APP_VERSION = "1.14";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -2324,7 +2324,7 @@ actions.copyEntryCustomDate = function() {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null, editingFoodId: null, foodEditSection: "macros", foodEditBaseInput: null, foodEditNameInput: null, foodEditBrandInput: null, foodEditAnimalOverrideInput: undefined };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], recipeResults: [], recipesQuery: "", searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null, editingFoodId: null, foodEditSection: "macros", foodEditBaseInput: null, foodEditNameInput: null, foodEditBrandInput: null, foodEditAnimalOverrideInput: undefined };
   return state.ui.food;
 }
 
@@ -2402,38 +2402,54 @@ function renderFoodTab() {
 
   if (fu.subTab === "recipes") {
     html += '<div class="row" style="margin-bottom:16px">' + btn({ label: "\u2795 New Recipe", action: "newRecipe", full: true }) + '</div>';
-    if (state.recipes.length === 0) {
-      html += card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No recipes yet. Build one from a set of ingredients and reuse it any time.</div>');
-    } else {
-      state.recipes.forEach(function(recipe) {
-        const totals = sumRecipeIngredients(recipe.ingredients);
-        html += '<div class="foodEntry">' +
-          '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
-            '<div style="flex:1;min-width:0"><div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(recipe.name) + '</div>' +
-            '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">' + recipe.ingredients.length + ' ingredient' + (recipe.ingredients.length === 1 ? "" : "s") + ' \u2022 ' + round1(totals.weight) + 'g</div></div>' +
-            '<div style="text-align:right"><span style="color:' + C.calories + ';font-weight:700">' + Math.round(totals.calories) + '</span><span style="color:' + C.textMut + ';font-size:11px"> kcal</span></div>' +
-          '</div>' +
-          '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
-            '<span style="color:' + C.protein + '">P: ' + round1(totals.protein) + 'g</span>' +
-            '<span style="color:' + C.carbs + '">C: ' + round1(totals.carbs) + 'g</span>' +
-            '<span style="color:' + C.fat + '">F: ' + round1(totals.fat) + 'g</span>' +
-          '</div>' +
-          (fu.confirmDeleteRecipeId === recipe.id ?
-            '<div class="row" style="margin-top:10px">' +
-              btn({ label: "Cancel", action: "cancelDeleteRecipe", small: true, outline: true, full: true }) +
-              btn({ label: "Delete Recipe?", action: "deleteRecipe", arg: recipe.id, small: true, full: true, color: "danger" }) +
-            '</div>'
-          :
-            '<div class="row" style="margin-top:10px">' +
-              btn({ label: "Log", action: "logRecipe", arg: recipe.id, small: true }) +
-              btn({ label: "Edit", action: "editRecipe", arg: recipe.id, small: true, outline: true }) +
-              btn({ label: "\u{1F5D1}", action: "askDeleteRecipe", arg: recipe.id, small: true, outline: true, color: "danger" }) +
-            '</div>'
-          ) + '</div>';
-      });
+    if (state.recipes.length > 0) {
+      html += '<div class="row" style="margin-bottom:12px">' +
+        textInput({ id: "recipesQueryInput", value: fu.recipesQuery, placeholder: "Search recipes...", bind: "recipesQuery", style: "flex:1" }) +
+      '</div>';
     }
+    html += '<div id="recipesListBlock">' + renderRecipesListBlock(fu) + '</div>';
   }
 
+  return html;
+}
+
+// Split out of renderFoodTab for the same reason as the History/Favorites lists: patched into
+// #recipesListBlock as the filter is typed, never via rerender(), which would blur the input.
+function renderRecipesListBlock(fu) {
+  if (state.recipes.length === 0) {
+    return card('<div style="text-align:center;padding:30px;color:' + C.textMut + '">No recipes yet. Build one from a set of ingredients and reuse it any time.</div>');
+  }
+  const list = filterRecipesByQuery(state.recipes, fu.recipesQuery);
+  if (list.length === 0) {
+    return '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No matches for \u201c' + esc(fu.recipesQuery) + '\u201d</div>';
+  }
+  let html = '';
+  list.forEach(function(recipe) {
+    const totals = sumRecipeIngredients(recipe.ingredients);
+    html += '<div class="foodEntry">' +
+      '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+        '<div style="flex:1;min-width:0"><div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(recipe.name) + '</div>' +
+        '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">' + recipe.ingredients.length + ' ingredient' + (recipe.ingredients.length === 1 ? "" : "s") + ' \u2022 ' + round1(totals.weight) + 'g</div></div>' +
+        '<div style="text-align:right"><span style="color:' + C.calories + ';font-weight:700">' + Math.round(totals.calories) + '</span><span style="color:' + C.textMut + ';font-size:11px"> kcal</span></div>' +
+      '</div>' +
+      '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
+        '<span style="color:' + C.protein + '">P: ' + round1(totals.protein) + 'g</span>' +
+        '<span style="color:' + C.carbs + '">C: ' + round1(totals.carbs) + 'g</span>' +
+        '<span style="color:' + C.fat + '">F: ' + round1(totals.fat) + 'g</span>' +
+      '</div>' +
+      (fu.confirmDeleteRecipeId === recipe.id ?
+        '<div class="row" style="margin-top:10px">' +
+          btn({ label: "Cancel", action: "cancelDeleteRecipe", small: true, outline: true, full: true }) +
+          btn({ label: "Delete Recipe?", action: "deleteRecipe", arg: recipe.id, small: true, full: true, color: "danger" }) +
+        '</div>'
+      :
+        '<div class="row" style="margin-top:10px">' +
+          btn({ label: "Log", action: "logRecipe", arg: recipe.id, small: true }) +
+          btn({ label: "Edit", action: "editRecipe", arg: recipe.id, small: true, outline: true }) +
+          btn({ label: "\u{1F5D1}", action: "askDeleteRecipe", arg: recipe.id, small: true, outline: true, color: "danger" }) +
+        '</div>'
+      ) + '</div>';
+  });
   return html;
 }
 
@@ -2480,32 +2496,46 @@ function resultsSectionHeader(label, color) {
 // ingredient picker's search -- the picker used to render database hits only, so a food Colin
 // had manually entered or eaten before was unreachable when building a recipe. Keeping one
 // renderer (rather than a parallel copy) is what stops the two screens drifting apart again.
+// Three groups, most-specific first: your own saved recipes, then foods you've eaten before,
+// then the online databases. Recipes lead because they're the thing you built deliberately --
+// and because they were previously unreachable from any search box at all.
 function renderFoodResultGroups(cfg) {
+  const recipes = cfg.recipes || [];
   const history = cfg.history || [];
   const dbResults = cfg.dbResults || [];
   let html = '';
+  let groupsSoFar = 0;
+  function separate() { if (groupsSoFar > 0) html += '<div style="height:6px"></div>'; groupsSoFar++; }
+
+  if (recipes.length > 0 && cfg.recipeAction) {
+    separate();
+    html += resultsSectionHeader("\u{1F372} Your recipes", C.primary);
+    recipes.forEach(function(recipe) { html += recipeResultRow(recipe, cfg.recipeAction); });
+  }
 
   if (history.length > 0) {
+    separate();
     html += resultsSectionHeader("★ Eaten before", C.warning);
     history.forEach(function(food) { html += foodResultRow(food, "history", cfg.action); });
   }
 
   if (dbResults.length > 0) {
-    if (history.length > 0) html += '<div style="height:6px"></div>';
+    separate();
     html += resultsSectionHeader("Food databases", C.textMut);
     dbResults.forEach(function(food) { html += foodResultRow(food, null, cfg.action); });
   }
 
   if (cfg.searching) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">Searching databases...</div>';
-  else if (history.length === 0 && dbResults.length === 0 && cfg.query) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">' + esc(cfg.emptyText) + '</div>';
+  else if (groupsSoFar === 0 && cfg.query) html += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">' + esc(cfg.emptyText) + '</div>';
   return html;
 }
 
 function renderFoodResultsBlock(fu) {
+  const recipes = fu.recipeResults || [];
   const history = fu.historyResults || [];
   const dbResults = fu.results || [];
   let html = '';
-  if (fu.wizardSuggestion && (history.length > 0 || dbResults.length > 0)) {
+  if (fu.wizardSuggestion && (recipes.length > 0 || history.length > 0 || dbResults.length > 0)) {
     const wc = WIZARD_CONFIGS[fu.wizardSuggestion];
     html += '<div style="padding:12px;background:' + C.primary + '11;border:1px solid ' + C.primary + '33;border-radius:12px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">' +
       '<span style="color:' + C.textSec + ';font-size:13px">' + wc.icon + ' Use ' + esc(wc.label) + ' Selection?</span>' +
@@ -2513,8 +2543,9 @@ function renderFoodResultsBlock(fu) {
       '</div>';
   }
   html += renderFoodResultGroups({
-    history: history, dbResults: dbResults, searching: fu.searching, query: fu.query,
-    action: "selectFoodForAdd", emptyText: "No results. Try AI estimation or manual entry.",
+    recipes: recipes, history: history, dbResults: dbResults, searching: fu.searching, query: fu.query,
+    action: "selectFoodForAdd", recipeAction: "logRecipe",
+    emptyText: "No results. Try AI estimation or manual entry.",
   });
   return html;
 }
@@ -2563,6 +2594,70 @@ function filterFoodsByQuery(list, query) {
   const q = (query || "").trim().toLowerCase();
   if (!q) return list;
   return list.filter(function(f){ return foodMatchesQuery(f, q); });
+}
+
+// ---- Recipes as a search result ----
+// Saved recipes used to be reachable only by going to the Recipes sub-tab and reading down the
+// list. They're matched by name only (a recipe has no brand, and matching ingredient names
+// would surface "Chili" for a search of "onion" -- a result the row gives no way to explain).
+function recipeMatchesQuery(recipe, q) {
+  if (!recipe) return false;
+  return String(recipe.name || "").toLowerCase().indexOf(q) >= 0;
+}
+// `q` already lowercased/trimmed by the caller, same contract as foodMatchesQuery.
+function matchingRecipes(q) {
+  return (state.recipes || []).filter(function(r){ return recipeMatchesQuery(r, q); });
+}
+function filterRecipesByQuery(list, query) {
+  const q = (query || "").trim().toLowerCase();
+  if (!q) return list;
+  return list.filter(function(r){ return recipeMatchesQuery(r, q); });
+}
+
+// Logging a recipe stores a snapshot food under the id "recipe_food_<recipeId>", so a recipe
+// eaten before matches BOTH groups and would otherwise render twice under the same name. The
+// recipe row wins here (unlike dbResultsExcludingHistory, where history wins): it re-reads the
+// recipe's current ingredients, whereas the snapshot is frozen at whatever the recipe looked
+// like the day it was logged and silently goes stale the moment the recipe is edited.
+function recipeSnapshotFoodId(recipeId) { return "recipe_food_" + recipeId; }
+function historyExcludingRecipes(recipeList, historyFoods) {
+  const shown = new Set((recipeList || []).map(function(r){ return recipeSnapshotFoodId(r.id); }));
+  return (historyFoods || []).filter(function(f){ return !shown.has(f.id); });
+}
+
+// A recipe rendered as one food: its ingredient totals, anchored to the recipe's own full
+// weight via baseGrams so calcMacrosForWeight scales a partial portion correctly. Used where a
+// recipe has to behave like any other food (currently: as an ingredient of another recipe).
+function recipeAsFood(recipe) {
+  const t = sumRecipeIngredients(recipe.ingredients);
+  const w = positiveGramsOr(t.weight, 100);
+  return {
+    id: recipeSnapshotFoodId(recipe.id), name: recipe.name, source: "Recipe", per100g: false,
+    calories: Math.round(t.calories), protein: round1(t.protein), carbs: round1(t.carbs),
+    fat: round1(t.fat), fiber: round1(t.fiber),
+    state: "—", loggedWeight: w, baseGrams: w,
+    servingSizes: [{ label: "Full recipe", grams: w }],
+  };
+}
+
+function recipeResultRow(recipe, action) {
+  const t = sumRecipeIngredients(recipe.ingredients);
+  const w = round1(t.weight);
+  const n = (recipe.ingredients || []).length;
+  return '<div class="foodResult" data-action="' + action + '" data-arg="' + esc_attr(recipe.id) + '">' +
+    '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+      '<div style="flex:1;min-width:0">' +
+        '<div style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(recipe.name) + '</div>' +
+        '<div style="color:' + C.textMut + ';font-size:12px">' + n + ' ingredient' + (n === 1 ? "" : "s") + '</div>' +
+        '<div class="rowWrap" style="margin-top:6px">' + badge("Recipe", C.primary) + '</div>' +
+      '</div>' +
+      '<div style="text-align:right"><div style="color:' + C.calories + ';font-weight:700">' + Math.round(t.calories) + '</div><div style="color:' + C.textMut + ';font-size:11px">kcal/' + w + 'g</div></div>' +
+    '</div>' +
+    '<div style="display:flex;gap:10px;margin-top:8px;font-size:12px">' +
+      '<span style="color:' + C.protein + '">P: ' + round1(t.protein) + 'g</span>' +
+      '<span style="color:' + C.carbs + '">C: ' + round1(t.carbs) + 'g</span>' +
+      '<span style="color:' + C.fat + '">F: ' + round1(t.fat) + 'g</span>' +
+    '</div></div>';
 }
 
 // Split out of renderFoodTab, same reason as renderFoodResultsBlock above: patched into
@@ -2800,6 +2895,11 @@ inputActions.favoritesQuery = function(val) {
   const el = document.getElementById("favoritesListBlock");
   if (el) el.innerHTML = renderFavoritesListBlock(foodUi());
 };
+inputActions.recipesQuery = function(val) {
+  foodUi().recipesQuery = val;
+  const el = document.getElementById("recipesListBlock");
+  if (el) el.innerHTML = renderRecipesListBlock(foodUi());
+};
 
 actions.setFoodSubTab = function(key) { foodUi().subTab = key; rerender(); };
 
@@ -2814,9 +2914,11 @@ inputActions.foodQuery = function(val) {
   clearTimeout(foodSearchDebounceTimer);
 
   const q = val.trim().toLowerCase();
-  // Previously-eaten foods appear from the very first character -- it's a local, synchronous
-  // lookup with no network cost, and surfacing them instantly is the whole point of the group.
-  fu.historyResults = q.length >= 1 ? localFoodMatches(q) : [];
+  // Saved recipes and previously-eaten foods appear from the very first character -- both are
+  // local, synchronous lookups with no network cost, and surfacing them instantly is the whole
+  // point of those groups.
+  fu.recipeResults = q.length >= 1 ? matchingRecipes(q) : [];
+  fu.historyResults = q.length >= 1 ? historyExcludingRecipes(fu.recipeResults, localFoodMatches(q)) : [];
   fu.results = []; // database hits arrive below, once the debounced search returns
   fu.searching = false;
   patchFoodResultsBlock();
@@ -2846,7 +2948,8 @@ async function liveFoodSearch(q, mySeq) {
   const offP = searchOpenFoodFacts(q);
   const usda = await usdaP, off = await offP;
   if (mySeq !== foodSearchSeq) return; // superseded by further typing or an explicit search
-  fu.historyResults = localFoodMatches(q);
+  fu.recipeResults = matchingRecipes(q);
+  fu.historyResults = historyExcludingRecipes(fu.recipeResults, localFoodMatches(q));
   fu.results = dbResultsExcludingHistory(fu.historyResults, usda.concat(off));
   fu.searching = false;
   patchFoodResultsBlock();
@@ -2861,7 +2964,8 @@ actions.doFoodSearch = async function() {
   const qLower = q.toLowerCase();
   fu.searching = true;
   fu.wizardSuggestion = detectWizard(fu.query);
-  fu.historyResults = localFoodMatches(qLower);
+  fu.recipeResults = matchingRecipes(qLower);
+  fu.historyResults = historyExcludingRecipes(fu.recipeResults, localFoodMatches(qLower));
   fu.results = [];
   rerender();
 
@@ -2869,7 +2973,8 @@ actions.doFoodSearch = async function() {
   const offP = searchOpenFoodFacts(q);
   const usda = await usdaP, off = await offP;
   if (mySeq !== foodSearchSeq) return; // superseded by further typing or another explicit search
-  fu.historyResults = localFoodMatches(qLower);
+  fu.recipeResults = matchingRecipes(qLower);
+  fu.historyResults = historyExcludingRecipes(fu.recipeResults, localFoodMatches(qLower));
   fu.results = dbResultsExcludingHistory(fu.historyResults, usda.concat(off));
   fu.searching = false;
   rerender();
@@ -3200,7 +3305,7 @@ function renderRecipeBuilderScreen(fu) {
 actions.openIngredientPicker = function() {
   const rb = foodUi().recipeBuilder;
   if (!rb) return;
-  rb.picker = { mode: "search", query: "", results: [], historyResults: [], searching: false, selecting: null, weight: "100", servingBasis: null, qty: "1", manual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" } };
+  rb.picker = { mode: "search", query: "", results: [], historyResults: [], recipeResults: [], searching: false, selecting: null, weight: "100", servingBasis: null, qty: "1", manual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" } };
   rerender();
 };
 actions.closeIngredientPicker = function() {
@@ -3229,10 +3334,19 @@ function ingredientPickerIsCurrent(pk) {
   return !!(rb && rb.picker === pk);
 }
 
+// A saved recipe can be dropped into another recipe as a single ingredient (a sauce inside a
+// meal, say) -- except itself: while editing a recipe it's excluded from its own ingredient
+// search, since its totals at that moment are exactly what's being edited.
+function pickerRecipeMatches(rb, q) {
+  return matchingRecipes(q).filter(function(r){ return r.id !== rb.editingId; });
+}
+
 function renderIngredientResultsBlock(pk) {
   return renderFoodResultGroups({
-    history: pk.historyResults, dbResults: pk.results, searching: pk.searching, query: pk.query,
-    action: "selectIngredientFood", emptyText: "No results. Try Manual instead.",
+    recipes: pk.recipeResults, history: pk.historyResults, dbResults: pk.results,
+    searching: pk.searching, query: pk.query,
+    action: "selectIngredientFood", recipeAction: "selectIngredientRecipe",
+    emptyText: "No results. Try Manual instead.",
   });
 }
 function patchIngredientResultsBlock() {
@@ -3253,7 +3367,8 @@ inputActions.ingredientQuery = function(val) {
   clearTimeout(ingredientSearchDebounceTimer);
 
   const q = val.trim().toLowerCase();
-  pk.historyResults = q.length >= 1 ? localFoodMatches(q) : [];
+  pk.recipeResults = q.length >= 1 ? pickerRecipeMatches(rb, q) : [];
+  pk.historyResults = q.length >= 1 ? historyExcludingRecipes(pk.recipeResults, localFoodMatches(q)) : [];
   pk.results = [];
   pk.searching = false;
   patchIngredientResultsBlock();
@@ -3271,7 +3386,8 @@ async function liveIngredientSearch(q, mySeq, pk) {
   const offP = searchOpenFoodFacts(q);
   const usda = await usdaP, off = await offP;
   if (mySeq !== ingredientSearchSeq || !ingredientPickerIsCurrent(pk)) return;
-  pk.historyResults = localFoodMatches(q);
+  pk.recipeResults = pickerRecipeMatches(foodUi().recipeBuilder, q);
+  pk.historyResults = historyExcludingRecipes(pk.recipeResults, localFoodMatches(q));
   pk.results = dbResultsExcludingHistory(pk.historyResults, usda.concat(off));
   pk.searching = false;
   patchIngredientResultsBlock();
@@ -3287,7 +3403,8 @@ actions.doIngredientSearch = async function() {
   const mySeq = ++ingredientSearchSeq;
   const qLower = q.toLowerCase();
   pk.searching = true;
-  pk.historyResults = localFoodMatches(qLower);
+  pk.recipeResults = pickerRecipeMatches(rb, qLower);
+  pk.historyResults = historyExcludingRecipes(pk.recipeResults, localFoodMatches(qLower));
   pk.results = [];
   rerender();
 
@@ -3295,7 +3412,8 @@ actions.doIngredientSearch = async function() {
   const offP = searchOpenFoodFacts(q);
   const usda = await usdaP, off = await offP;
   if (mySeq !== ingredientSearchSeq || !ingredientPickerIsCurrent(pk)) return;
-  pk.historyResults = localFoodMatches(qLower);
+  pk.recipeResults = pickerRecipeMatches(rb, qLower);
+  pk.historyResults = historyExcludingRecipes(pk.recipeResults, localFoodMatches(qLower));
   pk.results = dbResultsExcludingHistory(pk.historyResults, usda.concat(off));
   pk.searching = false;
   rerender();
@@ -3314,6 +3432,21 @@ actions.selectIngredientFood = function(foodId, srcTab) {
   if (!food) food = state.foodCache[foodId];
   if (!food) return;
   pk.selecting = food;
+  pk.weight = "";
+  pk.servingBasis = null; pk.qty = "1";
+  pendingFocusId = "ingredientWeightInput";
+  rerender();
+};
+// Tapping a recipe in the ingredient picker flattens it into one food (recipeAsFood) and drops
+// into the same portion screen every other ingredient uses, so confirmAddIngredient needs no
+// special case -- the recipe lands as a single ingredient row named after itself.
+actions.selectIngredientRecipe = function(recipeId) {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker) return;
+  const recipe = (state.recipes || []).find(function(r){ return r.id === recipeId; });
+  if (!recipe || recipe.id === rb.editingId) return;
+  const pk = rb.picker;
+  pk.selecting = recipeAsFood(recipe);
   pk.weight = "";
   pk.servingBasis = null; pk.qty = "1";
   pendingFocusId = "ingredientWeightInput";
@@ -3666,7 +3799,7 @@ actions.confirmAddFood = function() {
   // portion, so each re-add silently rescaled the food (400g/500kcal re-added at 200g then back
   // at 400g came out as 1000 kcal), compounding every time.
   addFoodToLog(Object.assign({}, anchorFoodBase(food), { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString() }));
-  fu.query = ""; fu.results = []; fu.historyResults = [];
+  fu.query = ""; fu.results = []; fu.historyResults = []; fu.recipeResults = [];
   stepBackOneLevel();
 };
 
@@ -4302,7 +4435,7 @@ actions.wizardConfirmAdd = function() {
   const m = calcMacrosForWeight(wiz.selectedFood, w);
   // Same base-anchor rule as confirmAddFood -- freeze before loggedWeight is overwritten.
   addFoodToLog(Object.assign({}, anchorFoodBase(wiz.selectedFood), { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString(), wizardUsed: true }));
-  fu.query = ""; fu.results = []; fu.historyResults = [];
+  fu.query = ""; fu.results = []; fu.historyResults = []; fu.recipeResults = [];
   stepBackOneLevel();
 };
 

@@ -105,6 +105,8 @@ const exportLine =
   "barcodeCodeForEntry: barcodeCodeForEntry, weightChartXPositions: weightChartXPositions, " +
   "dbResultsExcludingHistory: dbResultsExcludingHistory, " +
   "renderFoodResultGroups: renderFoodResultGroups, renderIngredientResultsBlock: renderIngredientResultsBlock, " +
+  "recipeMatchesQuery: recipeMatchesQuery, matchingRecipes: matchingRecipes, filterRecipesByQuery: filterRecipesByQuery, " +
+  "historyExcludingRecipes: historyExcludingRecipes, recipeAsFood: recipeAsFood, renderRecipesListBlock: renderRecipesListBlock, " +
   "foodBaseGrams: foodBaseGrams, foodQuantityLabel: foodQuantityLabel, " +
   "isAnimalProteinEntry: isAnimalProteinEntry, entryBrandLine: entryBrandLine, entryHasZeroMacros: entryHasZeroMacros, " +
   "addFoodToLog: addFoodToLog, updateFoodEntry: updateFoodEntry, " +
@@ -1173,6 +1175,139 @@ test("renderIngredientResultsBlock: labels both groups and wires rows to the pic
   assertEqual(html.indexOf('data-action="selectIngredientFood"') >= 0, true, "rows target the picker, not the Food tab");
   assertEqual(html.indexOf('data-action="selectFoodForAdd"') >= 0, false, "no leakage of the Food tab's action into the picker");
 });
+// ==== recipes as search results (reachable without going to the Recipes sub-tab) ====
+function recipeFixture(id, name, ingredients) {
+  return { id: id, name: name, ingredients: ingredients, createdAt: "2026-07-01T00:00:00.000Z" };
+}
+const CHILI = recipeFixture("r_chili", "Beef Chili", [
+  { id: "i1", name: "Ground Beef", weight: 400, calories: 800, protein: 70, carbs: 0, fat: 56, fiber: 0 },
+  { id: "i2", name: "Kidney Beans", weight: 200, calories: 250, protein: 15, carbs: 45, fat: 1, fiber: 12 },
+]);
+test("recipeMatchesQuery: case-insensitive substring on the recipe name", function () {
+  assertEqual(M.recipeMatchesQuery(CHILI, "chil"), true, "substring match");
+  assertEqual(M.recipeMatchesQuery(CHILI, "beef"), true, "matches anywhere in the name");
+  assertEqual(M.recipeMatchesQuery(CHILI, "zzz"), false, "no match");
+  assertEqual(M.recipeMatchesQuery(null, "x"), false, "null recipe does not throw");
+  assertEqual(M.recipeMatchesQuery({ id: "r0" }, "x"), false, "a recipe with no name does not throw");
+});
+test("matchingRecipes: finds saved recipes by name", function () {
+  M.state.recipes = [CHILI, recipeFixture("r_oats", "Overnight Oats", [])];
+  assertEqual(M.matchingRecipes("oat").length, 1, "one match");
+  assertEqual(M.matchingRecipes("oat")[0].name, "Overnight Oats", "the right one");
+  assertEqual(M.matchingRecipes("e").length, 2, "both match a common letter");
+});
+test("filterRecipesByQuery: an empty query returns the whole list (Recipes sub-tab default)", function () {
+  const list = [CHILI, recipeFixture("r_oats", "Overnight Oats", [])];
+  assertEqual(M.filterRecipesByQuery(list, "").length, 2, "unfiltered");
+  assertEqual(M.filterRecipesByQuery(list, "  ").length, 2, "whitespace-only is still unfiltered");
+  assertEqual(M.filterRecipesByQuery(list, "chili").length, 1, "filtered");
+});
+// Logging a recipe leaves a "recipe_food_<id>" snapshot in recentFoods, so without this the
+// same name renders in both the recipes group and the "Eaten before" group.
+test("historyExcludingRecipes: drops the logged snapshot of a recipe already shown as a recipe", function () {
+  const history = [
+    { id: "recipe_food_r_chili", name: "Beef Chili", source: "Recipe" },
+    { id: "man1", name: "Chili Powder", source: "Manual Entry" },
+  ];
+  const out = M.historyExcludingRecipes([CHILI], history);
+  assertEqual(out.length, 1, "snapshot removed");
+  assertEqual(out[0].id, "man1", "unrelated history entry kept");
+});
+test("historyExcludingRecipes: leaves history alone when no recipes matched", function () {
+  const history = [{ id: "recipe_food_r_chili", name: "Beef Chili", source: "Recipe" }];
+  assertEqual(M.historyExcludingRecipes([], history).length, 1, "no recipes group means nothing to de-dupe against");
+  assertEqual(M.historyExcludingRecipes(null, history).length, 1, "null recipe list treated as empty");
+});
+test("foodQuery: a saved recipe surfaces from the first character typed into the Food tab search", function () {
+  M.state.tab = "food";
+  M.state.ui = {};
+  M.state.recipes = [CHILI];
+  M.state.recentFoods = [{ id: "recipe_food_r_chili", name: "Beef Chili", source: "Recipe", calories: 1050, protein: 85, carbs: 45, fat: 57 }];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+  const fu = M.foodUi();
+  M.inputActions.foodQuery("ch");
+  assertEqual(fu.recipeResults.length, 1, "recipe found without visiting the Recipes tab");
+  assertEqual(fu.recipeResults[0].name, "Beef Chili", "the right recipe");
+  assertEqual(fu.historyResults.length, 0, "its stale logged snapshot is not also listed");
+});
+test("recipeAsFood: anchors macros to the recipe's own full weight, so a part portion scales", function () {
+  const food = M.recipeAsFood(CHILI);
+  assertEqual(food.baseGrams, 600, "400g beef + 200g beans");
+  assertEqual(food.calories, 1050, "summed ingredient calories");
+  assertEqual(M.calcMacrosForWeight(food, 600).calories, 1050, "full recipe returns the full total");
+  assertEqual(M.calcMacrosForWeight(food, 300).calories, 525, "half the recipe is half the calories");
+});
+test("recipeAsFood: a recipe with no weighed ingredients falls back to a 100g base, never 0", function () {
+  const empty = M.recipeAsFood(recipeFixture("r_empty", "Empty", []));
+  assertEqual(empty.baseGrams, 100, "no divide-by-zero base");
+});
+test("selectIngredientRecipe: nests a saved recipe into the recipe being built", function () {
+  M.state.recipes = [CHILI];
+  const rb = openIngredientPickerForTest();
+  M.actions.selectIngredientRecipe("r_chili");
+  assertEqual(rb.picker.selecting.name, "Beef Chili", "opened the portion screen for the recipe");
+  assertEqual(rb.picker.selecting.baseGrams, 600, "carried its full-recipe anchor");
+  rb.picker.weight = "300";
+  M.actions.confirmAddIngredient();
+  assertEqual(rb.ingredients.length, 1, "added as a single ingredient row");
+  assertEqual(rb.ingredients[0].name, "Beef Chili", "named after the recipe");
+  assertEqual(rb.ingredients[0].calories, 525, "scaled to the 300g picked");
+});
+test("selectIngredientRecipe: a recipe cannot be added to itself", function () {
+  M.state.recipes = [CHILI];
+  const rb = openIngredientPickerForTest();
+  rb.editingId = "r_chili";
+  M.actions.selectIngredientRecipe("r_chili");
+  assertEqual(rb.picker.selecting, null, "self-nesting refused");
+  M.inputActions.ingredientQuery("ch");
+  assertEqual(rb.picker.recipeResults.length, 0, "and it is not even offered while being edited");
+});
+test("renderFoodResultGroups: the recipes group leads and uses the caller's recipe action", function () {
+  M.state.recipes = [CHILI];
+  const html = M.renderFoodResultGroups({
+    recipes: [CHILI],
+    history: [{ id: "h3", name: "Chili Powder", source: "Manual Entry", calories: 10, protein: 0, carbs: 2, fat: 0 }],
+    dbResults: [], searching: false, query: "chili",
+    action: "selectFoodForAdd", recipeAction: "logRecipe", emptyText: "none",
+  });
+  assertEqual(html.indexOf("Your recipes") >= 0, true, "recipes group header rendered");
+  assertEqual(html.indexOf("Your recipes") < html.indexOf("Eaten before"), true, "recipes listed above eaten-before");
+  assertEqual(html.indexOf('data-action="logRecipe"') >= 0, true, "recipe rows open the log-recipe screen");
+});
+test("renderIngredientResultsBlock: recipe rows target the picker's nesting action instead", function () {
+  const html = M.renderIngredientResultsBlock({
+    query: "chili", searching: false, recipeResults: [CHILI], historyResults: [], results: [],
+  });
+  assertEqual(html.indexOf('data-action="selectIngredientRecipe"') >= 0, true, "nests rather than logs");
+  assertEqual(html.indexOf('data-action="logRecipe"') >= 0, false, "the Food tab's recipe action does not leak in");
+});
+test("renderFoodResultGroups: the empty-results message only shows when all three groups are empty", function () {
+  const withRecipe = M.renderFoodResultGroups({
+    recipes: [CHILI], history: [], dbResults: [], searching: false, query: "chili",
+    action: "selectFoodForAdd", recipeAction: "logRecipe", emptyText: "No results.",
+  });
+  assertEqual(withRecipe.indexOf("No results.") >= 0, false, "a recipe-only match is not 'no results'");
+  const withNothing = M.renderFoodResultGroups({
+    recipes: [], history: [], dbResults: [], searching: false, query: "zzz",
+    action: "selectFoodForAdd", recipeAction: "logRecipe", emptyText: "No results.",
+  });
+  assertEqual(withNothing.indexOf("No results.") >= 0, true, "genuinely empty still says so");
+});
+test("renderRecipesListBlock: the Recipes sub-tab filter narrows the list", function () {
+  M.state.recipes = [CHILI, recipeFixture("r_oats", "Overnight Oats", [])];
+  M.state.ui = {};
+  const fu = M.foodUi();
+  fu.recipesQuery = "oat";
+  const html = M.renderRecipesListBlock(fu);
+  assertEqual(html.indexOf("Overnight Oats") >= 0, true, "match shown");
+  assertEqual(html.indexOf("Beef Chili") >= 0, false, "non-match hidden");
+  fu.recipesQuery = "zzz";
+  assertEqual(M.renderRecipesListBlock(fu).indexOf("No matches for") >= 0, true, "empty filter state");
+  fu.recipesQuery = "";
+  assertEqual(M.renderRecipesListBlock(fu).indexOf("Beef Chili") >= 0, true, "cleared filter shows everything again");
+});
+
 test("renderFoodResultGroups: the Food tab's own rows keep their default action", function () {
   const html = M.renderFoodResultGroups({
     history: [{ id: "h2", name: "Oats", source: "USDA", calories: 389, protein: 17, carbs: 66, fat: 7 }],
