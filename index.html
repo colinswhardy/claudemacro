@@ -187,7 +187,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.11";
+const APP_VERSION = "1.12";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -366,6 +366,33 @@ async function getValidAccessToken() {
   return refreshed ? refreshed.accessToken : null;
 }
 
+// keepalive lets a request survive the tab being backgrounded or torn down -- exactly what
+// happens when someone logs food and immediately locks their phone -- but the Fetch spec gives
+// keepalive requests a hard 64KiB body quota, SHARED across all in-flight keepalive requests.
+// A fetch over that quota doesn't degrade or truncate: it REJECTS IMMEDIATELY, client-side,
+// with a bare TypeError and no network request at all -- invisible in server logs, and (before
+// v1.10 surfaced sync errors) invisible in the app too.
+//
+// That was a real, shipped outage, not a hypothetical: the weights push sends the entire
+// weight history every time, which after a multi-year CSV import was ~170KB of JSON. The day
+// keepalive was added, every weight push started rejecting instantly -- weights kept saving
+// locally and simply never reached the cloud again, while smaller pushes (food logs, blobs)
+// kept working. The food-log payload was itself ~1KB from the same cliff when this was found.
+//
+// So keepalive is requested only when the body fits a conservative slice of the quota (small
+// enough that a few concurrent pushes can share the 64KiB), and a keepalive fetch that rejects
+// is retried once WITHOUT keepalive -- nothing was sent, so there is no duplicate risk. The
+// non-keepalive retry costs the survive-teardown property, but an unsent request protects
+// nothing anyway; the debounced-sync retry path is what actually covers that case.
+const KEEPALIVE_BODY_BUDGET_BYTES = 24000;
+function utf8ByteLength(s) {
+  if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(s).length;
+  return s.length * 2; // no TextEncoder (very old engine): overcount, so we only ever under-use the quota
+}
+function fitsKeepaliveQuota(bodyStr) {
+  return bodyStr == null || utf8ByteLength(bodyStr) <= KEEPALIVE_BODY_BUDGET_BYTES;
+}
+
 // Generic PostgREST call against a table under /rest/v1/. Attaches the current user's
 // access token (required for RLS to identify them) plus the project apikey header.
 // Returns { data } on success or { error } on failure; never throws.
@@ -373,20 +400,31 @@ async function supabaseTable(path, options) {
   options = options || {};
   const token = await getValidAccessToken();
   if (!token) return { error: "Not signed in or offline" };
-  try {
-    const r = await fetch(SUPABASE_URL + "/rest/v1/" + path, {
+  const bodyStr = options.body ? JSON.stringify(options.body) : undefined;
+  const requestInit = function(useKeepalive) {
+    return {
       method: options.method || "GET",
       headers: Object.assign({
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": "Bearer " + token,
         "Content-Type": "application/json",
       }, options.headers || {}),
-      body: options.body ? JSON.stringify(options.body) : undefined,
-      // Lets the request complete even if the tab is backgrounded or torn down right after it
-      // starts -- exactly what happens when someone logs food and immediately locks their
-      // phone. Bodies here are small JSON blobs, well under keepalive's ~64KB combined limit.
-      keepalive: true,
-    });
+      body: bodyStr,
+      keepalive: useKeepalive,
+    };
+  };
+  const wantKeepalive = fitsKeepaliveQuota(bodyStr);
+  try {
+    let r;
+    try {
+      r = await fetch(SUPABASE_URL + "/rest/v1/" + path, requestInit(wantKeepalive));
+    } catch (e) {
+      // A keepalive fetch can be rejected pre-flight by the SHARED quota even when this body
+      // is small (other keepalive requests in flight count against it). Retry once without.
+      // A genuinely offline fetch just fails again immediately, which is the same outcome.
+      if (!wantKeepalive) throw e;
+      r = await fetch(SUPABASE_URL + "/rest/v1/" + path, requestInit(false));
+    }
     if (!r.ok) {
       const errBody = await r.json().catch(function(){ return {}; });
       return { error: errBody.message || errBody.error || ("HTTP " + r.status) };

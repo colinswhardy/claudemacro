@@ -80,6 +80,8 @@ const sandbox = {
   addEventListener: function () {},
   removeEventListener: function () {},
   screen: { orientation: null },
+  // Node's TextEncoder, forwarded so utf8ByteLength measures real UTF-8 bytes in tests too.
+  TextEncoder: TextEncoder,
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
@@ -119,6 +121,9 @@ const exportLine =
   "loadPendingDeletes: loadPendingDeletes, savePendingDeletes: savePendingDeletes, " +
   "hasPendingDelete: hasPendingDelete, enqueuePendingDelete: enqueuePendingDelete, " +
   "dequeuePendingDelete: dequeuePendingDelete, removeFoodFromLog: removeFoodFromLog, " +
+  "fitsKeepaliveQuota: fitsKeepaliveQuota, utf8ByteLength: utf8ByteLength, " +
+  "KEEPALIVE_BODY_BUDGET_BYTES: KEEPALIVE_BODY_BUDGET_BYTES, supabaseTable: supabaseTable, " +
+  "flattenWeightsForSync: flattenWeightsForSync, pushWeightsToCloud: pushWeightsToCloud, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -2056,5 +2061,91 @@ test("index.html contains no stray control bytes", function () {
   assertEqual(offenders, [], "no control bytes outside tab/newline/carriage-return");
 });
 
-console.log("\n" + pass + " passed, " + fail + " failed");
-process.exit(fail > 0 ? 1 : 0);
+// ============================================================
+// KEEPALIVE QUOTA -- the silent weight-sync outage
+// ============================================================
+// fetch({keepalive:true}) has a hard 64KiB body quota (shared across in-flight keepalive
+// requests); exceeding it rejects IMMEDIATELY with no network request -- invisible in server
+// logs. The weights push sends the full history (~170KB after a multi-year CSV import), so
+// the day keepalive shipped, every weight push started dying client-side while smaller pushes
+// kept working. These tests pin the two defences: big bodies never request keepalive, and a
+// keepalive rejection is retried once without it.
+test("fitsKeepaliveQuota: small bodies qualify, big bodies don't, absent body does", function () {
+  assertEqual(M.fitsKeepaliveQuota("{\"a\":1}"), true, "small JSON fits");
+  assertEqual(M.fitsKeepaliveQuota(null), true, "no body (GET) always qualifies");
+  assertEqual(M.fitsKeepaliveQuota("x".repeat(M.KEEPALIVE_BODY_BUDGET_BYTES + 1)), false, "over budget is excluded");
+});
+test("utf8ByteLength: counts bytes, not UTF-16 code units", function () {
+  assertEqual(M.utf8ByteLength("abc"), 3, "ASCII is 1 byte per char");
+  // A char like 'é' is 1 UTF-16 unit but 2 UTF-8 bytes; multibyte content must not sneak a
+  // too-large body under the quota by being measured in .length.
+  assertEqual(M.utf8ByteLength("é") > 1, true, "multibyte chars measured as bytes");
+});
+test("the real weights payload shape at 694 rows exceeds the keepalive budget", function () {
+  // Reconstructs the outage arithmetic: rows in the exact shape flattenWeightsForSync sends,
+  // at the row count the production table held when the sync died.
+  M.state.session = { userId: "82a3a1b2-d5ba-4a9b-9cfd-c13ad83d9e26", accessToken: "t", refreshToken: "r", expiresAt: Date.now() + 3600000 };
+  M.state.weights = {};
+  const d = new Date(2022, 0, 20);
+  for (let i = 0; i < 694; i++) {
+    const key = M.fmtDate(d);
+    M.state.weights[key] = { weight: 180.4, unit: "lbs", timestamp: "2026-07-17T16:49:04.227Z", updatedAt: "2026-07-17T16:49:04.227Z" };
+    d.setDate(d.getDate() + 1);
+  }
+  const body = JSON.stringify(M.flattenWeightsForSync());
+  assertEqual(M.fitsKeepaliveQuota(body), false, "the payload that killed the sync is correctly kept off keepalive (" + M.utf8ByteLength(body) + " bytes)");
+});
+
+(async function asyncTailThenExit() {
+  const okResponse = function () {
+    return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve([]); } });
+  };
+  async function atest(name, fn) {
+    try { await fn(); } catch (e) { fail++; console.error("FAIL (threw): " + name + "\n  " + (e.stack || e)); }
+  }
+  M.state.session = { userId: "u", accessToken: "tok", refreshToken: "r", expiresAt: Date.now() + 3600000 };
+
+  await atest("supabaseTable: an oversized body is sent as a normal fetch, not rejected pre-flight", async function () {
+    const calls = [];
+    sandbox.fetch = function (url, init) { calls.push(init); return okResponse(); };
+    const res = await M.supabaseTable("weight_entries?on_conflict=id", { method: "POST", body: [{ big: "x".repeat(M.KEEPALIVE_BODY_BUDGET_BYTES * 2) }] });
+    assertEqual(calls.length, 1, "exactly one fetch went out");
+    assertEqual(calls[0].keepalive, false, "without keepalive, so the quota can't reject it");
+    assertEqual(res.error === undefined, true, "and the push succeeds");
+  });
+
+  await atest("supabaseTable: a small body still gets keepalive (the backgrounding protection)", async function () {
+    const calls = [];
+    sandbox.fetch = function (url, init) { calls.push(init); return okResponse(); };
+    await M.supabaseTable("weight_entries?on_conflict=id", { method: "POST", body: [{ small: 1 }] });
+    assertEqual(calls[0].keepalive, true, "small pushes keep the survive-teardown property");
+  });
+
+  await atest("supabaseTable: a keepalive pre-flight rejection is retried once without keepalive", async function () {
+    // The 64KiB quota is SHARED across in-flight keepalive requests, so even a small body can
+    // be rejected when several pushes fire together. Nothing was sent, so a retry is safe.
+    const calls = [];
+    sandbox.fetch = function (url, init) {
+      calls.push(init);
+      if (init.keepalive) return Promise.reject(new TypeError("Failed to fetch"));
+      return okResponse();
+    };
+    const res = await M.supabaseTable("food_log_entries?on_conflict=id", { method: "POST", body: [{ small: 1 }] });
+    assertEqual(calls.length, 2, "retried exactly once");
+    assertEqual(calls[0].keepalive, true, "first attempt asked for keepalive");
+    assertEqual(calls[1].keepalive, false, "retry dropped it");
+    assertEqual(res.error === undefined, true, "and the data still went through");
+  });
+
+  await atest("supabaseTable: a genuine network failure still reports an error", async function () {
+    sandbox.fetch = function () { return Promise.reject(new TypeError("Failed to fetch")); };
+    const res = await M.supabaseTable("weight_entries", {});
+    assertEqual(typeof res.error, "string", "offline surfaces as {error}, never a throw");
+  });
+
+  // Restore the default no-network stub for anything after us.
+  sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+
+  console.log("\n" + pass + " passed, " + fail + " failed");
+  process.exit(fail > 0 ? 1 : 0);
+})();
