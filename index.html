@@ -7,6 +7,8 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0B0E18">
 <title>MacroLog</title>
+<!-- Same artwork as logoSvg() in the app script and the manifest SVG icon; keep all three in sync. -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48' fill='none'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='6' y1='42' x2='42' y2='6' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0' stop-color='%2322D3EE'/%3E%3Cstop offset='.5' stop-color='%233B82F6'/%3E%3Cstop offset='1' stop-color='%23A855F7'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='48' height='48' rx='10' fill='%230B0E18'/%3E%3Cpath d='M33.8 7.1A19.5 19.5 0 1 0 42.3 17.3' stroke='url(%23g)' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M16 32V17l8 9 8-9v15' stroke='url(%23g)' stroke-width='4.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="manifest" href="manifest.json">
 <style>
 :root{color-scheme:dark;}
@@ -34,7 +36,10 @@ a{color:inherit;}
 /* The centred date column is fixed-width, so on a narrow screen the brand is what has to give.
    It ellipsises rather than pushing the date off-centre -- the app name is the least useful
    thing in this header (it's also on the Strategy tab and the home-screen icon). */
-.brand{font-size:15px;font-weight:700;color:#3B82F6;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.brand{display:flex;align-items:center;gap:7px;min-width:0;}
+/* Gradient wordmark; the ellipsis lives on the text span so the SVG mark never clips. Both
+   -webkit- and standard properties: background-clip:text still needs the prefix in Chromium. */
+.brandWord{font-size:15px;font-weight:800;letter-spacing:-0.3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:linear-gradient(90deg,#22D3EE,#3B82F6 55%,#A855F7);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent;}
 .dateNav{display:flex;align-items:center;justify-content:center;gap:10px;}
 /* Bigger arrows, set apart from the date so a mis-tap doesn't hit the wrong control. The 28px
    glyph is what reads as "larger"; min-height keeps the touch target at the 44px both the iOS
@@ -187,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.14";
+const APP_VERSION = "1.15";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -270,6 +275,11 @@ const state = {
   foodCache: db.get("foodCache", {}),
   recipes: db.get("recipes", []),
   customBarcodes: db.get("customBarcodes", {}),
+  // Per-day macro boosts for heavy-activity days: date -> {protein, carbs, fat, updatedAt}
+  // (grams on top of the base targets; calories derive via Atwater). An all-zero entry means
+  // "boost toggled off" -- kept rather than deleted so the newer-wins merge can carry a
+  // toggle-off to another device instead of the old boost resurrecting additively.
+  dayBoosts: db.get("dayBoosts", {}),
   session: db.get("supabaseSession", null),
   authError: null,
   authLoading: false,
@@ -286,6 +296,7 @@ function saveRecentFoods() { db.set("recentFoods", state.recentFoods); scheduleC
 function saveFoodCache() { db.set("foodCache", state.foodCache); scheduleCloudSync("foodCache", pushFoodCacheToCloud); }
 function saveRecipes() { db.set("recipes", state.recipes); scheduleCloudSync("recipes", pushRecipesToCloud); }
 function saveCustomBarcodes() { db.set("customBarcodes", state.customBarcodes); scheduleCloudSync("customBarcodes", pushCustomBarcodesToCloud); }
+function saveDayBoosts() { db.set("dayBoosts", state.dayBoosts); scheduleCloudSync("dayBoosts", pushDayBoostsToCloud); }
 
 function cleanExpiredPhotos() {
   const now = new Date().toISOString();
@@ -841,6 +852,28 @@ function mergeRecentFoodsFromCloud(cloudArr) {
 
 async function pushFoodCacheToCloud() { return pushAppDataToCloud("foodCache", state.foodCache); }
 async function pullFoodCacheFromCloud() { return pullAppDataFromCloud("foodCache"); }
+
+// Day boosts ride the same user_app_data blob store as favorites/recentFoods/foodCache --
+// the table's `key` column takes any string, so no schema migration was needed. Merge is
+// per-DATE newer-wins (reusing foodRecordIsNewer's updatedAt rule): each date's boost is an
+// independent little record, and an all-zero boost with a newer stamp is how "toggled off"
+// wins over an older non-zero boost from another device.
+async function pushDayBoostsToCloud() { return pushAppDataToCloud("dayBoosts", state.dayBoosts); }
+async function pullDayBoostsFromCloud() { return pullAppDataFromCloud("dayBoosts"); }
+function mergeDayBoostsFromCloud(cloudMap) {
+  if (!cloudMap) return 0;
+  let changed = 0;
+  Object.keys(cloudMap).forEach(function(date) {
+    const c = cloudMap[date];
+    if (!c) return;
+    if (!state.dayBoosts[date] || foodRecordIsNewer(c, state.dayBoosts[date])) {
+      state.dayBoosts[date] = c;
+      changed++;
+    }
+  });
+  db.set("dayBoosts", state.dayBoosts);
+  return changed;
+}
 function mergeFoodCacheFromCloud(cloudDict) {
   if (!cloudDict) return 0;
   let changed = 0;
@@ -943,11 +976,11 @@ async function pullAndMergeAll() {
   // never a subset. It also makes food-log newer-wins correct: the blind id-upsert on push can't
   // clobber a newer cloud edit with a stale local one, because the merge pulled the newer cloud
   // version in first.
-  const [logsPull, weightsPull, recipesPull, barcodesPull, favsPull, recentPull, cachePull] = await Promise.all([
+  const [logsPull, weightsPull, recipesPull, barcodesPull, favsPull, recentPull, cachePull, boostsPull] = await Promise.all([
     pullFoodLogsFromCloud(), pullWeightsFromCloud(), pullRecipesFromCloud(), pullCustomBarcodesFromCloud(),
-    pullFavoritesFromCloud(), pullRecentFoodsFromCloud(), pullFoodCacheFromCloud(),
+    pullFavoritesFromCloud(), pullRecentFoodsFromCloud(), pullFoodCacheFromCloud(), pullDayBoostsFromCloud(),
   ]);
-  const firstError = logsPull.error || weightsPull.error || recipesPull.error || barcodesPull.error || favsPull.error || recentPull.error || cachePull.error;
+  const firstError = logsPull.error || weightsPull.error || recipesPull.error || barcodesPull.error || favsPull.error || recentPull.error || cachePull.error || boostsPull.error;
   if (firstError) return { error: firstError };
 
   const logsAdded = mergeFoodLogsFromCloud(logsPull.data);
@@ -957,13 +990,14 @@ async function pullAndMergeAll() {
   const favsAdded = mergeFavoritesFromCloud(favsPull.data && favsPull.data[0] && favsPull.data[0].data);
   const recentAdded = mergeRecentFoodsFromCloud(recentPull.data && recentPull.data[0] && recentPull.data[0].data);
   const cacheAdded = mergeFoodCacheFromCloud(cachePull.data && cachePull.data[0] && cachePull.data[0].data);
+  mergeDayBoostsFromCloud(boostsPull.data && boostsPull.data[0] && boostsPull.data[0].data);
 
   // Now push the merged local state up, so anything this device had that the cloud lacked gets
   // persisted. Safe to overwrite the whole-blob collections now: local already contains the
   // cloud's copy after the merges above.
   await Promise.all([
     pushFoodLogsToCloud(), pushWeightsToCloud(), pushRecipesToCloud(), pushCustomBarcodesToCloud(),
-    pushFavoritesToCloud(), pushRecentFoodsToCloud(), pushFoodCacheToCloud(),
+    pushFavoritesToCloud(), pushRecentFoodsToCloud(), pushFoodCacheToCloud(), pushDayBoostsToCloud(),
   ]);
 
   state.lastSyncedAt = Date.now();
@@ -973,7 +1007,11 @@ async function pullAndMergeAll() {
 
 function renderLoginScreen() {
   return '<div style="max-width:340px;margin:0 auto;padding:60px 20px 20px;">' +
-    '<div style="text-align:center;margin-bottom:32px"><div style="font-size:22px;font-weight:700;color:' + C.primary + '">MacroLog</div><div style="color:' + C.textMut + ';font-size:13px;margin-top:4px">Sign in to sync your data</div></div>' +
+    '<div style="text-align:center;margin-bottom:32px">' +
+      '<div style="display:flex;justify-content:center;margin-bottom:10px">' + logoSvg(64) + '</div>' +
+      '<div class="brandWord" style="font-size:26px;display:inline-block">MacroLog</div>' +
+      '<div style="color:' + C.textMut + ';font-size:13px;margin-top:4px">Sign in to sync your data</div>' +
+    '</div>' +
     card(
       '<div style="display:flex;flex-direction:column;gap:12px">' +
         '<div><label class="label">Email</label>' + textInput({ id: "loginEmailInput", value: state.ui.loginEmail || "", type: "email", bind: "loginEmail", enter: "supabaseLogin" }) + '</div>' +
@@ -1439,6 +1477,22 @@ function statCard(label, value, color) {
     '</div>';
 }
 
+// The logomark: a broken progress ring (the dashboard's core visual) in a cyan->blue->violet
+// gradient, wrapping a rounded geometric M. Inline SVG so it needs no asset pipeline; the
+// gradient id is fixed, which is safe because header and login screen are never in the DOM at
+// the same time (login renders INSTEAD of the app shell). The same artwork, minified and
+// URL-encoded, backs the favicon <link> in <head> and the manifest's SVG icon -- keep the
+// three in sync if the mark ever changes.
+function logoSvg(size) {
+  return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0">' +
+    '<defs><linearGradient id="mlgrad" x1="6" y1="42" x2="42" y2="6" gradientUnits="userSpaceOnUse">' +
+      '<stop offset="0" stop-color="#22D3EE"/><stop offset="0.5" stop-color="#3B82F6"/><stop offset="1" stop-color="#A855F7"/>' +
+    '</linearGradient></defs>' +
+    '<path d="M33.8 7.1 A19.5 19.5 0 1 0 42.3 17.3" stroke="url(#mlgrad)" stroke-width="5" stroke-linecap="round"/>' +
+    '<path d="M16 32 V17 L24 26 L32 17 V32" stroke="url(#mlgrad)" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>' +
+  '</svg>';
+}
+
 function btn(opts) {
   // opts: {label, action, arg, arg2, color, outline, full, small, rowItem, disabled, extraStyle, id}
   // rowItem = equal-width member of a .btnRow (deliberately NOT called "compact" -- that word
@@ -1502,7 +1556,7 @@ function renderApp() {
   if (!s.session) return renderLoginScreen();
   return '' +
     '<div class="header">' +
-      '<div class="brand">MacroLog</div>' +
+      '<div class="brand">' + logoSvg(22) + '<span class="brandWord">MacroLog</span></div>' +
       '<div class="dateNav">' +
         '<button class="navArrow" data-action="shiftDate" data-arg="-1">\u2039</button>' +
         '<button class="dateBtn' + (s.date === todayStr() ? ' today' : '') + '" data-action="goToday">' + (s.date === todayStr() ? "Today" : dayLabel(s.date)) + '</button>' +
@@ -1614,6 +1668,51 @@ function getDayTotals(date) {
   }, { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0, plantProtein: 0 });
 }
 
+// ---- Per-day macro boosts (heavy-activity days) ----
+// A boost adds grams of protein/carbs/fat on top of the base Strategy-tab targets for ONE
+// specific date; the calorie target rises by the Atwater value of those grams automatically.
+// Base targets in settings are untouched -- viewing any other day shows the normal numbers,
+// and a boost set on a past date keeps applying when reviewing that day.
+function dayBoostFor(date) {
+  const b = state.dayBoosts[date];
+  if (!b) return null;
+  const p = Math.max(0, parseFloat(b.protein) || 0), c = Math.max(0, parseFloat(b.carbs) || 0), f = Math.max(0, parseFloat(b.fat) || 0);
+  if (p === 0 && c === 0 && f === 0) return null; // all-zero = toggled off (kept as a tombstone for sync)
+  return { protein: p, carbs: c, fat: f };
+}
+
+function boostCalories(boost) {
+  if (!boost) return 0;
+  return Math.round(boost.protein * 4 + boost.carbs * 4 + boost.fat * 9);
+}
+
+// The single place a day's EFFECTIVE targets come from. Everything that renders "X of Y"
+// against a target must read this, not state.settings directly, or boosted days silently
+// show the base numbers in some spots and boosted ones in others.
+function getDayTargets(date) {
+  const s = state.settings;
+  const boost = dayBoostFor(date);
+  if (!boost) {
+    return { calorieTarget: s.calorieTarget, proteinTarget: s.proteinTarget, carbsTarget: s.carbsTarget, fatTarget: s.fatTarget, boost: null };
+  }
+  return {
+    calorieTarget: s.calorieTarget + boostCalories(boost),
+    proteinTarget: s.proteinTarget + boost.protein,
+    carbsTarget: s.carbsTarget + boost.carbs,
+    fatTarget: s.fatTarget + boost.fat,
+    boost: boost,
+  };
+}
+
+function writeDayBoost(date, protein, carbs, fat) {
+  state.dayBoosts[date] = {
+    protein: Math.max(0, protein), carbs: Math.max(0, carbs), fat: Math.max(0, fat),
+    // The stamp is what lets a toggle-off (all zeros) beat an older boost in the merge.
+    updatedAt: new Date().toISOString(),
+  };
+  saveDayBoosts();
+}
+
 function addFoodToLog(food) {
   const entry = {
     id: "log_" + Date.now() + "_" + Math.random().toString(36).slice(2,7),
@@ -1711,15 +1810,17 @@ function updateFoodEntry(entryId, updates) {
 function renderDashboard() {
   const totals = getDayTotals(state.date);
   const set = state.settings;
-  const calPct = set.calorieTarget > 0 ? Math.round((totals.calories / set.calorieTarget) * 100) : 0;
-  const remaining = set.calorieTarget - totals.calories;
+  // Effective targets for THIS day -- base settings plus any activity boost toggled on it.
+  const t = getDayTargets(state.date);
+  const calPct = t.calorieTarget > 0 ? Math.round((totals.calories / t.calorieTarget) * 100) : 0;
+  const remaining = t.calorieTarget - totals.calories;
   const entries = state.foodLogs[state.date] || [];
 
   let html = card(
     '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px">' +
       '<div>' +
         '<div style="font-size:42px;font-weight:800;line-height:1;letter-spacing:-1px">' + Math.round(totals.calories).toLocaleString() + '</div>' +
-        '<div style="color:' + C.textMut + ';font-size:14px;margin-top:4px">of ' + set.calorieTarget.toLocaleString() + ' kcal</div>' +
+        '<div style="color:' + C.textMut + ';font-size:14px;margin-top:4px">of ' + t.calorieTarget.toLocaleString() + ' kcal' + (t.boost ? ' <span style="color:' + C.warning + '">⚡</span>' : '') + '</div>' +
       '</div>' +
       '<div style="text-align:right">' +
         '<div style="font-size:28px;font-weight:700;color:' + (remaining >= 0 ? C.success : C.danger) + '">' + Math.abs(Math.round(remaining)) + '</div>' +
@@ -1727,10 +1828,11 @@ function renderDashboard() {
         '<div style="color:' + C.textMut + ';font-size:13px;margin-top:2px">' + calPct + '% done</div>' +
       '</div>' +
     '</div>' +
-    progressBar(totals.calories, set.calorieTarget, C.calories, "Calories", "", " kcal") +
-    progressBar(totals.protein, set.proteinTarget, C.protein, "Protein", (set.showPlantProtein && totals.plantProtein > 0) ? "(" + Math.round(totals.plantProtein) + "g plant-based)" : "") +
-    progressBar(totals.carbs, set.carbsTarget, C.carbs, "Carbs", totals.fiber > 0 ? "(" + Math.round(totals.fiber) + "g fiber)" : "") +
-    progressBar(totals.fat, set.fatTarget, C.fat, "Fat")
+    progressBar(totals.calories, t.calorieTarget, C.calories, "Calories", t.boost ? "(+" + boostCalories(t.boost) + " boost)" : "", " kcal") +
+    progressBar(totals.protein, t.proteinTarget, C.protein, "Protein", (set.showPlantProtein && totals.plantProtein > 0) ? "(" + Math.round(totals.plantProtein) + "g plant-based)" : "") +
+    progressBar(totals.carbs, t.carbsTarget, C.carbs, "Carbs", totals.fiber > 0 ? "(" + Math.round(totals.fiber) + "g fiber)" : "") +
+    progressBar(totals.fat, t.fatTarget, C.fat, "Fat") +
+    renderDayBoostBlock(t.boost)
   );
 
   html += '<div class="row" style="margin-bottom:16px">' + btn({ label: "\uFF0B Add Food", action: "setTab", arg: "food", full: true }) + '</div>';
@@ -1757,6 +1859,63 @@ function renderDashboard() {
 
   return html;
 }
+
+// The per-day activity-boost control, rendered at the bottom of the dashboard's targets card.
+// Toggling and stepping are all BUTTONS (no text inputs), so plain rerender() per tap is safe
+// -- the no-rerender-on-keystroke rule only bites on typed fields.
+// Steps are +10g protein / +10g carbs / +5g fat per tap: comparable calorie increments
+// (40/40/45 kcal), coarse enough to dial in a few hundred extra kcal in a handful of taps.
+function renderDayBoostBlock(activeBoost) {
+  const open = !!state.ui.dayBoostOpen;
+  let html = '<div style="border-top:1px solid ' + C.border + ';margin-top:14px;padding-top:12px">';
+
+  const label = activeBoost
+    ? "⚡ Activity boost: +" + boostCalories(activeBoost) + " kcal"
+    : "⚡ Activity boost";
+  html += '<button class="chip' + (activeBoost ? " active" : "") + '" data-action="toggleDayBoostPanel" style="width:100%;text-align:center">' +
+    label + (open ? " ▴" : " ▾") + '</button>';
+
+  if (open) {
+    const b = activeBoost || { protein: 0, carbs: 0, fat: 0 };
+    const stepperRow = function(name, key, color, step) {
+      return '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px">' +
+        '<span style="color:' + color + ';font-size:14px;font-weight:600;min-width:64px">' + name + '</span>' +
+        '<div style="display:flex;align-items:center;gap:12px">' +
+          '<button class="chip" data-action="bumpDayBoost" data-arg="' + key + '" data-arg2="-' + step + '" style="min-width:44px;font-size:16px">−</button>' +
+          '<span style="color:' + C.text + ';font-size:15px;font-weight:700;min-width:52px;text-align:center">+' + b[key] + 'g</span>' +
+          '<button class="chip" data-action="bumpDayBoost" data-arg="' + key + '" data-arg2="' + step + '" style="min-width:44px;font-size:16px">＋</button>' +
+        '</div>' +
+      '</div>';
+    };
+    html += stepperRow("Protein", "protein", C.protein, 10) +
+      stepperRow("Carbs", "carbs", C.carbs, 10) +
+      stepperRow("Fat", "fat", C.fat, 5);
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:10px">Raises today’s targets only — your base targets in Strategy stay unchanged. Applies just to ' + esc(state.date === todayStr() ? "today" : dayLabel(state.date)) + '.</div>';
+    if (activeBoost) {
+      html += '<div style="margin-top:10px">' + btn({ label: "Clear boost", action: "clearDayBoost", small: true, outline: true, full: true }) + '</div>';
+    }
+  }
+  html += '</div>';
+  return html;
+}
+
+actions.toggleDayBoostPanel = function() { state.ui.dayBoostOpen = !state.ui.dayBoostOpen; rerender(); };
+actions.bumpDayBoost = function(macro, deltaStr) {
+  if (macro !== "protein" && macro !== "carbs" && macro !== "fat") return;
+  const delta = parseFloat(deltaStr) || 0;
+  const current = dayBoostFor(state.date) || { protein: 0, carbs: 0, fat: 0 };
+  const next = Object.assign({}, current);
+  next[macro] = Math.max(0, next[macro] + delta);
+  writeDayBoost(state.date, next.protein, next.carbs, next.fat);
+  rerender();
+};
+actions.clearDayBoost = function() {
+  // Written as all-zeros rather than deleted: the zero entry's fresh updatedAt is what lets
+  // "toggled off" win the newer-wins merge against an older non-zero copy on another device.
+  writeDayBoost(state.date, 0, 0, 0);
+  state.ui.dayBoostOpen = false;
+  rerender();
+};
 
 // Buckets a day's entries into hour groups, newest first both BETWEEN groups (5 PM above 2 PM)
 // and WITHIN each group (the food just logged sits at the top of its hour, not the bottom).
@@ -2355,7 +2514,7 @@ function renderFoodTab() {
 
   if (fu.subTab === "search") {
     const dayTotals = getDayTotals(state.date);
-    const dailySet = state.settings;
+    const dailySet = getDayTargets(state.date); // boosted targets, same as the dashboard shows
     html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:' + C.inputBg + ';border-radius:10px;margin-bottom:12px;font-size:12px">' +
       '<div style="display:flex;gap:10px">' +
         '<span style="color:' + C.protein + '">P: ' + Math.round(dayTotals.protein) + '/' + dailySet.proteinTarget + 'g</span>' +
@@ -5426,7 +5585,7 @@ function exportSnapshot() {
   return {
     settings: state.settings, foodLogs: state.foodLogs, weights: state.weights,
     favorites: state.favorites, recentFoods: state.recentFoods, foodCache: state.foodCache,
-    recipes: state.recipes, customBarcodes: state.customBarcodes,
+    recipes: state.recipes, customBarcodes: state.customBarcodes, dayBoosts: state.dayBoosts,
     exportDate: new Date().toISOString(), version: "1.1",
   };
 }
@@ -5462,6 +5621,7 @@ changeActions.importData = function(el) {
       // Older exports (version 1.0) predate this key and simply won't have it -- restoring one
       // of those leaves the existing cache alone rather than wiping it.
       if (data.foodCache) { state.foodCache = data.foodCache; saveFoodCache(); }
+      if (data.dayBoosts) { state.dayBoosts = data.dayBoosts; saveDayBoosts(); }
       if (data.recipes) { state.recipes = data.recipes; saveRecipes(); }
       if (data.customBarcodes) { state.customBarcodes = data.customBarcodes; saveCustomBarcodes(); }
       alert("Data imported successfully!");
@@ -5492,11 +5652,11 @@ actions.clearAllData = async function() {
     ]);
   }
   state.settings = Object.assign({}, DEFAULT_SETTINGS);
-  state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {}; state.recipes = []; state.customBarcodes = {};
+  state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {}; state.recipes = []; state.customBarcodes = {}; state.dayBoosts = {};
   // Everything those queued deletes referred to is gone from both sides now; leaving them would
   // keep retrying deletes for rows that no longer exist and keep blocking their ids forever.
   savePendingDeletes([]);
-  saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache(); saveRecipes(); saveCustomBarcodes();
+  saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache(); saveRecipes(); saveCustomBarcodes(); saveDayBoosts();
   su.clearing = false;
   su.confirmClear = false;
   rerender();

@@ -125,6 +125,9 @@ const exportLine =
   "hasPendingDelete: hasPendingDelete, enqueuePendingDelete: enqueuePendingDelete, " +
   "dequeuePendingDelete: dequeuePendingDelete, removeFoodFromLog: removeFoodFromLog, " +
   "fitsKeepaliveQuota: fitsKeepaliveQuota, utf8ByteLength: utf8ByteLength, " +
+  "dayBoostFor: dayBoostFor, boostCalories: boostCalories, getDayTargets: getDayTargets, " +
+  "writeDayBoost: writeDayBoost, mergeDayBoostsFromCloud: mergeDayBoostsFromCloud, " +
+  "renderDayBoostBlock: renderDayBoostBlock, logoSvg: logoSvg, " +
   "KEEPALIVE_BODY_BUDGET_BYTES: KEEPALIVE_BODY_BUDGET_BYTES, supabaseTable: supabaseTable, " +
   "flattenWeightsForSync: flattenWeightsForSync, pushWeightsToCloud: pushWeightsToCloud, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
@@ -2261,6 +2264,87 @@ test("exportSnapshot: foodCache round-trips the baseGrams that logged entries de
   assertEqual(restored.foodCache.m1.baseGrams, 83, "anchor survives the backup");
   // Without this, a restored entry can no longer re-derive its macros from its source food.
   assertEqual(M.calcMacrosForWeight(restored.foodCache.m1, 166).calories, 470, "and still scales after a restore");
+});
+
+// ============================================================
+// PER-DAY MACRO BOOSTS (heavy-activity days)
+// ============================================================
+test("getDayTargets: no boost returns the base targets untouched", function () {
+  M.state.settings.calorieTarget = 1876; M.state.settings.proteinTarget = 163;
+  M.state.settings.carbsTarget = 153; M.state.settings.fatTarget = 68;
+  M.state.dayBoosts = {};
+  const t = M.getDayTargets("2026-07-28");
+  assertEqual(t, { calorieTarget: 1876, proteinTarget: 163, carbsTarget: 153, fatTarget: 68, boost: null }, "base pass-through");
+});
+test("getDayTargets: a boost raises that day's macros and derives the calories via Atwater", function () {
+  M.state.dayBoosts = { "2026-07-28": { protein: 20, carbs: 30, fat: 5, updatedAt: "2026-07-28T10:00:00.000Z" } };
+  const t = M.getDayTargets("2026-07-28");
+  assertEqual(t.proteinTarget, 183, "protein +20");
+  assertEqual(t.carbsTarget, 183, "carbs +30");
+  assertEqual(t.fatTarget, 73, "fat +5");
+  assertEqual(t.calorieTarget, 1876 + 20 * 4 + 30 * 4 + 5 * 9, "calories rise by 4/4/9 of the boost grams");
+  // The boost is per-DAY: every other date still reads base.
+  assertEqual(M.getDayTargets("2026-07-27").calorieTarget, 1876, "adjacent day unaffected");
+});
+test("getDayTargets: an all-zero boost entry means toggled off, not a zero-shaped boost", function () {
+  M.state.dayBoosts = { "2026-07-28": { protein: 0, carbs: 0, fat: 0, updatedAt: "2026-07-28T10:00:00.000Z" } };
+  assertEqual(M.getDayTargets("2026-07-28").boost, null, "zero entry is inert");
+  assertEqual(M.getDayTargets("2026-07-28").calorieTarget, 1876, "targets are base");
+});
+test("bumpDayBoost: steps up, steps down, clamps at zero, stamps updatedAt", function () {
+  M.state.dayBoosts = {}; M.state.date = "2026-07-28"; M.state.ui = {};
+  M.actions.bumpDayBoost("protein", "10");
+  M.actions.bumpDayBoost("protein", "10");
+  M.actions.bumpDayBoost("fat", "5");
+  assertEqual(M.dayBoostFor("2026-07-28"), { protein: 20, carbs: 0, fat: 5 }, "accumulates per macro");
+  M.actions.bumpDayBoost("fat", "-5");
+  M.actions.bumpDayBoost("fat", "-5"); // below zero
+  assertEqual(M.state.dayBoosts["2026-07-28"].fat, 0, "clamped at 0, no negative boost");
+  assertEqual(typeof M.state.dayBoosts["2026-07-28"].updatedAt, "string", "stamped so the merge can resolve it");
+  M.actions.bumpDayBoost("weight", "10");
+  assertEqual(M.dayBoostFor("2026-07-28").protein, 20, "an unknown macro key is rejected, not written");
+});
+test("clearDayBoost: writes zeros (a sync tombstone) rather than deleting the entry", function () {
+  M.state.dayBoosts = { "2026-07-28": { protein: 20, carbs: 0, fat: 0, updatedAt: "2026-07-28T10:00:00.000Z" } };
+  M.state.date = "2026-07-28"; M.state.ui = {};
+  M.actions.clearDayBoost();
+  assertEqual(M.dayBoostFor("2026-07-28"), null, "boost is off");
+  assertEqual(!!M.state.dayBoosts["2026-07-28"], true, "but the entry survives as a tombstone");
+});
+test("mergeDayBoostsFromCloud: newer wins per date; a newer zero beats an older boost (cross-device toggle-off)", function () {
+  M.state.dayBoosts = {
+    "2026-07-27": { protein: 10, carbs: 0, fat: 0, updatedAt: "2026-07-27T09:00:00.000Z" },
+    "2026-07-28": { protein: 20, carbs: 0, fat: 0, updatedAt: "2026-07-28T09:00:00.000Z" },
+  };
+  M.mergeDayBoostsFromCloud({
+    "2026-07-27": { protein: 0, carbs: 0, fat: 0, updatedAt: "2026-07-27T12:00:00.000Z" }, // newer OFF
+    "2026-07-28": { protein: 99, carbs: 0, fat: 0, updatedAt: "2026-07-28T08:00:00.000Z" }, // older -> loses
+    "2026-07-26": { protein: 0, carbs: 40, fat: 0, updatedAt: "2026-07-26T09:00:00.000Z" }, // unknown -> added
+  });
+  assertEqual(M.dayBoostFor("2026-07-27"), null, "the toggle-off propagated");
+  assertEqual(M.state.dayBoosts["2026-07-28"].protein, 20, "the older cloud copy lost");
+  assertEqual(M.dayBoostFor("2026-07-26").carbs, 40, "a boost set on the other device arrived");
+});
+test("exportSnapshot: includes dayBoosts", function () {
+  M.state.dayBoosts = { "2026-07-28": { protein: 20, carbs: 0, fat: 0, updatedAt: "2026-07-28T09:00:00.000Z" } };
+  assertEqual(!!M.exportSnapshot().dayBoosts, true, "the backup carries per-day boosts");
+});
+test("renderDayBoostBlock: renders the chip closed, the steppers open, and never throws", function () {
+  M.state.ui = {}; M.state.date = "2026-07-28";
+  const closed = M.renderDayBoostBlock(null);
+  assertEqual(closed.indexOf("toggleDayBoostPanel") >= 0, true, "chip is wired");
+  assertEqual(closed.indexOf("bumpDayBoost") >= 0, false, "steppers hidden while closed");
+  M.state.ui.dayBoostOpen = true;
+  const open = M.renderDayBoostBlock({ protein: 20, carbs: 30, fat: 5 });
+  assertEqual(open.indexOf("bumpDayBoost") >= 0, true, "steppers visible");
+  assertEqual(open.indexOf("+" + (20 * 4 + 30 * 4 + 5 * 9) + " kcal") >= 0, true, "chip shows the derived calories");
+  assertEqual(open.indexOf("clearDayBoost") >= 0, true, "clear offered when active");
+});
+test("logoSvg: emits a well-formed mark with the gradient and both paths", function () {
+  const svg = M.logoSvg(22);
+  assertEqual(svg.indexOf('width="22"') >= 0, true, "sized as asked");
+  assertEqual((svg.match(/<path /g) || []).length, 2, "ring + M glyph");
+  assertEqual(svg.indexOf("linearGradient") >= 0, true, "gradient present");
 });
 
 // ============================================================
