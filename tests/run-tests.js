@@ -128,6 +128,7 @@ const exportLine =
   "dayBoostFor: dayBoostFor, boostCalories: boostCalories, getDayTargets: getDayTargets, " +
   "writeDayBoost: writeDayBoost, mergeDayBoostsFromCloud: mergeDayBoostsFromCloud, " +
   "renderDayBoostBlock: renderDayBoostBlock, logoSvg: logoSvg, " +
+  "signedKcal: signedKcal, weeklyDeltaLog: weeklyDeltaLog, renderWeeklyDeltaCard: renderWeeklyDeltaCard, " +
   "KEEPALIVE_BODY_BUDGET_BYTES: KEEPALIVE_BODY_BUDGET_BYTES, supabaseTable: supabaseTable, " +
   "flattenWeightsForSync: flattenWeightsForSync, pushWeightsToCloud: pushWeightsToCloud, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
@@ -2291,18 +2292,47 @@ test("getDayTargets: an all-zero boost entry means toggled off, not a zero-shape
   assertEqual(M.getDayTargets("2026-07-28").boost, null, "zero entry is inert");
   assertEqual(M.getDayTargets("2026-07-28").calorieTarget, 1876, "targets are base");
 });
-test("bumpDayBoost: steps up, steps down, clamps at zero, stamps updatedAt", function () {
+test("bumpDayBoost: steps up, steps down, goes negative, stamps updatedAt", function () {
   M.state.dayBoosts = {}; M.state.date = "2026-07-28"; M.state.ui = {};
+  M.state.settings.fatTarget = 68;
   M.actions.bumpDayBoost("protein", "10");
   M.actions.bumpDayBoost("protein", "10");
   M.actions.bumpDayBoost("fat", "5");
   assertEqual(M.dayBoostFor("2026-07-28"), { protein: 20, carbs: 0, fat: 5 }, "accumulates per macro");
   M.actions.bumpDayBoost("fat", "-5");
-  M.actions.bumpDayBoost("fat", "-5"); // below zero
-  assertEqual(M.state.dayBoosts["2026-07-28"].fat, 0, "clamped at 0, no negative boost");
+  M.actions.bumpDayBoost("fat", "-5"); // below zero: allowed now -- removing calories is the point
+  assertEqual(M.state.dayBoosts["2026-07-28"].fat, -5, "negative boost is a legitimate value");
   assertEqual(typeof M.state.dayBoosts["2026-07-28"].updatedAt, "string", "stamped so the merge can resolve it");
   M.actions.bumpDayBoost("weight", "10");
   assertEqual(M.dayBoostFor("2026-07-28").protein, 20, "an unknown macro key is rejected, not written");
+});
+test("bumpDayBoost: a negative boost floors at minus-the-base-target, never below", function () {
+  M.state.dayBoosts = {}; M.state.date = "2026-07-28"; M.state.ui = {};
+  M.state.settings.fatTarget = 12;
+  M.actions.bumpDayBoost("fat", "-5");
+  M.actions.bumpDayBoost("fat", "-5");
+  M.actions.bumpDayBoost("fat", "-5"); // would be -15, base is only 12
+  assertEqual(M.state.dayBoosts["2026-07-28"].fat, -12, "floored so the effective target bottoms out at exactly 0");
+  M.state.settings.fatTarget = 68;
+});
+test("getDayTargets: a negative boost lowers the day's targets, floored at zero", function () {
+  M.state.settings.calorieTarget = 1876; M.state.settings.proteinTarget = 163;
+  M.state.settings.carbsTarget = 153; M.state.settings.fatTarget = 68;
+  M.state.dayBoosts = { "2026-07-29": { protein: 0, carbs: -50, fat: -10, updatedAt: "2026-07-28T10:00:00.000Z" } };
+  const t = M.getDayTargets("2026-07-29");
+  assertEqual(t.carbsTarget, 103, "carbs −50");
+  assertEqual(t.fatTarget, 58, "fat −10");
+  assertEqual(t.calorieTarget, 1876 - 50 * 4 - 10 * 9, "calories drop by 4/4/9 of the removed grams");
+  // Absurdly negative stored values (e.g. synced from a future version) still can't produce
+  // a negative target -- the progress-bar math divides by these.
+  M.state.dayBoosts = { "2026-07-29": { protein: -999, carbs: -999, fat: -999, updatedAt: "2026-07-28T10:00:00.000Z" } };
+  const t2 = M.getDayTargets("2026-07-29");
+  assertEqual(t2.proteinTarget >= 0 && t2.carbsTarget >= 0 && t2.fatTarget >= 0 && t2.calorieTarget >= 0, true, "all targets floored at 0");
+});
+test("signedKcal: explicit sign both directions", function () {
+  assertEqual(M.signedKcal(320), "+320", "surplus/boost");
+  assertEqual(M.signedKcal(-240), "−240", "deficit/reduction");
+  assertEqual(M.signedKcal(0), "+0", "zero reads as +0");
 });
 test("clearDayBoost: writes zeros (a sync tombstone) rather than deleting the entry", function () {
   M.state.dayBoosts = { "2026-07-28": { protein: 20, carbs: 0, fat: 0, updatedAt: "2026-07-28T10:00:00.000Z" } };
@@ -2340,6 +2370,59 @@ test("renderDayBoostBlock: renders the chip closed, the steppers open, and never
   assertEqual(open.indexOf("+" + (20 * 4 + 30 * 4 + 5 * 9) + " kcal") >= 0, true, "chip shows the derived calories");
   assertEqual(open.indexOf("clearDayBoost") >= 0, true, "clear offered when active");
 });
+// ==== 7-day deficit/surplus log ====
+test("weeklyDeltaLog: seven calendar days ending on the anchor, oldest first", function () {
+  M.state.settings.calorieTarget = 2000;
+  M.state.foodLogs = {};
+  const rows = M.weeklyDeltaLog("2026-07-28", 7);
+  assertEqual(rows.length, 7, "seven rows");
+  assertEqual(rows[0].date, "2026-07-22", "starts six days back");
+  assertEqual(rows[6].date, "2026-07-28", "ends on the anchor day");
+});
+test("weeklyDeltaLog: delta is intake minus the BASE settings goal, boost or no boost", function () {
+  M.state.settings.calorieTarget = 2000;
+  M.state.foodLogs = {
+    "2026-07-27": [{ id: "a", macros: { calories: 1700 } }],
+    "2026-07-28": [{ id: "b", macros: { calories: 2350 } }],
+  };
+  // A boost on the 28th must NOT move the yardstick -- the log scores against the standing
+  // goal from Strategy, else a boost hides the very surplus it was meant to budget for.
+  M.state.dayBoosts = { "2026-07-28": { protein: 50, carbs: 0, fat: 0, updatedAt: "2026-07-28T10:00:00.000Z" } };
+  const rows = M.weeklyDeltaLog("2026-07-28", 7);
+  const d27 = rows.find(function(r){ return r.date === "2026-07-27"; });
+  const d28 = rows.find(function(r){ return r.date === "2026-07-28"; });
+  assertEqual(d27.delta, -300, "300 kcal deficit");
+  assertEqual(d28.delta, 350, "350 kcal surplus, measured against 2000, not the boosted target");
+});
+test("weeklyDeltaLog: unlogged days are flagged, not counted as giant deficits", function () {
+  M.state.settings.calorieTarget = 2000;
+  M.state.foodLogs = { "2026-07-28": [{ id: "a", macros: { calories: 1900 } }] };
+  const rows = M.weeklyDeltaLog("2026-07-28", 7);
+  const unlogged = rows.filter(function(r){ return !r.logged; });
+  assertEqual(unlogged.length, 6, "six empty days flagged");
+  assertEqual(rows[6].logged, true, "the logged day counts");
+  // The card's net must therefore be -100, not -100 - 6*2000.
+  const net = rows.filter(function(r){ return r.logged; }).reduce(function(a, r){ return a + r.delta; }, 0);
+  assertEqual(net, -100, "net sums logged days only");
+});
+test("weeklyDeltaLog: spans a month boundary by calendar days", function () {
+  M.state.settings.calorieTarget = 2000;
+  M.state.foodLogs = {};
+  const rows = M.weeklyDeltaLog("2026-08-03", 7);
+  assertEqual(rows[0].date, "2026-07-28", "window reaches back across the month edge");
+});
+test("renderWeeklyDeltaCard: renders rows, net, and the no-data state without throwing", function () {
+  M.state.settings.calorieTarget = 2000;
+  M.state.date = "2026-07-28";
+  M.state.foodLogs = { "2026-07-28": [{ id: "a", macros: { calories: 1900 } }] };
+  const html = M.renderWeeklyDeltaCard();
+  assertEqual(html.indexOf("Last 7 Days") >= 0, true, "card title");
+  assertEqual(html.indexOf("−100") >= 0, true, "the day's deficit is shown signed");
+  assertEqual(html.indexOf("no log") >= 0, true, "empty days say so");
+  M.state.foodLogs = {};
+  assertEqual(M.renderWeeklyDeltaCard().indexOf("Nothing logged") >= 0, true, "empty week has a friendly state");
+});
+
 test("logoSvg: emits a well-formed mark with the gradient and both paths", function () {
   const svg = M.logoSvg(22);
   assertEqual(svg.indexOf('width="22"') >= 0, true, "sized as asked");

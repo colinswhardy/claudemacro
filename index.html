@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.15";
+const APP_VERSION = "1.16";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -1676,7 +1676,9 @@ function getDayTotals(date) {
 function dayBoostFor(date) {
   const b = state.dayBoosts[date];
   if (!b) return null;
-  const p = Math.max(0, parseFloat(b.protein) || 0), c = Math.max(0, parseFloat(b.carbs) || 0), f = Math.max(0, parseFloat(b.fat) || 0);
+  // Negative values are legitimate: a boost can REMOVE calories from a day (rest days, or
+  // planning a lighter tomorrow), so this must not clamp at zero on read.
+  const p = parseFloat(b.protein) || 0, c = parseFloat(b.carbs) || 0, f = parseFloat(b.fat) || 0;
   if (p === 0 && c === 0 && f === 0) return null; // all-zero = toggled off (kept as a tombstone for sync)
   return { protein: p, carbs: c, fat: f };
 }
@@ -1695,22 +1697,89 @@ function getDayTargets(date) {
   if (!boost) {
     return { calorieTarget: s.calorieTarget, proteinTarget: s.proteinTarget, carbsTarget: s.carbsTarget, fatTarget: s.fatTarget, boost: null };
   }
+  // A large negative boost must not drive a target below zero -- a negative calorie or
+  // macro goal is meaningless, and the progress-bar math divides by the target.
   return {
-    calorieTarget: s.calorieTarget + boostCalories(boost),
-    proteinTarget: s.proteinTarget + boost.protein,
-    carbsTarget: s.carbsTarget + boost.carbs,
-    fatTarget: s.fatTarget + boost.fat,
+    calorieTarget: Math.max(0, s.calorieTarget + boostCalories(boost)),
+    proteinTarget: Math.max(0, s.proteinTarget + boost.protein),
+    carbsTarget: Math.max(0, s.carbsTarget + boost.carbs),
+    fatTarget: Math.max(0, s.fatTarget + boost.fat),
     boost: boost,
   };
 }
 
 function writeDayBoost(date, protein, carbs, fat) {
   state.dayBoosts[date] = {
-    protein: Math.max(0, protein), carbs: Math.max(0, carbs), fat: Math.max(0, fat),
+    protein: protein, carbs: carbs, fat: fat, // signed: negative = removing from that day
     // The stamp is what lets a toggle-off (all zeros) beat an older boost in the merge.
     updatedAt: new Date().toISOString(),
   };
   saveDayBoosts();
+}
+
+// "+320 kcal" / "−240 kcal" -- the chip and sublabels need the sign to be explicit, since a
+// boost can now go either direction.
+function signedKcal(kcal) {
+  return (kcal >= 0 ? "+" : "−") + Math.abs(kcal);
+}
+
+// The past week's deficit/surplus, day by day, against the BASE calorie goal from the
+// Strategy page -- deliberately not the boosted per-day target. The boost is a plan for the
+// day; this log is the scoreboard against the standing goal, and measuring against a target
+// that moves with each day's boost would let a boost hide the surplus it was meant to cover.
+// Days with nothing logged are listed but flagged logged:false and EXCLUDED from the net --
+// an unlogged day isn't a 1,900-kcal deficit, it's missing data, and counting it would make
+// the weekly number look heroic after any lazy logging day.
+// Calendar-day stepping via parseDateStr/setDate, never now()-N*86400000 (DST-unsafe).
+function weeklyDeltaLog(endDateStr, days) {
+  const target = state.settings.calorieTarget || 0;
+  const out = [];
+  const d = parseDateStr(endDateStr);
+  d.setDate(d.getDate() - (days - 1));
+  for (let i = 0; i < days; i++) {
+    const dateStr = fmtDate(d);
+    const entries = state.foodLogs[dateStr] || [];
+    const calories = Math.round(entries.reduce(function(a, e){ return a + (e.macros.calories || 0); }, 0));
+    out.push({
+      date: dateStr,
+      logged: entries.length > 0,
+      calories: calories,
+      delta: calories - target, // positive = surplus, negative = deficit
+    });
+    d.setDate(d.getDate() + 1);
+  }
+  return out;
+}
+
+function renderWeeklyDeltaCard() {
+  const rows = weeklyDeltaLog(state.date, 7);
+  const loggedRows = rows.filter(function(r){ return r.logged; });
+  let inner = '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px">' +
+    '<h3 class="cardTitle" style="margin:0">Last 7 Days</h3>' +
+    '<span style="color:' + C.textMut + ';font-size:11px">vs ' + (state.settings.calorieTarget || 0).toLocaleString() + ' kcal goal</span></div>';
+
+  rows.forEach(function(r) {
+    const isViewed = r.date === state.date;
+    const deltaColor = !r.logged ? C.textMut : (r.delta <= 0 ? C.success : C.danger);
+    inner += '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0' + (isViewed ? ';background:' + C.primary + '11;border-radius:6px;padding-left:6px;padding-right:6px;margin:0 -6px' : '') + '">' +
+      '<span style="color:' + (isViewed ? C.text : C.textSec) + ';font-size:13px">' + esc(dayLabel(r.date)) + (r.date === todayStr() ? ' <span style="color:' + C.textMut + ';font-size:11px">today</span>' : '') + '</span>' +
+      (r.logged
+        ? '<span style="font-size:13px"><span style="color:' + C.textMut + '">' + r.calories.toLocaleString() + ' kcal</span>' +
+          ' <span style="color:' + deltaColor + ';font-weight:700;display:inline-block;min-width:56px;text-align:right">' + signedKcal(r.delta) + '</span></span>'
+        : '<span style="color:' + C.textMut + ';font-size:12px">no log</span>') +
+    '</div>';
+  });
+
+  if (loggedRows.length > 0) {
+    const net = loggedRows.reduce(function(a, r){ return a + r.delta; }, 0);
+    inner += '<div style="display:flex;justify-content:space-between;border-top:1px solid ' + C.border + ';margin-top:8px;padding-top:10px">' +
+      '<span style="color:' + C.textSec + ';font-size:13px;font-weight:600">Net (' + loggedRows.length + ' logged day' + (loggedRows.length === 1 ? '' : 's') + ')</span>' +
+      '<span style="color:' + (net <= 0 ? C.success : C.danger) + ';font-size:14px;font-weight:800">' + signedKcal(net) + ' kcal</span></div>';
+    inner += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px">' + (net <= 0 ? "Running a deficit" : "Running a surplus") + ' vs your goal. ~3,500 kcal ≈ 1 lb.</div>';
+  } else {
+    inner += '<div style="color:' + C.textMut + ';font-size:12px;text-align:center;padding:8px 0">Nothing logged this week yet.</div>';
+  }
+  return card(inner);
 }
 
 function addFoodToLog(food) {
@@ -1828,7 +1897,7 @@ function renderDashboard() {
         '<div style="color:' + C.textMut + ';font-size:13px;margin-top:2px">' + calPct + '% done</div>' +
       '</div>' +
     '</div>' +
-    progressBar(totals.calories, t.calorieTarget, C.calories, "Calories", t.boost ? "(+" + boostCalories(t.boost) + " boost)" : "", " kcal") +
+    progressBar(totals.calories, t.calorieTarget, C.calories, "Calories", t.boost ? "(" + signedKcal(boostCalories(t.boost)) + " boost)" : "", " kcal") +
     progressBar(totals.protein, t.proteinTarget, C.protein, "Protein", (set.showPlantProtein && totals.plantProtein > 0) ? "(" + Math.round(totals.plantProtein) + "g plant-based)" : "") +
     progressBar(totals.carbs, t.carbsTarget, C.carbs, "Carbs", totals.fiber > 0 ? "(" + Math.round(totals.fiber) + "g fiber)" : "") +
     progressBar(totals.fat, t.fatTarget, C.fat, "Fat") +
@@ -1857,6 +1926,8 @@ function renderDashboard() {
     html += card('<div class="empty"><div style="font-size:32px;margin-bottom:8px">\u{1F37D}</div><div style="color:' + C.textSec + ';font-size:15px">No food logged yet today</div><div style="color:' + C.textMut + ';font-size:13px;margin-top:4px">Tap "Add Food" to get started</div></div>');
   }
 
+  html += renderWeeklyDeltaCard();
+
   return html;
 }
 
@@ -1870,7 +1941,7 @@ function renderDayBoostBlock(activeBoost) {
   let html = '<div style="border-top:1px solid ' + C.border + ';margin-top:14px;padding-top:12px">';
 
   const label = activeBoost
-    ? "⚡ Activity boost: +" + boostCalories(activeBoost) + " kcal"
+    ? "⚡ Activity boost: " + signedKcal(boostCalories(activeBoost)) + " kcal"
     : "⚡ Activity boost";
   html += '<button class="chip' + (activeBoost ? " active" : "") + '" data-action="toggleDayBoostPanel" style="width:100%;text-align:center">' +
     label + (open ? " ▴" : " ▾") + '</button>';
@@ -1878,11 +1949,12 @@ function renderDayBoostBlock(activeBoost) {
   if (open) {
     const b = activeBoost || { protein: 0, carbs: 0, fat: 0 };
     const stepperRow = function(name, key, color, step) {
+      const v = b[key];
       return '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px">' +
         '<span style="color:' + color + ';font-size:14px;font-weight:600;min-width:64px">' + name + '</span>' +
         '<div style="display:flex;align-items:center;gap:12px">' +
           '<button class="chip" data-action="bumpDayBoost" data-arg="' + key + '" data-arg2="-' + step + '" style="min-width:44px;font-size:16px">−</button>' +
-          '<span style="color:' + C.text + ';font-size:15px;font-weight:700;min-width:52px;text-align:center">+' + b[key] + 'g</span>' +
+          '<span style="color:' + (v < 0 ? C.danger : C.text) + ';font-size:15px;font-weight:700;min-width:52px;text-align:center">' + (v >= 0 ? "+" : "−") + Math.abs(v) + 'g</span>' +
           '<button class="chip" data-action="bumpDayBoost" data-arg="' + key + '" data-arg2="' + step + '" style="min-width:44px;font-size:16px">＋</button>' +
         '</div>' +
       '</div>';
@@ -1890,7 +1962,7 @@ function renderDayBoostBlock(activeBoost) {
     html += stepperRow("Protein", "protein", C.protein, 10) +
       stepperRow("Carbs", "carbs", C.carbs, 10) +
       stepperRow("Fat", "fat", C.fat, 5);
-    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:10px">Raises today’s targets only — your base targets in Strategy stay unchanged. Applies just to ' + esc(state.date === todayStr() ? "today" : dayLabel(state.date)) + '.</div>';
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:10px">Adjusts this day’s targets only — up for heavy activity, down to bank a deficit. Your base targets in Strategy stay unchanged. Applies just to ' + esc(state.date === todayStr() ? "today" : dayLabel(state.date)) + '.</div>';
     if (activeBoost) {
       html += '<div style="margin-top:10px">' + btn({ label: "Clear boost", action: "clearDayBoost", small: true, outline: true, full: true }) + '</div>';
     }
@@ -1905,7 +1977,10 @@ actions.bumpDayBoost = function(macro, deltaStr) {
   const delta = parseFloat(deltaStr) || 0;
   const current = dayBoostFor(state.date) || { protein: 0, carbs: 0, fat: 0 };
   const next = Object.assign({}, current);
-  next[macro] = Math.max(0, next[macro] + delta);
+  // Signed, but floored so the day's EFFECTIVE target can't go below zero -- stepping further
+  // down than the base target would just bank taps the user has to undo one by one later.
+  const baseKey = macro + "Target";
+  next[macro] = Math.max(-(state.settings[baseKey] || 0), next[macro] + delta);
   writeDayBoost(state.date, next.protein, next.carbs, next.fat);
   rerender();
 };
