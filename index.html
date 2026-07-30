@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.16";
+const APP_VERSION = "1.18";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -280,6 +280,12 @@ const state = {
   // "boost toggled off" -- kept rather than deleted so the newer-wins merge can carry a
   // toggle-off to another device instead of the old boost resurrecting additively.
   dayBoosts: db.get("dayBoosts", {}),
+  // Calorie/macro targets as they changed over time: date -> {calorieTarget, proteinTarget,
+  // carbsTarget, fatTarget, updatedAt}, each entry meaning "from this day forward, until the
+  // next entry". A target is a point-in-time decision, not a permanent fact -- see
+  // targetsForDate. Empty on an install that has never changed a target, which reads exactly
+  // like the old behaviour (fall back to state.settings).
+  targetHistory: db.get("targetHistory", {}),
   session: db.get("supabaseSession", null),
   authError: null,
   authLoading: false,
@@ -288,7 +294,11 @@ const state = {
   ui: {}
 };
 
-function saveSettings() { db.set("settings", state.settings); scheduleCloudSync("settings", pushSettingsToCloud); }
+// Every path that can change a target funnels through saveSettings -- the calorie field, the
+// three macro fields, the % sliders and applyPreset -- so recording the change here catches
+// them all, including anything added later. recordTargetChange no-ops unless a target actually
+// moved, so the many unrelated saveSettings callers (units, AI keys, goal weight) cost nothing.
+function saveSettings() { recordTargetChange(); db.set("settings", state.settings); scheduleCloudSync("settings", pushSettingsToCloud); }
 function saveFoodLogs() { db.set("foodLogs", state.foodLogs); scheduleCloudSync("foodLogs", pushFoodLogsToCloud); }
 function saveWeights() { db.set("weights", state.weights); scheduleCloudSync("weights", pushWeightsToCloud); }
 function saveFavorites() { db.set("favorites", state.favorites); scheduleCloudSync("favorites", pushFavoritesToCloud); }
@@ -297,6 +307,7 @@ function saveFoodCache() { db.set("foodCache", state.foodCache); scheduleCloudSy
 function saveRecipes() { db.set("recipes", state.recipes); scheduleCloudSync("recipes", pushRecipesToCloud); }
 function saveCustomBarcodes() { db.set("customBarcodes", state.customBarcodes); scheduleCloudSync("customBarcodes", pushCustomBarcodesToCloud); }
 function saveDayBoosts() { db.set("dayBoosts", state.dayBoosts); scheduleCloudSync("dayBoosts", pushDayBoostsToCloud); }
+function saveTargetHistory() { db.set("targetHistory", state.targetHistory); scheduleCloudSync("targetHistory", pushTargetHistoryToCloud); }
 
 function cleanExpiredPhotos() {
   const now = new Date().toISOString();
@@ -665,6 +676,10 @@ function mergeSettingsFromCloud(cloudData) {
   if (!cloudData) return false;
   state.settings = Object.assign({}, DEFAULT_SETTINGS, cloudData);
   db.set("settings", state.settings);
+  // Targets arriving from another device are a sync, not an edit made here, so re-baseline
+  // rather than letting the next genuine edit measure itself against the pre-sync values (which
+  // would seed the history's baseline with targets this device had already been told are stale).
+  syncTargetBaseline();
   return true;
 }
 
@@ -874,6 +889,25 @@ function mergeDayBoostsFromCloud(cloudMap) {
   db.set("dayBoosts", state.dayBoosts);
   return changed;
 }
+// Target history rides the same blob store, merged per-DATE newer-wins for the same reason as
+// dayBoosts: each date's entry is an independent little record, and two devices can legitimately
+// have recorded changes on different days.
+async function pushTargetHistoryToCloud() { return pushAppDataToCloud("targetHistory", state.targetHistory); }
+async function pullTargetHistoryFromCloud() { return pullAppDataFromCloud("targetHistory"); }
+function mergeTargetHistoryFromCloud(cloudMap) {
+  if (!cloudMap) return 0;
+  let changed = 0;
+  Object.keys(cloudMap).forEach(function(date) {
+    const c = cloudMap[date];
+    if (!c) return;
+    if (!state.targetHistory[date] || foodRecordIsNewer(c, state.targetHistory[date])) {
+      state.targetHistory[date] = c;
+      changed++;
+    }
+  });
+  db.set("targetHistory", state.targetHistory);
+  return changed;
+}
 function mergeFoodCacheFromCloud(cloudDict) {
   if (!cloudDict) return 0;
   let changed = 0;
@@ -976,11 +1010,12 @@ async function pullAndMergeAll() {
   // never a subset. It also makes food-log newer-wins correct: the blind id-upsert on push can't
   // clobber a newer cloud edit with a stale local one, because the merge pulled the newer cloud
   // version in first.
-  const [logsPull, weightsPull, recipesPull, barcodesPull, favsPull, recentPull, cachePull, boostsPull] = await Promise.all([
+  const [logsPull, weightsPull, recipesPull, barcodesPull, favsPull, recentPull, cachePull, boostsPull, targetsPull] = await Promise.all([
     pullFoodLogsFromCloud(), pullWeightsFromCloud(), pullRecipesFromCloud(), pullCustomBarcodesFromCloud(),
     pullFavoritesFromCloud(), pullRecentFoodsFromCloud(), pullFoodCacheFromCloud(), pullDayBoostsFromCloud(),
+    pullTargetHistoryFromCloud(),
   ]);
-  const firstError = logsPull.error || weightsPull.error || recipesPull.error || barcodesPull.error || favsPull.error || recentPull.error || cachePull.error || boostsPull.error;
+  const firstError = logsPull.error || weightsPull.error || recipesPull.error || barcodesPull.error || favsPull.error || recentPull.error || cachePull.error || boostsPull.error || targetsPull.error;
   if (firstError) return { error: firstError };
 
   const logsAdded = mergeFoodLogsFromCloud(logsPull.data);
@@ -991,6 +1026,7 @@ async function pullAndMergeAll() {
   const recentAdded = mergeRecentFoodsFromCloud(recentPull.data && recentPull.data[0] && recentPull.data[0].data);
   const cacheAdded = mergeFoodCacheFromCloud(cachePull.data && cachePull.data[0] && cachePull.data[0].data);
   mergeDayBoostsFromCloud(boostsPull.data && boostsPull.data[0] && boostsPull.data[0].data);
+  mergeTargetHistoryFromCloud(targetsPull.data && targetsPull.data[0] && targetsPull.data[0].data);
 
   // Now push the merged local state up, so anything this device had that the cloud lacked gets
   // persisted. Safe to overwrite the whole-blob collections now: local already contains the
@@ -998,6 +1034,7 @@ async function pullAndMergeAll() {
   await Promise.all([
     pushFoodLogsToCloud(), pushWeightsToCloud(), pushRecipesToCloud(), pushCustomBarcodesToCloud(),
     pushFavoritesToCloud(), pushRecentFoodsToCloud(), pushFoodCacheToCloud(), pushDayBoostsToCloud(),
+    pushTargetHistoryToCloud(),
   ]);
 
   state.lastSyncedAt = Date.now();
@@ -1302,7 +1339,7 @@ function syncNavHistoryDepth() {
 function collapseOneNavLevel() {
   const fu = state.ui.food;
   if (state.tab === "food" && fu) {
-    if (fu.scanningBarcode) { stopBarcodeCamera(); fu.scanningBarcode = false; fu.scanError = null; fu.scanManualCode = ""; fu.scanLoading = false; fu.scanNotFoundCode = null; return true; }
+    if (fu.scanningBarcode) { stopBarcodeCamera(); fu.scanningBarcode = false; fu.scanTarget = null; fu.scanError = null; fu.scanManualCode = ""; fu.scanLoading = false; fu.scanNotFoundCode = null; return true; }
     if (fu.loggingRecipe) { fu.loggingRecipe = null; return true; }
     if (fu.recipeBuilder) { fu.recipeBuilder = null; return true; }
     if (fu.wizardType) { fu.wizardType = null; fu.wizard = null; fu.wizardSuggestion = null; return true; }
@@ -1646,11 +1683,35 @@ function isAnimalProteinFood(name) {
   return ANIMAL_PROTEIN_RE.test(name || "");
 }
 
-// entry.animalOverride (true/false/null) lets a manual correction win over the keyword guess --
-// null (the default, "Auto") falls through to isAnimalProteinFood. Per-entry only for now, not
-// propagated to the underlying food, so re-adding the same food from History re-guesses fresh.
+// The saved plant/animal call for a food, or null if it's never been corrected. Read from
+// foodCache first because that's an id-keyed dict (O(1), and this runs per entry on every
+// getDayTotals, i.e. every render) and pruneFoodCache guarantees anything a logged entry still
+// references stays in it. recentFoods is the fallback for a record that predates the cache --
+// a restored v1.0 export has no foodCache at all.
+function animalOverrideForFood(foodId) {
+  if (!foodId) return null;
+  const cached = state.foodCache[foodId];
+  if (cached && cached.animalOverride != null) return cached.animalOverride;
+  const rec = state.recentFoods.find(function(f){ return f.id === foodId; });
+  if (rec && rec.animalOverride != null) return rec.animalOverride;
+  return null;
+}
+
+// Three tiers, most specific first: a call made on THIS entry, then the call saved on the food
+// record itself, then the keyword guess.
+//
+// The middle tier is what makes "set it once and it sticks" actually stick. Correcting the
+// protein source used to be per-entry only, so re-adding the same food from History re-guessed
+// from scratch and the correction had to be redone every single time. saveEntryDetails now
+// writes the call back to the food record, which covers future logs via addFoodToLog -- and
+// this lookup covers the ones ALREADY logged, since they carry animalOverride:null and so fall
+// through to the record's answer. That's a live re-read, not a data migration: exactly how the
+// keyword guess itself already applied retroactively to old entries.
 function isAnimalProteinEntry(entry) {
-  return entry.animalOverride != null ? entry.animalOverride : isAnimalProteinFood(entry.name);
+  if (entry.animalOverride != null) return entry.animalOverride;
+  const saved = animalOverrideForFood(entry.foodId);
+  if (saved != null) return saved;
+  return isAnimalProteinFood(entry.name);
 }
 
 function getDayTotals(date) {
@@ -1688,11 +1749,85 @@ function boostCalories(boost) {
   return Math.round(boost.protein * 4 + boost.carbs * 4 + boost.fat * 9);
 }
 
+// ---- Target history: what were you aiming at on a given day? ----
+// A calorie target is a point-in-time decision, not a permanent fact. Reading every past day
+// against TODAY's target is a real distortion: switching from a cut to a bulk (1,876 -> 2,800)
+// silently rewrote months of perfectly on-plan cut days into ~900 kcal-under-target failures,
+// on every past dashboard and down the whole Last 7 Days log.
+//
+// Shape deliberately mirrors dayBoosts -- date-keyed, per-date newer-wins merge via
+// foodRecordIsNewer, riding user_app_data under its own key (that column takes any string, so
+// no schema migration). Keyed by DATE rather than appended so that typing "2800" into the
+// calorie field, which fires an inputAction per keystroke, overwrites one entry for today
+// instead of leaving "2", "28" and "280" behind as fake target changes.
+function targetSnapshotOf(s) {
+  return {
+    calorieTarget: Math.max(0, s.calorieTarget || 0), proteinTarget: Math.max(0, s.proteinTarget || 0),
+    carbsTarget: Math.max(0, s.carbsTarget || 0), fatTarget: Math.max(0, s.fatTarget || 0),
+  };
+}
+function sameTargets(a, b) {
+  return a.calorieTarget === b.calorieTarget && a.proteinTarget === b.proteinTarget &&
+    a.carbsTarget === b.carbsTarget && a.fatTarget === b.fatTarget;
+}
+// The targets in effect on a given day: the most recent recorded change dated on or before it.
+// With nothing recorded it falls back to current settings, which is exactly the pre-feature
+// behaviour -- an install that has never changed a target behaves identically.
+function targetsForDate(dateStr) {
+  const hist = state.targetHistory || {};
+  let best = null;    // newest change dated on or before the day
+  let earliest = null; // oldest change on record, whatever its date
+  Object.keys(hist).forEach(function(d) {
+    if (d <= dateStr && (best === null || d > best)) best = d;
+    if (earliest === null || d < earliest) earliest = d;
+  });
+  if (best !== null) return targetSnapshotOf(hist[best]);
+  // Nothing recorded on or before this day. If anything is recorded at all, the oldest entry is
+  // the best evidence available and is extended backwards -- falling through to CURRENT settings
+  // here would reintroduce the exact bug for any day older than the first recorded change.
+  // Only a genuinely empty history falls back to settings, which is the pre-feature behaviour.
+  if (earliest !== null) return targetSnapshotOf(hist[earliest]);
+  return targetSnapshotOf(state.settings);
+}
+// The last targets this device knows about. Null until boot establishes it, which is what
+// stops a saveSettings() during startup from being mistaken for a user edit.
+let lastKnownTargets = null;
+function syncTargetBaseline() { lastKnownTargets = targetSnapshotOf(state.settings); }
+function earliestLoggedDate() {
+  let earliest = null;
+  Object.keys(state.foodLogs).forEach(function(d) {
+    if ((state.foodLogs[d] || []).length === 0) return;
+    if (earliest === null || d < earliest) earliest = d;
+  });
+  return earliest;
+}
+function recordTargetChange() {
+  if (lastKnownTargets === null) return false; // baseline not established yet (still booting)
+  const now = targetSnapshotOf(state.settings);
+  if (sameTargets(now, lastKnownTargets)) return false;
+  const today = todayStr();
+  // First ever change: write a baseline holding the OLD targets, dated back to the earliest day
+  // there's a food log for. Without it every past day falls through to the NEW targets and
+  // shows the exact distortion this exists to prevent. This is the one and only moment the old
+  // value is still knowable -- after this write it's gone for good.
+  if (Object.keys(state.targetHistory).length === 0) {
+    const firstDay = earliestLoggedDate();
+    if (firstDay && firstDay < today) {
+      state.targetHistory[firstDay] = Object.assign({}, lastKnownTargets, { updatedAt: new Date().toISOString() });
+    }
+  }
+  state.targetHistory[today] = Object.assign({}, now, { updatedAt: new Date().toISOString() });
+  lastKnownTargets = now;
+  saveTargetHistory();
+  return true;
+}
+
 // The single place a day's EFFECTIVE targets come from. Everything that renders "X of Y"
 // against a target must read this, not state.settings directly, or boosted days silently
 // show the base numbers in some spots and boosted ones in others.
+// The base is the target that was in effect on THAT day (targetsForDate), not today's.
 function getDayTargets(date) {
-  const s = state.settings;
+  const s = targetsForDate(date);
   const boost = dayBoostFor(date);
   if (!boost) {
     return { calorieTarget: s.calorieTarget, proteinTarget: s.proteinTarget, carbsTarget: s.carbsTarget, fatTarget: s.fatTarget, boost: null };
@@ -1732,7 +1867,6 @@ function signedKcal(kcal) {
 // the weekly number look heroic after any lazy logging day.
 // Calendar-day stepping via parseDateStr/setDate, never now()-N*86400000 (DST-unsafe).
 function weeklyDeltaLog(endDateStr, days) {
-  const target = state.settings.calorieTarget || 0;
   const out = [];
   const d = parseDateStr(endDateStr);
   d.setDate(d.getDate() - (days - 1));
@@ -1740,10 +1874,15 @@ function weeklyDeltaLog(endDateStr, days) {
     const dateStr = fmtDate(d);
     const entries = state.foodLogs[dateStr] || [];
     const calories = Math.round(entries.reduce(function(a, e){ return a + (e.macros.calories || 0); }, 0));
+    // Each day is scored against the goal that was standing ON that day, not today's. Still
+    // the BASE target for that day rather than getDayTargets' boosted one -- the boost is a
+    // plan for the day, this log is the scoreboard against the standing goal.
+    const target = targetsForDate(dateStr).calorieTarget || 0;
     out.push({
       date: dateStr,
       logged: entries.length > 0,
       calories: calories,
+      target: target,
       delta: calories - target, // positive = surplus, negative = deficit
     });
     d.setDate(d.getDate() + 1);
@@ -1754,9 +1893,15 @@ function weeklyDeltaLog(endDateStr, days) {
 function renderWeeklyDeltaCard() {
   const rows = weeklyDeltaLog(state.date, 7);
   const loggedRows = rows.filter(function(r){ return r.logged; });
+  // The window can now straddle a target change, in which case there is no single number to
+  // name here -- saying "vs 2,800" over days that were actually scored against 1,876 would
+  // misdescribe the very column it labels.
+  const spansOneTarget = rows.every(function(r){ return r.target === rows[0].target; });
   let inner = '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px">' +
     '<h3 class="cardTitle" style="margin:0">Last 7 Days</h3>' +
-    '<span style="color:' + C.textMut + ';font-size:11px">vs ' + (state.settings.calorieTarget || 0).toLocaleString() + ' kcal goal</span></div>';
+    '<span style="color:' + C.textMut + ';font-size:11px">' +
+      (spansOneTarget ? 'vs ' + (rows[0] ? rows[0].target : 0).toLocaleString() + ' kcal goal' : "vs each day’s own goal") +
+    '</span></div>';
 
   rows.forEach(function(r) {
     const isViewed = r.date === state.date;
@@ -2126,7 +2271,11 @@ function renderEntryEditor(entry) {
   } else if (section === "details") {
     const nameVal = state.ui.entryNameInput != null ? state.ui.entryNameInput : entry.name;
     const brandVal = state.ui.entryBrandInput != null ? state.ui.entryBrandInput : (entry.brand || "");
-    const override = state.ui.entryAnimalOverrideInput !== undefined ? state.ui.entryAnimalOverrideInput : entry.animalOverride;
+    // Falls back to the food record's saved call, not raw entry.animalOverride: an entry logged
+    // before the correction still carries null, and showing "Auto" for a food that is in fact
+    // saved as Animal would misreport what the dashboard is actually counting.
+    const savedOverride = entry.animalOverride != null ? entry.animalOverride : animalOverrideForFood(entry.foodId);
+    const override = state.ui.entryAnimalOverrideInput !== undefined ? state.ui.entryAnimalOverrideInput : savedOverride;
     html += '<div style="margin-bottom:10px"><label class="label">Food Name</label>' +
       textInput({ id: "entryNameInput", value: nameVal, bind: "entryNameInput", enter: "saveEntryDetails" }) + '</div>';
     html += '<div style="margin-bottom:10px"><label class="label">Brand</label>' +
@@ -2137,7 +2286,7 @@ function renderEntryEditor(entry) {
         return '<button class="chip' + (active ? ' active' : '') + '" data-action="setEntryAnimalOverride" data-arg="' + (o[0] === null ? "auto" : o[0]) + '" style="flex:1;text-align:center">' + o[1] + '</button>';
       }).join('') +
     '</div></div>';
-    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">"Auto" guesses from the food name for the dashboard’s plant-protein estimate. Override it here if it guessed wrong.</div>';
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">"Auto" guesses from the food name for the dashboard’s plant-protein estimate. Override it here if it guessed wrong — the choice is saved against this food, so every past and future serving of it uses the same answer.</div>';
     html += btn({ label: "Save Details", action: "saveEntryDetails", small: true });
   } else if (section === "move") {
     const targetDate = state.ui.entryMoveDate || state.date;
@@ -2405,8 +2554,18 @@ actions.saveEntryDetails = function() {
   const name = (state.ui.entryNameInput != null ? state.ui.entryNameInput : entry.name).trim();
   if (!name) return; // never allow saving a blank name
   const brand = (state.ui.entryBrandInput != null ? state.ui.entryBrandInput : (entry.brand || "")).trim();
-  const override = state.ui.entryAnimalOverrideInput !== undefined ? state.ui.entryAnimalOverrideInput : entry.animalOverride;
+  const prevOverride = entry.animalOverride != null ? entry.animalOverride : animalOverrideForFood(entry.foodId);
+  const override = state.ui.entryAnimalOverrideInput !== undefined ? state.ui.entryAnimalOverrideInput : prevOverride;
   updateFoodEntry(id, { name: name, brand: brand, animalOverride: override });
+  // Plant-vs-animal is a property of the FOOD, not of one day's serving -- chicken doesn't stop
+  // being animal protein tomorrow. So unlike name and brand, which are legitimately per-entry
+  // ("Chicken" vs "Chicken (leftovers)") and stay on this entry alone, this one is written back
+  // to the food record: every future log inherits it through addFoodToLog, and every past log
+  // picks it up through isAnimalProteinEntry's fallback. Picking "Auto" writes null back too,
+  // which is the intended way to undo a saved call and return the food to keyword guessing.
+  if (entry.foodId && override !== prevOverride) {
+    updateFoodRecordEverywhere(entry.foodId, { animalOverride: override });
+  }
   closeEntryEditor();
   rerender();
 };
@@ -2558,7 +2717,7 @@ actions.copyEntryCustomDate = function() {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], recipeResults: [], recipesQuery: "", searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null, editingFoodId: null, foodEditSection: "macros", foodEditBaseInput: null, foodEditNameInput: null, foodEditBrandInput: null, foodEditAnimalOverrideInput: undefined };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], recipeResults: [], recipesQuery: "", searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanTarget: null, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null, editingFoodId: null, foodEditSection: "macros", foodEditBaseInput: null, foodEditNameInput: null, foodEditBrandInput: null, foodEditAnimalOverrideInput: undefined };
   return state.ui.food;
 }
 
@@ -3255,7 +3414,9 @@ function renderBarcodeScanScreen(fu) {
     return html;
   }
 
-  let inner = '<h3 class="cardTitle" style="margin-bottom:12px">Scan Barcode</h3>';
+  // The camera screen is shared with the recipe ingredient picker, so say which one you're in:
+  // the difference (adds an ingredient vs. logs the food to today) isn't visible otherwise.
+  let inner = '<h3 class="cardTitle" style="margin-bottom:12px">' + (fu.scanTarget === "ingredient" ? "Scan Ingredient" : "Scan Barcode") + '</h3>';
   inner += '<div style="position:relative;background:#000;border-radius:12px;overflow:hidden;margin-bottom:12px;aspect-ratio:4/3">' +
     '<video id="barcodeVideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;display:block"></video>' +
     '<div style="position:absolute;inset:15%;border:2px solid ' + C.primary + '88;border-radius:8px;pointer-events:none"></div>' +
@@ -3311,18 +3472,47 @@ async function startBarcodeCamera() {
   }
 }
 
+// The single hand-off point for a successful barcode lookup. Where the scanned food lands
+// depends on where the scan was started from: normally the Food tab's Adding Food screen, but
+// the recipe ingredient picker's portion screen when fu.scanTarget says the scan came from
+// there. Everything before this point -- the camera, the manual-code box, the customBarcodes
+// lookup, the not-found form -- is shared verbatim by both, so this is the only fork.
+function deliverScannedFood(food, weightStr) {
+  const fu = foodUi();
+  // A lookup can still be in flight when the user backs out of the scan screen, so a delivery
+  // that arrives after that has to be dropped: it would otherwise drag them into a screen they
+  // had already left. That matters most on the ingredient path, where the fallback isn't a
+  // no-op but the Food tab's Adding Food screen -- i.e. logging the item to today's log
+  // instead of adding it to the recipe they were building.
+  if (!fu.scanningBarcode) return;
+  const forIngredient = fu.scanTarget === "ingredient";
+  const rb = fu.recipeBuilder;
+  const pk = rb && rb.picker ? rb.picker : null;
+  fu.scanningBarcode = false;
+  fu.scanTarget = null;
+  fu.scanNotFoundCode = null;
+  if (forIngredient) {
+    if (!pk) { rerender(); return; } // picker closed underneath the scan -- nothing to add to
+    pk.selecting = food;
+    pk.weight = weightStr;
+    pk.servingBasis = null; pk.qty = "1";
+    pendingFocusId = "ingredientWeightInput";
+  } else {
+    fu.addingFood = food;
+    fu.addWeight = weightStr;
+    fu.addServingBasis = null; fu.addQty = "1";
+    pendingFocusId = "addWeightInput";
+  }
+  rerender();
+}
+
 async function handleBarcodeDetected(code) {
   const fu = foodUi();
   fu.scanNotFoundCode = null;
 
   const remembered = state.customBarcodes[code];
   if (remembered) {
-    fu.scanningBarcode = false;
-    fu.addingFood = remembered;
-    fu.addWeight = String(remembered.loggedWeight || (remembered.servingSizes && remembered.servingSizes[0] && remembered.servingSizes[0].grams) || "");
-    fu.addServingBasis = null; fu.addQty = "1";
-    pendingFocusId = "addWeightInput";
-    rerender();
+    deliverScannedFood(remembered, String(remembered.loggedWeight || (remembered.servingSizes && remembered.servingSizes[0] && remembered.servingSizes[0].grams) || ""));
     return;
   }
 
@@ -3330,25 +3520,41 @@ async function handleBarcodeDetected(code) {
   rerender();
   const food = await searchBarcode(code);
   fu.scanLoading = false;
+  if (!fu.scanningBarcode) return; // backed out while the lookup was in flight
   if (!food) {
     fu.scanNotFoundCode = code;
     fu.customBarcodeManual = { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" };
     rerender();
     return;
   }
-  fu.scanningBarcode = false;
-  fu.addingFood = food;
-  fu.addWeight = "";
-  fu.addServingBasis = null; fu.addQty = "1";
-  pendingFocusId = "addWeightInput";
-  rerender();
+  deliverScannedFood(food, "");
 }
 
 actions.openBarcodeScan = function() {
   stopBarcodeCamera(); // safety: in case one was already running
   state.tab = "food";
   state.ui = {};
-  foodUi().scanningBarcode = true;
+  const fu = foodUi();
+  fu.scanTarget = null; // a plain scan logs the food; only the ingredient picker retargets it
+  fu.scanningBarcode = true;
+  rerender();
+  startBarcodeCamera();
+};
+// Scanning a barcode while building a recipe. Deliberately NOT routed through openBarcodeScan:
+// that one resets state.ui wholesale, which would throw away the half-built recipe. Since
+// renderFoodTab checks scanningBarcode *before* recipeBuilder, simply raising the flag swaps
+// the camera screen in on top of the untouched builder -- a lateral move between two depth-2
+// screens (same reasoning as barcode-scan -> adding-food, see collapseOneNavLevel), not a new
+// nav level, so backing out of the camera lands back on the picker rather than dropping the
+// whole builder.
+actions.openIngredientBarcodeScan = function() {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker) return;
+  stopBarcodeCamera(); // safety: in case one was already running
+  const fu = foodUi();
+  fu.scanTarget = "ingredient";
+  fu.scanError = null; fu.scanManualCode = ""; fu.scanLoading = false; fu.scanNotFoundCode = null;
+  fu.scanningBarcode = true;
   rerender();
   startBarcodeCamera();
 };
@@ -3401,12 +3607,9 @@ actions.saveCustomBarcode = function() {
   };
   state.customBarcodes[code] = food;
   saveCustomBarcodes();
-  fu.scanningBarcode = false;
-  fu.scanNotFoundCode = null;
-  fu.addingFood = food;
-  fu.addWeight = String(weight);
-  fu.addServingBasis = null; fu.addQty = "1";
-  rerender();
+  // Same hand-off as a found product: a barcode entered by hand while building a recipe has to
+  // land in the ingredient picker, not in today's log.
+  deliverScannedFood(food, String(weight));
 };
 
 // ---- Recipes ----
@@ -3539,7 +3742,7 @@ function renderRecipeBuilderScreen(fu) {
 actions.openIngredientPicker = function() {
   const rb = foodUi().recipeBuilder;
   if (!rb) return;
-  rb.picker = { mode: "search", query: "", results: [], historyResults: [], recipeResults: [], searching: false, selecting: null, weight: "100", servingBasis: null, qty: "1", manual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" } };
+  rb.picker = { mode: "search", query: "", results: [], historyResults: [], recipeResults: [], searching: false, selecting: null, weight: "100", servingBasis: null, qty: "1", historyQuery: "", manual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" } };
   rerender();
 };
 actions.closeIngredientPicker = function() {
@@ -3591,6 +3794,54 @@ function patchIngredientResultsBlock() {
   const btnEl = document.getElementById("ingredientSearchBtn");
   if (btnEl) { btnEl.disabled = rb.picker.searching; btnEl.textContent = rb.picker.searching ? "..." : "\u{1F50D}"; }
 }
+
+// One shared row for both of the picker's browse tabs (History and Favorites) so they can't
+// drift apart the way the picker's search once drifted from the Food tab's. Mirrors the Food
+// tab's History row: loggedMacros wins over the base fields (it's what was actually eaten last
+// time), and the last-used weight is shown because it's usually the number to retype into the
+// portion field on the next screen.
+function pickerBrowseRow(food, srcTab) {
+  const m = food.loggedMacros || { calories: food.calories, protein: food.protein, carbs: food.carbs, fat: food.fat };
+  const w = food.loggedWeight;
+  return '<div class="foodResult" data-action="selectIngredientFood" data-arg="' + esc_attr(food.id) + '" data-arg2="' + srcTab + '">' +
+    '<div style="display:flex;justify-content:space-between">' +
+      '<div style="color:' + C.text + ';font-weight:500;font-size:14px">' + esc(food.name) + '</div>' +
+      '<span style="color:' + C.calories + ';font-weight:600">' + m.calories + ' kcal</span>' +
+    '</div>' +
+    (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">' + esc(food.brand) + '</div>' : '') +
+    '<div style="display:flex;gap:10px;margin-top:4px;font-size:12px">' +
+      '<span style="color:' + C.protein + '">P: ' + m.protein + 'g</span>' +
+      '<span style="color:' + C.carbs + '">C: ' + m.carbs + 'g</span>' +
+      '<span style="color:' + C.fat + '">F: ' + m.fat + 'g</span>' +
+      (w ? '<span style="color:' + C.textMut + ';margin-left:auto">last: ' + w + 'g</span>' : '') +
+    '</div>' +
+  '</div>';
+}
+
+// Browsing History while building a recipe, not just searching it. The picker's search already
+// surfaces a previously-eaten food from the 1st character, but only if you can remember enough
+// of its name to type -- History is the 500-entry "everything ever added" list, and scrolling
+// it is how you find the thing you can't name. Its own filter (rather than reusing the Food
+// tab's fu.historyQuery) so the two screens' filters don't leak into each other.
+function renderPickerHistoryListBlock(pk) {
+  if (state.recentFoods.length === 0) {
+    return '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No food history yet.</div>';
+  }
+  const list = filterFoodsByQuery(state.recentFoods, pk.historyQuery);
+  if (list.length === 0) {
+    return '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No matches for “' + esc(pk.historyQuery) + '”</div>';
+  }
+  return list.map(function(food) { return pickerBrowseRow(food, "history"); }).join('');
+}
+// Patched into #pickerHistoryListBlock as the filter is typed, never via rerender() -- same
+// no-rerender-on-keystroke rule the Food tab's own History filter follows.
+inputActions.pickerHistoryQuery = function(val) {
+  const rb = foodUi().recipeBuilder;
+  if (!rb || !rb.picker) return;
+  rb.picker.historyQuery = val;
+  const el = document.getElementById("pickerHistoryListBlock");
+  if (el) el.innerHTML = renderPickerHistoryListBlock(rb.picker);
+};
 
 inputActions.ingredientQuery = function(val) {
   const rb = foodUi().recipeBuilder;
@@ -3786,7 +4037,7 @@ function renderIngredientPickerScreen(fu, rb) {
 
   let inner = '<h3 class="cardTitle" style="margin-bottom:12px">Add Ingredient</h3>';
   inner += '<div class="subTabs">' +
-    [["search","Search"],["favorites","Favorites"],["manual","Manual"]].map(function(m) {
+    [["search","Search"],["history","History"],["favorites","Favorites"],["manual","Manual"]].map(function(m) {
       return '<button class="subTabBtn' + (pk.mode === m[0] ? ' active' : '') + '" data-action="setPickerMode" data-arg="' + m[0] + '">' + m[1] + '</button>';
     }).join('') +
   '</div>';
@@ -3796,20 +4047,24 @@ function renderIngredientPickerScreen(fu, rb) {
       textInput({ id: "ingredientQueryInput", value: pk.query, placeholder: "Search foods...", bind: "ingredientQuery", enter: "doIngredientSearch", enterHint: "search", style: "flex:1" }) +
       btn({ id: "ingredientSearchBtn", label: pk.searching ? "..." : "\u{1F50D}", action: "doIngredientSearch", disabled: pk.searching }) +
     '</div>';
+    // Sits under the search box for the same reason the Food tab's Scan button does: it's the
+    // fallback when the thing in your hand has a label but no name you'd think to type.
+    inner += btn({ label: "\u{1F4F7} Scan Barcode", action: "openIngredientBarcodeScan", full: true, outline: true, extraStyle: "margin-bottom:14px" });
     // Patched in place by patchIngredientResultsBlock() as the user types, never via rerender()
     // -- a full rerender mid-keystroke blurs the input and drops the phone keyboard.
     inner += '<div id="ingredientResultsBlock">' + renderIngredientResultsBlock(pk) + '</div>';
+  } else if (pk.mode === "history") {
+    if (state.recentFoods.length > 0) {
+      inner += '<div class="row" style="margin-bottom:12px">' +
+        textInput({ id: "pickerHistoryQueryInput", value: pk.historyQuery, placeholder: "Search history...", bind: "pickerHistoryQuery", style: "flex:1" }) +
+      '</div>';
+    }
+    inner += '<div id="pickerHistoryListBlock">' + renderPickerHistoryListBlock(pk) + '</div>';
   } else if (pk.mode === "favorites") {
     if (state.favorites.length === 0) {
       inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + '">No favorites yet.</div>';
     } else {
-      state.favorites.forEach(function(food) {
-        inner += '<div class="foodResult" data-action="selectIngredientFood" data-arg="' + esc_attr(food.id) + '" data-arg2="favorites">' +
-          '<div style="display:flex;justify-content:space-between">' +
-            '<div style="color:' + C.text + ';font-weight:500;font-size:14px">' + esc(food.name) + '</div>' +
-            '<span style="color:' + C.calories + ';font-weight:600">' + food.calories + ' kcal</span>' +
-          '</div></div>';
-      });
+      state.favorites.forEach(function(food) { inner += pickerBrowseRow(food, "favorites"); });
     }
   } else {
     const m = pk.manual;
@@ -5139,7 +5394,30 @@ function renderTargetsSection() {
     });
     html += '</div>';
   }
+  html += renderTargetHistoryBlock();
   return card(html);
+}
+
+// Read-only, and only once there's actually something to show. Without it the fact that past
+// days are scored against past targets is invisible magic -- this is what makes "why does an
+// old day say I hit my goal when my goal is 2,800?" answerable at a glance.
+function renderTargetHistoryBlock() {
+  const dates = Object.keys(state.targetHistory || {}).sort();
+  if (dates.length === 0) return '';
+  let html = '<div style="margin-top:20px;padding-top:16px;border-top:1px solid ' + C.border + '">' +
+    '<label class="label" style="margin-bottom:8px">Target History</label>' +
+    '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:10px">Past days are scored against the goal that was standing on that day, so changing your target now doesn’t rewrite how those days read.</div>';
+  // Newest first, each row covering "from this date until the next change".
+  for (let i = dates.length - 1; i >= 0; i--) {
+    const t = state.targetHistory[dates[i]];
+    const isCurrent = i === dates.length - 1;
+    const until = isCurrent ? "now" : dayLabel(dates[i + 1]);
+    html += '<div style="display:flex;justify-content:space-between;align-items:baseline;padding:4px 0;font-size:12px">' +
+      '<span style="color:' + (isCurrent ? C.textSec : C.textMut) + '">' + esc(dayLabel(dates[i])) + ' → ' + esc(until) + '</span>' +
+      '<span style="color:' + (isCurrent ? C.calories : C.textMut) + ';font-weight:600">' + (t.calorieTarget || 0).toLocaleString() + ' kcal</span>' +
+    '</div>';
+  }
+  return html + '</div>';
 }
 
 actions.applyPreset = function(name) {
@@ -5661,6 +5939,9 @@ function exportSnapshot() {
     settings: state.settings, foodLogs: state.foodLogs, weights: state.weights,
     favorites: state.favorites, recentFoods: state.recentFoods, foodCache: state.foodCache,
     recipes: state.recipes, customBarcodes: state.customBarcodes, dayBoosts: state.dayBoosts,
+    // Without this a restored backup scores every past day against whatever the target happens
+    // to be at restore time -- the same distortion targetsForDate exists to prevent.
+    targetHistory: state.targetHistory,
     exportDate: new Date().toISOString(), version: "1.1",
   };
 }
@@ -5697,6 +5978,7 @@ changeActions.importData = function(el) {
       // of those leaves the existing cache alone rather than wiping it.
       if (data.foodCache) { state.foodCache = data.foodCache; saveFoodCache(); }
       if (data.dayBoosts) { state.dayBoosts = data.dayBoosts; saveDayBoosts(); }
+      if (data.targetHistory) { state.targetHistory = data.targetHistory; saveTargetHistory(); }
       if (data.recipes) { state.recipes = data.recipes; saveRecipes(); }
       if (data.customBarcodes) { state.customBarcodes = data.customBarcodes; saveCustomBarcodes(); }
       alert("Data imported successfully!");
@@ -5727,11 +6009,14 @@ actions.clearAllData = async function() {
     ]);
   }
   state.settings = Object.assign({}, DEFAULT_SETTINGS);
-  state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {}; state.recipes = []; state.customBarcodes = {}; state.dayBoosts = {};
+  state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {}; state.recipes = []; state.customBarcodes = {}; state.dayBoosts = {}; state.targetHistory = {};
+  // Re-baseline: with the history cleared, the current settings are once again the only thing
+  // any day can be scored against, and the next edit should seed its baseline from them.
+  syncTargetBaseline();
   // Everything those queued deletes referred to is gone from both sides now; leaving them would
   // keep retrying deletes for rows that no longer exist and keep blocking their ids forever.
   savePendingDeletes([]);
-  saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache(); saveRecipes(); saveCustomBarcodes(); saveDayBoosts();
+  saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache(); saveRecipes(); saveCustomBarcodes(); saveDayBoosts(); saveTargetHistory();
   su.clearing = false;
   su.confirmClear = false;
   rerender();
@@ -5742,6 +6027,10 @@ actions.clearAllData = async function() {
 // INIT
 // ============================================================
 cleanExpiredPhotos();
+// Establish what the targets currently are BEFORE anything can call saveSettings, so the first
+// real edit has a true "previous value" to seed the target history's baseline from, and so
+// startup writes aren't mistaken for user edits.
+syncTargetBaseline();
 if (!state.session) pendingFocusId = "loginEmailInput";
 render();
 

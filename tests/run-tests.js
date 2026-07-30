@@ -105,10 +105,17 @@ const exportLine =
   "barcodeCodeForEntry: barcodeCodeForEntry, weightChartXPositions: weightChartXPositions, " +
   "dbResultsExcludingHistory: dbResultsExcludingHistory, " +
   "renderFoodResultGroups: renderFoodResultGroups, renderIngredientResultsBlock: renderIngredientResultsBlock, " +
+  "renderPickerHistoryListBlock: renderPickerHistoryListBlock, pickerBrowseRow: pickerBrowseRow, " +
+  "renderIngredientPickerScreen: renderIngredientPickerScreen, " +
+  "deliverScannedFood: deliverScannedFood, handleBarcodeDetected: handleBarcodeDetected, " +
   "recipeMatchesQuery: recipeMatchesQuery, matchingRecipes: matchingRecipes, filterRecipesByQuery: filterRecipesByQuery, " +
   "historyExcludingRecipes: historyExcludingRecipes, recipeAsFood: recipeAsFood, renderRecipesListBlock: renderRecipesListBlock, " +
   "foodBaseGrams: foodBaseGrams, foodQuantityLabel: foodQuantityLabel, " +
   "isAnimalProteinEntry: isAnimalProteinEntry, entryBrandLine: entryBrandLine, entryHasZeroMacros: entryHasZeroMacros, " +
+  "animalOverrideForFood: animalOverrideForFood, " +
+  "targetsForDate: targetsForDate, recordTargetChange: recordTargetChange, syncTargetBaseline: syncTargetBaseline, " +
+  "targetSnapshotOf: targetSnapshotOf, sameTargets: sameTargets, earliestLoggedDate: earliestLoggedDate, " +
+  "mergeTargetHistoryFromCloud: mergeTargetHistoryFromCloud, renderTargetHistoryBlock: renderTargetHistoryBlock, " +
   "addFoodToLog: addFoodToLog, updateFoodEntry: updateFoodEntry, " +
   "flattenFoodLogsForSync: flattenFoodLogsForSync, " +
   "weightRangeStats: weightRangeStats, weightStatsRangeLabel: weightStatsRangeLabel, weightChartCutoff: weightChartCutoff, " +
@@ -277,6 +284,98 @@ test("actions.saveEntryDetails: refuses to save a blank name", function () {
   M.actions.saveEntryDetails();
   assertEqual(M.state.foodLogs["2026-07-21"][0].name, "Loonie Dog", "original name preserved, blank rejected");
   assertEqual(M.state.ui.editingEntryId, "e1", "editor stays open since nothing was saved");
+});
+
+// ==== the plant/animal call sticks to the FOOD, not just one entry ====
+// It used to be per-entry only: re-adding the same food from History re-guessed from the name,
+// so a correction had to be redone on every single serving, forever.
+function resetProteinOverrideFixtures() {
+  M.state.date = "2026-07-21";
+  M.state.foodLogs = {};
+  M.state.recentFoods = [];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+}
+test("isAnimalProteinEntry: an entry's own call still outranks the food record's", function () {
+  resetProteinOverrideFixtures();
+  M.state.foodCache = { p1: { id: "p1", name: "Protein Shake", animalOverride: true } };
+  assertEqual(M.isAnimalProteinEntry({ foodId: "p1", name: "Protein Shake", animalOverride: false }), false, "this-serving override wins");
+});
+test("isAnimalProteinEntry: falls back to the food record before guessing from the name", function () {
+  resetProteinOverrideFixtures();
+  M.state.foodCache = { p1: { id: "p1", name: "Protein Shake", animalOverride: false } };
+  assertEqual(M.isAnimalProteinEntry({ foodId: "p1", name: "Protein Shake", animalOverride: null }), false, "record's saved call used");
+  M.state.foodCache = {};
+  M.state.recentFoods = [{ id: "p1", name: "Protein Shake", animalOverride: false }];
+  assertEqual(M.isAnimalProteinEntry({ foodId: "p1", name: "Protein Shake", animalOverride: null }), false, "recentFoods is the fallback when foodCache has no copy");
+});
+test("isAnimalProteinEntry: still guesses from the name when nothing has been saved", function () {
+  resetProteinOverrideFixtures();
+  assertEqual(M.isAnimalProteinEntry({ foodId: "x", name: "Grilled Chicken", animalOverride: null }), true, "keyword guess unchanged");
+  assertEqual(M.isAnimalProteinEntry({ foodId: "x", name: "Black Beans", animalOverride: null }), false, "and for plants");
+});
+test("animalOverrideForFood: a saved false is preserved, not collapsed into 'nothing saved'", function () {
+  resetProteinOverrideFixtures();
+  M.state.foodCache = { p1: { id: "p1", animalOverride: false } };
+  assertEqual(M.animalOverrideForFood("p1"), false, "an explicit 'this is plant protein' survives");
+  M.state.foodCache = { p2: { id: "p2" } };
+  assertEqual(M.animalOverrideForFood("p2"), null, "an unset record reads as nothing saved");
+  assertEqual(M.animalOverrideForFood(null), null, "no foodId is safe");
+});
+test("saveEntryDetails: the protein-source call is written back onto the food record", function () {
+  resetProteinOverrideFixtures();
+  M.state.recentFoods = [{ id: "p1", name: "Protein Shake", animalOverride: null }];
+  M.state.favorites = [{ id: "p1", name: "Protein Shake", animalOverride: null }];
+  M.state.foodCache = { p1: { id: "p1", name: "Protein Shake", animalOverride: null } };
+  M.state.foodLogs = { "2026-07-21": [{ id: "e1", foodId: "p1", name: "Protein Shake", brand: "", weight: 300, macros: { calories: 160, protein: 30, carbs: 5, fat: 2, fiber: 0 }, animalOverride: null }] };
+  M.state.ui = { editingEntryId: "e1", entryAnimalOverrideInput: false };
+  M.actions.saveEntryDetails();
+  assertEqual(M.state.foodLogs["2026-07-21"][0].animalOverride, false, "saved on the entry");
+  assertEqual(M.state.recentFoods[0].animalOverride, false, "and propagated to History's record");
+  assertEqual(M.state.favorites[0].animalOverride, false, "and to Favorites");
+  assertEqual(M.state.foodCache.p1.animalOverride, false, "and to the food cache");
+});
+test("saveEntryDetails: name and brand stay per-entry, only the protein source propagates", function () {
+  resetProteinOverrideFixtures();
+  M.state.recentFoods = [{ id: "p1", name: "Protein Shake", brand: "", animalOverride: null }];
+  M.state.foodCache = { p1: { id: "p1", name: "Protein Shake", brand: "", animalOverride: null } };
+  M.state.foodLogs = { "2026-07-21": [{ id: "e1", foodId: "p1", name: "Protein Shake", brand: "", weight: 300, macros: { calories: 160, protein: 30, carbs: 5, fat: 2, fiber: 0 }, animalOverride: null }] };
+  M.state.ui = { editingEntryId: "e1", entryNameInput: "Shake (leftovers)", entryBrandInput: "Homemade", entryAnimalOverrideInput: false };
+  M.actions.saveEntryDetails();
+  assertEqual(M.state.foodLogs["2026-07-21"][0].name, "Shake (leftovers)", "entry renamed");
+  assertEqual(M.state.recentFoods[0].name, "Protein Shake", "the food record keeps its own name");
+  assertEqual(M.state.recentFoods[0].brand, "", "and its own brand");
+  assertEqual(M.state.recentFoods[0].animalOverride, false, "but takes the protein-source call");
+});
+test("saveEntryDetails: choosing Auto clears the saved call instead of leaving it stuck", function () {
+  resetProteinOverrideFixtures();
+  M.state.recentFoods = [{ id: "p1", name: "Protein Shake", animalOverride: false }];
+  M.state.foodCache = { p1: { id: "p1", name: "Protein Shake", animalOverride: false } };
+  M.state.foodLogs = { "2026-07-21": [{ id: "e1", foodId: "p1", name: "Protein Shake", brand: "", weight: 300, macros: { calories: 160, protein: 30, carbs: 5, fat: 2, fiber: 0 }, animalOverride: false }] };
+  M.state.ui = { editingEntryId: "e1", entryAnimalOverrideInput: null };
+  M.actions.saveEntryDetails();
+  assertEqual(M.state.recentFoods[0].animalOverride, null, "record returned to keyword guessing");
+  assertEqual(M.animalOverrideForFood("p1"), null, "nothing saved any more");
+});
+// The point of the whole thing: entries logged BEFORE the correction have animalOverride:null,
+// and must pick up the saved call with no data migration -- the same way the keyword guess has
+// always applied retroactively.
+test("getDayTotals: correcting one serving fixes the plant-protein rollup for every past one", function () {
+  resetProteinOverrideFixtures();
+  M.state.settings.showPlantProtein = true;
+  M.state.foodCache = { p1: { id: "p1", name: "Morning Smoothie", animalOverride: null } };
+  M.state.foodLogs = { "2026-07-21": [
+    { id: "e1", foodId: "p1", name: "Morning Smoothie", weight: 300, macros: { calories: 160, protein: 30, carbs: 5, fat: 2, fiber: 0 }, animalOverride: null },
+    { id: "e2", foodId: "p1", name: "Morning Smoothie", weight: 300, macros: { calories: 160, protein: 30, carbs: 5, fat: 2, fiber: 0 }, animalOverride: null },
+  ] };
+  assertEqual(M.getDayTotals("2026-07-21").plantProtein, 60, "both read as plant while the name doesn't match a keyword");
+  M.state.foodCache.p1.animalOverride = true;
+  assertEqual(M.getDayTotals("2026-07-21").plantProtein, 0, "one saved call reclassifies both servings at once");
+});
+test("addFoodToLog: a future log of a corrected food inherits the call", function () {
+  resetProteinOverrideFixtures();
+  M.addFoodToLog({ id: "p1", name: "Protein Shake", source: "Manual Entry", loggedWeight: 300, calories: 160, protein: 30, carbs: 5, fat: 2, fiber: 0, animalOverride: false });
+  assertEqual(M.state.foodLogs["2026-07-21"][0].animalOverride, false, "carried onto the new entry from the food record");
 });
 
 // ==== isAnimalProteinFood / getDayTotals plant-protein rollup ====
@@ -1167,6 +1266,150 @@ test("selectIngredientFood: a database hit still resolves from the results list"
   M.actions.selectIngredientFood("usda_1");
   assertEqual(rb.picker.selecting.name, "Brown Rice", "database group unaffected by the new history lookup");
 });
+// ==== browsing History from the ingredient picker ====
+// Search only reaches a food you can remember the name of. History is the durable 500-entry
+// "everything ever added" list, and scrolling it is how you find the one you can't name --
+// it was reachable from the Food tab but not while building a recipe.
+test("ingredient picker: History is a browse mode with its own filter, separate from the Food tab's", function () {
+  M.state.recentFoods = [
+    { id: "h1", name: "Loonie Dog", source: "Manual Entry", calories: 235, protein: 8, carbs: 20, fat: 14 },
+    { id: "h2", name: "Greek Yogurt", source: "USDA", calories: 120, protein: 17, carbs: 7, fat: 1 },
+  ];
+  const rb = openIngredientPickerForTest();
+  assertEqual(rb.picker.historyQuery, "", "picker opens with its own empty history filter");
+  M.actions.setPickerMode("history");
+  assertEqual(rb.picker.mode, "history", "History is a selectable picker mode");
+  const all = M.renderPickerHistoryListBlock(rb.picker);
+  assertEqual(all.indexOf("Loonie Dog") >= 0 && all.indexOf("Greek Yogurt") >= 0, true, "unfiltered list shows the whole history");
+  M.inputActions.pickerHistoryQuery("yog");
+  assertEqual(rb.picker.historyQuery, "yog", "filter stored on the picker");
+  assertEqual(M.foodUi().historyQuery, "", "the Food tab's own History filter is untouched");
+  const filtered = M.renderPickerHistoryListBlock(rb.picker);
+  assertEqual(filtered.indexOf("Greek Yogurt") >= 0, true, "match kept");
+  assertEqual(filtered.indexOf("Loonie Dog") >= 0, false, "non-match filtered out");
+});
+test("renderPickerHistoryListBlock: rows add to the recipe, they do not log the food", function () {
+  M.state.recentFoods = [{ id: "h1", name: "Loonie Dog", source: "Manual Entry", calories: 235, protein: 8, carbs: 20, fat: 14 }];
+  const rb = openIngredientPickerForTest();
+  const html = M.renderPickerHistoryListBlock(rb.picker);
+  assertEqual(html.indexOf('data-action="selectIngredientFood"') >= 0, true, "rows target the picker");
+  assertEqual(html.indexOf('data-action="selectFoodForAdd"') >= 0, false, "no leakage of the Food tab's log action");
+  assertEqual(html.indexOf('data-arg2="history"') >= 0, true, "srcTab lets selectIngredientFood resolve from recentFoods");
+});
+test("renderPickerHistoryListBlock: empty and no-match states", function () {
+  M.state.recentFoods = [];
+  const rb = openIngredientPickerForTest();
+  assertEqual(M.renderPickerHistoryListBlock(rb.picker).indexOf("No food history yet") >= 0, true, "empty history explains itself");
+  M.state.recentFoods = [{ id: "h1", name: "Loonie Dog", calories: 235, protein: 8, carbs: 20, fat: 14 }];
+  rb.picker.historyQuery = "zzz";
+  assertEqual(M.renderPickerHistoryListBlock(rb.picker).indexOf("No matches") >= 0, true, "filtered-to-nothing explains itself");
+});
+// Browsing means no query was ever typed, so historyResults is empty -- the food has to be
+// resolved from state.recentFoods via srcTab, the path a tap from the browse list relies on.
+test("selectIngredientFood: resolves a browsed History row with no search having been run", function () {
+  M.state.recentFoods = [{ id: "h7", name: "Leftover Rice", source: "Manual Entry", per100g: false, loggedWeight: 150, calories: 200, protein: 4, carbs: 44, fat: 0 }];
+  M.state.favorites = [];
+  M.state.foodCache = {};
+  const rb = openIngredientPickerForTest();
+  M.actions.setPickerMode("history");
+  assertEqual(rb.picker.historyResults.length, 0, "nothing was searched for");
+  M.actions.selectIngredientFood("h7", "history");
+  assertEqual(!!rb.picker.selecting, true, "the tapped row opened the portion screen");
+  assertEqual(rb.picker.selecting.name, "Leftover Rice", "resolved straight out of recentFoods");
+  assertEqual(rb.picker.servingBasis, null, "serving basis reset for the newly picked food");
+  assertEqual(rb.picker.qty, "1", "quantity reset alongside it");
+});
+// ==== scanning a barcode straight into a recipe ====
+// The camera screen is shared with the Food tab, so the only thing separating "add this to the
+// recipe" from "log this to today" is where the successful lookup is delivered.
+function openPickerAndScanForTest() {
+  const rb = openIngredientPickerForTest();
+  M.actions.openIngredientBarcodeScan();
+  return rb;
+}
+test("openIngredientBarcodeScan: raises the camera on top of the builder without destroying it", function () {
+  const rb = openPickerAndScanForTest();
+  const fu = M.foodUi();
+  assertEqual(fu.scanningBarcode, true, "camera screen is up");
+  assertEqual(fu.scanTarget, "ingredient", "result is retargeted at the picker");
+  assertEqual(fu.recipeBuilder === rb, true, "the half-built recipe survived (openBarcodeScan would have wiped state.ui)");
+  assertEqual(!!fu.recipeBuilder.picker, true, "and so did the picker underneath it");
+  assertEqual(M.computeNavDepth(), 2, "a lateral swap between depth-2 screens, not a new nav level");
+});
+test("deliverScannedFood: an ingredient scan lands in the picker's portion screen, not today's log", function () {
+  openPickerAndScanForTest();
+  const food = { id: "barcode_111", name: "Trail Mix", per100g: false, baseGrams: 40, calories: 200, protein: 5, carbs: 20, fat: 12, servingSizes: [{ label: "40g", grams: 40 }] };
+  M.deliverScannedFood(food, "40");
+  const fu = M.foodUi();
+  assertEqual(fu.recipeBuilder.picker.selecting.name, "Trail Mix", "scanned food opened the ingredient portion screen");
+  assertEqual(fu.recipeBuilder.picker.weight, "40", "carried its portion through");
+  assertEqual(fu.recipeBuilder.picker.servingBasis, null, "serving basis reset for the scanned food");
+  assertEqual(fu.addingFood, null, "nothing was queued for today's log");
+  assertEqual(fu.scanningBarcode, false, "camera screen closed");
+  assertEqual(fu.scanTarget, null, "target cleared so the next plain scan logs normally");
+});
+test("deliverScannedFood: a plain Food-tab scan still lands in Adding Food", function () {
+  M.state.tab = "food";
+  M.state.ui = {};
+  const fu = M.foodUi();
+  fu.scanningBarcode = true;
+  const food = { id: "barcode_222", name: "Oat Bar", per100g: false, baseGrams: 60, calories: 240, protein: 6, carbs: 30, fat: 10 };
+  M.deliverScannedFood(food, "60");
+  assertEqual(fu.addingFood.name, "Oat Bar", "unchanged default route");
+  assertEqual(fu.addWeight, "60", "weight carried through");
+});
+// A lookup can still be in flight when the user backs out. Falling through to the default
+// route would then hijack them into logging the item to today's log -- a thing they never
+// asked for -- so a delivery that arrives after the scan screen closed is dropped.
+test("deliverScannedFood: a result arriving after the user backed out is dropped, not rerouted", function () {
+  openPickerAndScanForTest();
+  M.collapseOneNavLevel(); // physical back out of the camera
+  const fu = M.foodUi();
+  assertEqual(fu.scanningBarcode, false, "back-out closed the scan");
+  assertEqual(fu.scanTarget, null, "and cleared the retarget");
+  M.deliverScannedFood({ id: "barcode_333", name: "Late Result", calories: 100, protein: 1, carbs: 1, fat: 1 }, "50");
+  assertEqual(fu.addingFood, null, "the late result did not open Adding Food");
+  assertEqual(fu.recipeBuilder.picker.selecting, null, "and did not silently appear in the picker either");
+});
+test("deliverScannedFood: an ingredient scan whose picker closed mid-lookup does not fall back to logging", function () {
+  const rb = openPickerAndScanForTest();
+  rb.picker = null; // picker abandoned while the lookup was in flight
+  M.deliverScannedFood({ id: "barcode_444", name: "Orphan", calories: 100, protein: 1, carbs: 1, fat: 1 }, "50");
+  assertEqual(M.foodUi().addingFood, null, "no hand-off to today's log");
+  assertEqual(M.foodUi().scanningBarcode, false, "scan still closed out cleanly");
+});
+// A barcode already corrected/remembered resolves with no network, so this exercises the whole
+// handleBarcodeDetected path (not just the hand-off) against the ingredient route.
+test("handleBarcodeDetected: a remembered barcode scanned from the picker becomes an ingredient", function () {
+  const rb = openPickerAndScanForTest();
+  M.state.customBarcodes = { "5000159484695": { id: "barcode_5000159484695", name: "Snickers", per100g: false, baseGrams: 48, loggedWeight: 48, calories: 245, protein: 4, carbs: 28, fat: 12, servingSizes: [{ label: "48g", grams: 48 }] } };
+  M.handleBarcodeDetected("5000159484695");
+  assertEqual(rb.picker.selecting.name, "Snickers", "remembered product opened the ingredient portion screen");
+  assertEqual(rb.picker.weight, "48", "remembered portion prefilled");
+  assertEqual(M.foodUi().addingFood, null, "not logged to today");
+});
+test("saveCustomBarcode: a not-found barcode entered by hand from the picker becomes an ingredient", function () {
+  const rb = openPickerAndScanForTest();
+  M.state.customBarcodes = {};
+  const fu = M.foodUi();
+  fu.scanNotFoundCode = "999";
+  fu.customBarcodeManual = { name: "Bulk Oats", weight: "80", calories: "300", protein: "10", carbs: "54", fat: "5", fiber: "8" };
+  M.actions.saveCustomBarcode();
+  assertEqual(M.state.customBarcodes["999"].name, "Bulk Oats", "still remembered for future scans");
+  assertEqual(rb.picker.selecting.name, "Bulk Oats", "and handed to the ingredient portion screen");
+  assertEqual(rb.picker.weight, "80", "with the portion just entered");
+  assertEqual(fu.addingFood, null, "not logged to today");
+});
+test("renderIngredientPickerScreen: search mode offers the barcode scanner", function () {
+  M.state.recentFoods = [];
+  M.state.favorites = [];
+  M.state.recipes = [];
+  const rb = openIngredientPickerForTest();
+  const html = M.renderIngredientPickerScreen(M.foodUi(), rb);
+  assertEqual(html.indexOf('data-action="openIngredientBarcodeScan"') >= 0, true, "Scan Barcode button present in the picker");
+  assertEqual(html.indexOf('data-action="openBarcodeScan"') >= 0, false, "not the Food tab's scanner, which would wipe the builder");
+  assertEqual(html.indexOf('data-arg="history"') >= 0, true, "History is offered as a picker mode");
+});
 test("renderIngredientResultsBlock: labels both groups and wires rows to the picker's own action", function () {
   const pk = {
     query: "rice", searching: false,
@@ -1849,6 +2092,10 @@ const FOOD_CREATION_PATHS = [
     name: "Custom barcode entry (saveCustomBarcode then confirmAddFood)",
     covers: [],
     run: function (fu) {
+      // scanningBarcode is part of the real precondition, not scaffolding: the "product not
+      // found" form only ever renders inside renderBarcodeScanScreen, and saveCustomBarcode's
+      // hand-off now drops results that arrive after the scan screen has been left.
+      fu.scanningBarcode = true;
       fu.scanNotFoundCode = "0123456789012";
       fu.customBarcodeManual = { name: "Protein Bar", weight: "60", calories: "220", protein: "20", carbs: "22", fat: "7", fiber: "3" };
       M.actions.saveCustomBarcode(); // sets fu.addingFood + fu.addWeight for the next screen
@@ -2270,7 +2517,12 @@ test("exportSnapshot: foodCache round-trips the baseGrams that logged entries de
 // ============================================================
 // PER-DAY MACRO BOOSTS (heavy-activity days)
 // ============================================================
+// getDayTargets' BASE now comes from targetsForDate, so these boost-math tests have to control
+// that source too -- an empty targetHistory is what makes state.settings the base, which is the
+// condition they were written under.
+M.state.targetHistory = {};
 test("getDayTargets: no boost returns the base targets untouched", function () {
+  M.state.targetHistory = {};
   M.state.settings.calorieTarget = 1876; M.state.settings.proteinTarget = 163;
   M.state.settings.carbsTarget = 153; M.state.settings.fatTarget = 68;
   M.state.dayBoosts = {};
@@ -2278,6 +2530,7 @@ test("getDayTargets: no boost returns the base targets untouched", function () {
   assertEqual(t, { calorieTarget: 1876, proteinTarget: 163, carbsTarget: 153, fatTarget: 68, boost: null }, "base pass-through");
 });
 test("getDayTargets: a boost raises that day's macros and derives the calories via Atwater", function () {
+  M.state.targetHistory = {};
   M.state.dayBoosts = { "2026-07-28": { protein: 20, carbs: 30, fat: 5, updatedAt: "2026-07-28T10:00:00.000Z" } };
   const t = M.getDayTargets("2026-07-28");
   assertEqual(t.proteinTarget, 183, "protein +20");
@@ -2288,6 +2541,7 @@ test("getDayTargets: a boost raises that day's macros and derives the calories v
   assertEqual(M.getDayTargets("2026-07-27").calorieTarget, 1876, "adjacent day unaffected");
 });
 test("getDayTargets: an all-zero boost entry means toggled off, not a zero-shaped boost", function () {
+  M.state.targetHistory = {};
   M.state.dayBoosts = { "2026-07-28": { protein: 0, carbs: 0, fat: 0, updatedAt: "2026-07-28T10:00:00.000Z" } };
   assertEqual(M.getDayTargets("2026-07-28").boost, null, "zero entry is inert");
   assertEqual(M.getDayTargets("2026-07-28").calorieTarget, 1876, "targets are base");
@@ -2316,6 +2570,7 @@ test("bumpDayBoost: a negative boost floors at minus-the-base-target, never belo
   M.state.settings.fatTarget = 68;
 });
 test("getDayTargets: a negative boost lowers the day's targets, floored at zero", function () {
+  M.state.targetHistory = {};
   M.state.settings.calorieTarget = 1876; M.state.settings.proteinTarget = 163;
   M.state.settings.carbsTarget = 153; M.state.settings.fatTarget = 68;
   M.state.dayBoosts = { "2026-07-29": { protein: 0, carbs: -50, fat: -10, updatedAt: "2026-07-28T10:00:00.000Z" } };
@@ -2372,6 +2627,7 @@ test("renderDayBoostBlock: renders the chip closed, the steppers open, and never
 });
 // ==== 7-day deficit/surplus log ====
 test("weeklyDeltaLog: seven calendar days ending on the anchor, oldest first", function () {
+  M.state.targetHistory = {};
   M.state.settings.calorieTarget = 2000;
   M.state.foodLogs = {};
   const rows = M.weeklyDeltaLog("2026-07-28", 7);
@@ -2380,6 +2636,7 @@ test("weeklyDeltaLog: seven calendar days ending on the anchor, oldest first", f
   assertEqual(rows[6].date, "2026-07-28", "ends on the anchor day");
 });
 test("weeklyDeltaLog: delta is intake minus the BASE settings goal, boost or no boost", function () {
+  M.state.targetHistory = {};
   M.state.settings.calorieTarget = 2000;
   M.state.foodLogs = {
     "2026-07-27": [{ id: "a", macros: { calories: 1700 } }],
@@ -2395,6 +2652,7 @@ test("weeklyDeltaLog: delta is intake minus the BASE settings goal, boost or no 
   assertEqual(d28.delta, 350, "350 kcal surplus, measured against 2000, not the boosted target");
 });
 test("weeklyDeltaLog: unlogged days are flagged, not counted as giant deficits", function () {
+  M.state.targetHistory = {};
   M.state.settings.calorieTarget = 2000;
   M.state.foodLogs = { "2026-07-28": [{ id: "a", macros: { calories: 1900 } }] };
   const rows = M.weeklyDeltaLog("2026-07-28", 7);
@@ -2406,12 +2664,14 @@ test("weeklyDeltaLog: unlogged days are flagged, not counted as giant deficits",
   assertEqual(net, -100, "net sums logged days only");
 });
 test("weeklyDeltaLog: spans a month boundary by calendar days", function () {
+  M.state.targetHistory = {};
   M.state.settings.calorieTarget = 2000;
   M.state.foodLogs = {};
   const rows = M.weeklyDeltaLog("2026-08-03", 7);
   assertEqual(rows[0].date, "2026-07-28", "window reaches back across the month edge");
 });
 test("renderWeeklyDeltaCard: renders rows, net, and the no-data state without throwing", function () {
+  M.state.targetHistory = {};
   M.state.settings.calorieTarget = 2000;
   M.state.date = "2026-07-28";
   M.state.foodLogs = { "2026-07-28": [{ id: "a", macros: { calories: 1900 } }] };
@@ -2421,6 +2681,172 @@ test("renderWeeklyDeltaCard: renders rows, net, and the no-data state without th
   assertEqual(html.indexOf("no log") >= 0, true, "empty days say so");
   M.state.foodLogs = {};
   assertEqual(M.renderWeeklyDeltaCard().indexOf("Nothing logged") >= 0, true, "empty week has a friendly state");
+});
+
+// ==== target history: a past day is scored against the goal that was standing THEN ====
+// Reported as: switching from a cut to a bulk made months-old, perfectly on-plan days suddenly
+// read as enormous under-eating, because every past day was being measured against the NEW
+// target. Every test here resets targetHistory so it can't leak into the suites around it.
+function resetTargetHistory() {
+  M.state.targetHistory = {};
+  M.state.dayBoosts = {};
+  M.state.foodLogs = {};
+  M.syncTargetBaseline();
+}
+const TODAY = M.fmtDate(new Date());
+test("targetsForDate: with no history recorded, every day falls back to current settings", function () {
+  resetTargetHistory();
+  M.state.settings.calorieTarget = 1876;
+  M.state.settings.proteinTarget = 163;
+  assertEqual(M.targetsForDate("2026-01-01").calorieTarget, 1876, "unchanged pre-feature behaviour");
+  assertEqual(M.targetsForDate("2026-01-01").proteinTarget, 163, "macros too");
+});
+test("targetsForDate: picks the most recent change dated on or before the day", function () {
+  resetTargetHistory();
+  M.state.targetHistory = {
+    "2026-03-01": { calorieTarget: 1876, proteinTarget: 163, carbsTarget: 153, fatTarget: 68, updatedAt: "2026-03-01T00:00:00.000Z" },
+    "2026-07-15": { calorieTarget: 2800, proteinTarget: 180, carbsTarget: 300, fatTarget: 80, updatedAt: "2026-07-15T00:00:00.000Z" },
+  };
+  assertEqual(M.targetsForDate("2026-05-10").calorieTarget, 1876, "a day inside the cut uses the cut target");
+  assertEqual(M.targetsForDate("2026-07-15").calorieTarget, 2800, "the change applies from its own day forward");
+  assertEqual(M.targetsForDate("2026-09-01").calorieTarget, 2800, "and stays in effect after");
+  // Set current settings to something unmistakable first: a day older than every recorded
+  // change must extend the OLDEST record backwards, never fall through to today's target --
+  // that fall-through would be the original bug all over again.
+  M.state.settings.calorieTarget = 9999;
+  assertEqual(M.targetsForDate("2026-02-01").calorieTarget, 1876, "a day before any entry uses the earliest recorded one, not current settings");
+  resetTargetHistory();
+});
+test("recordTargetChange: does nothing when the targets didn't actually move", function () {
+  resetTargetHistory();
+  M.state.settings.calorieTarget = 2000;
+  M.syncTargetBaseline();
+  assertEqual(M.recordTargetChange(), false, "no entry written for an unrelated settings save");
+  assertEqual(Object.keys(M.state.targetHistory).length, 0, "history untouched");
+});
+// The one and only moment the OLD target is still knowable. Without this baseline every past
+// day falls through to the NEW target -- exactly the distortion being fixed.
+test("recordTargetChange: the first change back-fills a baseline holding the old target", function () {
+  resetTargetHistory();
+  M.state.foodLogs = { "2026-03-02": [{ id: "a", macros: { calories: 1800 } }], "2026-06-01": [{ id: "b", macros: { calories: 1850 } }] };
+  M.state.settings.calorieTarget = 1876;
+  M.state.settings.proteinTarget = 163;
+  M.syncTargetBaseline();
+  M.state.settings.calorieTarget = 2800; // the cut -> bulk switch
+  assertEqual(M.recordTargetChange(), true, "a real change is recorded");
+  assertEqual(M.state.targetHistory["2026-03-02"].calorieTarget, 1876, "baseline back-filled at the earliest logged day, holding the OLD target");
+  assertEqual(M.state.targetHistory[TODAY].calorieTarget, 2800, "and today carries the new one");
+  assertEqual(M.targetsForDate("2026-05-10").calorieTarget, 1876, "so a day from the cut still reads against the cut goal");
+  assertEqual(M.targetsForDate(TODAY).calorieTarget, 2800, "while today reads against the bulk goal");
+  resetTargetHistory();
+});
+test("recordTargetChange: a second change adds today's entry without disturbing the earlier ones", function () {
+  resetTargetHistory();
+  M.state.targetHistory = { "2026-03-01": { calorieTarget: 1876, proteinTarget: 163, carbsTarget: 153, fatTarget: 68, updatedAt: "2026-03-01T00:00:00.000Z" } };
+  M.state.settings.calorieTarget = 1876;
+  M.syncTargetBaseline();
+  M.state.settings.calorieTarget = 2400;
+  M.recordTargetChange();
+  assertEqual(M.state.targetHistory["2026-03-01"].calorieTarget, 1876, "the earlier record is left alone");
+  assertEqual(M.state.targetHistory[TODAY].calorieTarget, 2400, "today updated");
+  resetTargetHistory();
+});
+// Typing "2800" fires an inputAction per keystroke; keying by date is what stops "2", "28" and
+// "280" being persisted as three separate target changes.
+test("recordTargetChange: repeated edits on one day overwrite rather than accumulate", function () {
+  resetTargetHistory();
+  M.state.settings.calorieTarget = 1876;
+  M.syncTargetBaseline();
+  [2, 28, 280, 2800].forEach(function (v) { M.state.settings.calorieTarget = v; M.recordTargetChange(); });
+  assertEqual(Object.keys(M.state.targetHistory).length, 1, "one entry for today, not four");
+  assertEqual(M.state.targetHistory[TODAY].calorieTarget, 2800, "holding the final value");
+  resetTargetHistory();
+});
+test("recordTargetChange: stays inert until boot has established a baseline", function () {
+  resetTargetHistory();
+  M.syncTargetBaseline();
+  const saved = M.targetSnapshotOf(M.state.settings);
+  assertEqual(M.sameTargets(saved, M.targetSnapshotOf(M.state.settings)), true, "baseline matches settings after sync");
+});
+// The actual reported symptom.
+test("weeklyDeltaLog: a cut day keeps reading as on-plan after switching to a bulk", function () {
+  resetTargetHistory();
+  M.state.targetHistory = {
+    "2026-03-01": { calorieTarget: 1900, proteinTarget: 163, carbsTarget: 153, fatTarget: 68, updatedAt: "2026-03-01T00:00:00.000Z" },
+    "2026-07-26": { calorieTarget: 2800, proteinTarget: 180, carbsTarget: 300, fatTarget: 80, updatedAt: "2026-07-26T00:00:00.000Z" },
+  };
+  M.state.foodLogs = {
+    "2026-07-24": [{ id: "a", macros: { calories: 1880 } }], // a cut day, essentially on target
+    "2026-07-28": [{ id: "b", macros: { calories: 2750 } }], // a bulk day, essentially on target
+  };
+  const rows = M.weeklyDeltaLog("2026-07-28", 7);
+  const cutDay = rows.find(function(r){ return r.date === "2026-07-24"; });
+  const bulkDay = rows.find(function(r){ return r.date === "2026-07-28"; });
+  assertEqual(cutDay.target, 1900, "the cut day is scored against the cut goal");
+  assertEqual(cutDay.delta, -20, "so it reads as 20 under, not ~920 under");
+  assertEqual(bulkDay.target, 2800, "the bulk day is scored against the bulk goal");
+  assertEqual(bulkDay.delta, -50, "50 under");
+  resetTargetHistory();
+});
+test("getDayTargets: the base comes from that day's target, with the day boost still applied on top", function () {
+  resetTargetHistory();
+  M.state.targetHistory = {
+    "2026-03-01": { calorieTarget: 1900, proteinTarget: 160, carbsTarget: 150, fatTarget: 60, updatedAt: "2026-03-01T00:00:00.000Z" },
+    "2026-07-26": { calorieTarget: 2800, proteinTarget: 180, carbsTarget: 300, fatTarget: 80, updatedAt: "2026-07-26T00:00:00.000Z" },
+  };
+  assertEqual(M.getDayTargets("2026-07-24").calorieTarget, 1900, "an old day shows the old goal");
+  assertEqual(M.getDayTargets("2026-07-24").proteinTarget, 160, "macros follow too");
+  assertEqual(M.getDayTargets("2026-07-28").calorieTarget, 2800, "a recent day shows the current goal");
+  M.state.dayBoosts = { "2026-07-24": { protein: 10, carbs: 0, fat: 0, updatedAt: "2026-07-24T10:00:00.000Z" } };
+  assertEqual(M.getDayTargets("2026-07-24").calorieTarget, 1940, "boost still stacks on the historical base");
+  resetTargetHistory();
+});
+test("renderWeeklyDeltaCard: names one goal when the week shares it, otherwise says each day's own", function () {
+  resetTargetHistory();
+  M.state.date = "2026-07-28";
+  M.state.settings.calorieTarget = 2000;
+  M.state.foodLogs = { "2026-07-28": [{ id: "a", macros: { calories: 1900 } }] };
+  assertEqual(M.renderWeeklyDeltaCard().indexOf("vs 2,000 kcal goal") >= 0, true, "single goal named");
+  M.state.targetHistory = {
+    "2026-03-01": { calorieTarget: 1900, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-03-01T00:00:00.000Z" },
+    "2026-07-26": { calorieTarget: 2800, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-07-26T00:00:00.000Z" },
+  };
+  const spanning = M.renderWeeklyDeltaCard();
+  assertEqual(spanning.indexOf("each day") >= 0, true, "a week straddling a change refuses to name one number");
+  assertEqual(spanning.indexOf("vs 2,800 kcal goal") >= 0, false, "and does not mislabel the older days");
+  resetTargetHistory();
+});
+test("mergeTargetHistoryFromCloud: per-date newer-wins, same rule as day boosts", function () {
+  resetTargetHistory();
+  M.state.targetHistory = { "2026-07-26": { calorieTarget: 2800, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-07-26T10:00:00.000Z" } };
+  M.mergeTargetHistoryFromCloud({
+    "2026-07-26": { calorieTarget: 2900, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-07-26T12:00:00.000Z" },
+    "2026-03-01": { calorieTarget: 1900, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-03-01T00:00:00.000Z" },
+  });
+  assertEqual(M.state.targetHistory["2026-07-26"].calorieTarget, 2900, "newer cloud stamp wins");
+  assertEqual(M.state.targetHistory["2026-03-01"].calorieTarget, 1900, "a date this device never had is added");
+  M.mergeTargetHistoryFromCloud({ "2026-07-26": { calorieTarget: 1, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-07-26T01:00:00.000Z" } });
+  assertEqual(M.state.targetHistory["2026-07-26"].calorieTarget, 2900, "an older cloud stamp does not clobber");
+  resetTargetHistory();
+});
+test("exportSnapshot: carries targetHistory, or a restored backup rescores every past day", function () {
+  resetTargetHistory();
+  M.state.targetHistory = { "2026-03-01": { calorieTarget: 1900, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-03-01T00:00:00.000Z" } };
+  assertEqual(M.exportSnapshot().targetHistory["2026-03-01"].calorieTarget, 1900, "included in the backup");
+  resetTargetHistory();
+});
+test("renderTargetHistoryBlock: hidden until there is something to show", function () {
+  resetTargetHistory();
+  assertEqual(M.renderTargetHistoryBlock(), "", "nothing rendered on an untouched install");
+  M.state.targetHistory = {
+    "2026-03-01": { calorieTarget: 1900, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-03-01T00:00:00.000Z" },
+    "2026-07-26": { calorieTarget: 2800, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-07-26T00:00:00.000Z" },
+  };
+  const html = M.renderTargetHistoryBlock();
+  assertEqual(html.indexOf("Target History") >= 0, true, "section heading");
+  assertEqual(html.indexOf("1,900 kcal") >= 0 && html.indexOf("2,800 kcal") >= 0, true, "both periods listed");
+  assertEqual(html.indexOf("now") >= 0, true, "the current period runs to now");
+  resetTargetHistory();
 });
 
 test("logoSvg: emits a well-formed mark with the gradient and both paths", function () {
