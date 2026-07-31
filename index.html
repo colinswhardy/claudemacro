@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.18";
+const APP_VERSION = "1.19";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -2166,6 +2166,42 @@ function groupEntriesByHourNewestFirst(entries) {
   });
 }
 
+// ---- Editing the time of day an entry was eaten ----
+// The dashboard's log groups are derived from entry.timestamp by groupEntriesByHourNewestFirst,
+// never from a fixed list of hours -- so simply setting a new time is also what moves an entry
+// into an hour that has nothing logged in it yet. That hour's group appears on its own.
+const ENTRY_TIME_PRESETS = [
+  ["Breakfast", "08:00"], ["Lunch", "12:30"], ["Snack", "15:30"], ["Dinner", "18:30"],
+];
+// Value for <input type="time">, which wants 24-hour "HH:MM" regardless of how the phone
+// displays it. Local hours/minutes, not the ISO string's UTC ones.
+function entryTimeInputValue(entry) {
+  const d = new Date(entry && entry.timestamp);
+  if (isNaN(d.getTime())) return "";
+  return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+}
+function entryTimeLabel(entry) {
+  const d = new Date(entry && entry.timestamp);
+  if (isNaN(d.getTime())) return "an unknown time";
+  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+}
+// Combines the entry's own log DATE with a chosen wall-clock time. Built through the local-time
+// Date constructor rather than by splicing hours into the existing ISO string: an ISO string is
+// UTC, so string surgery would shift the entry by the timezone offset (and by another hour
+// across a DST boundary) -- the same trap fmtDate and weightChartCutoff already exist to avoid.
+// Returns null rather than a bad stamp on unparseable input; seconds are zeroed so a time set by
+// hand sorts predictably against one captured at log time.
+function entryTimestampForTime(dateStr, hhmm) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm == null ? "" : hhmm).trim());
+  if (!m) return null;
+  const hh = parseInt(m[1], 10), mm = parseInt(m[2], 10);
+  if (!(hh >= 0 && hh <= 23) || !(mm >= 0 && mm <= 59)) return null;
+  const d = parseDateStr(String(dateStr || ""));
+  if (isNaN(d.getTime())) return null;
+  d.setHours(hh, mm, 0, 0);
+  return d.toISOString();
+}
+
 // A real, distinct brand is shown as its own line; falling back to the source (e.g. "Manual
 // Entry", "Recipe") would just repeat the source line right underneath it, so that fallback is
 // suppressed here (unlike foodQuantityLabel, which needs a fallback for the math to be right --
@@ -2227,6 +2263,7 @@ function renderEntryEditor(entry) {
       '<button class="sectionBtn' + (section === "portion" ? " active" : "") + '" data-action="setEntrySection" data-arg="portion">Portion</button>' +
       '<button class="sectionBtn' + (section === "macros" ? " active" : "") + '" data-action="setEntrySection" data-arg="macros">Macros</button>' +
       '<button class="sectionBtn' + (section === "details" ? " active" : "") + '" data-action="setEntrySection" data-arg="details">Details</button>' +
+      '<button class="sectionBtn' + (section === "time" ? " active" : "") + '" data-action="setEntrySection" data-arg="time">Time</button>' +
       '<button class="sectionBtn' + (section === "move" ? " active" : "") + '" data-action="setEntrySection" data-arg="move">Move Day</button>' +
       '<button class="sectionBtn' + (section === "copy" ? " active" : "") + '" data-action="setEntrySection" data-arg="copy">Copy</button>' +
     '</div>';
@@ -2288,6 +2325,22 @@ function renderEntryEditor(entry) {
     '</div></div>';
     html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">"Auto" guesses from the food name for the dashboard’s plant-protein estimate. Override it here if it guessed wrong — the choice is saved against this food, so every past and future serving of it uses the same answer.</div>';
     html += btn({ label: "Save Details", action: "saveEntryDetails", small: true });
+  } else if (section === "time") {
+    const timeVal = state.ui.entryTimeInput != null ? state.ui.entryTimeInput : entryTimeInputValue(entry);
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:10px">Logged at <span style="color:' + C.textSec + '">' + esc(entryTimeLabel(entry)) + '</span>. Pick any time of day \u2014 the log groups by hour, so an hour with nothing in it yet simply appears.</div>';
+    // Presets fill the field rather than saving outright (unlike Move Day's Yesterday/Today,
+    // which are exact): "Breakfast" is a rough 8:00 guess most people will want to nudge, so
+    // this mirrors the Portion tab's serving chips -- chip sets the value, Save commits it.
+    html += '<div class="rowWrap" style="margin-bottom:10px">' +
+      ENTRY_TIME_PRESETS.map(function(p) {
+        return '<button class="chip' + (timeVal === p[1] ? ' active' : '') + '" data-action="setEntryTimePreset" data-arg="' + p[1] + '">' + esc(p[0]) + '</button>';
+      }).join('') +
+      '<button class="chip" data-action="setEntryTimeNow">Now</button>' +
+    '</div>';
+    html += '<div class="row" style="align-items:center">' +
+      textInput({ id: "entryTimeInput", value: timeVal, type: "time", bind: "entryTimeInput", enter: "saveEntryTime", style: "flex:1" }) +
+      btn({ label: "Save Time", action: "saveEntryTime", small: true }) +
+    '</div>';
   } else if (section === "move") {
     const targetDate = state.ui.entryMoveDate || state.date;
     html += '<div class="row" style="margin-bottom:10px">' +
@@ -2349,10 +2402,38 @@ inputActions.editMacroProtein = function() { patchEditMacroCalories(); };
 inputActions.editMacroCarbs = function() { patchEditMacroCalories(); };
 inputActions.editMacroFat = function() { patchEditMacroCalories(); };
 
+inputActions.entryTimeInput = function(val) { state.ui.entryTimeInput = val; };
+// Preset chips only fill the field; saving is the explicit second tap (see the comment on the
+// Time tab). rerender() is fine here -- the no-rerender-on-keystroke rule only bites on typed
+// input, and these are buttons.
+actions.setEntryTimePreset = function(hhmm) { state.ui.entryTimeInput = hhmm; rerender(); };
+actions.setEntryTimeNow = function() {
+  const now = new Date();
+  state.ui.entryTimeInput = String(now.getHours()).padStart(2, "0") + ":" + String(now.getMinutes()).padStart(2, "0");
+  rerender();
+};
+actions.saveEntryTime = function() {
+  const id = state.ui.editingEntryId;
+  if (!id) return;
+  const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === id; });
+  if (!entry) return;
+  const val = state.ui.entryTimeInput != null ? state.ui.entryTimeInput : entryTimeInputValue(entry);
+  // Anchored to the entry's own log date, so re-timing never silently relocates it to another
+  // day -- moving days is Move Day's job, and conflating the two would make both surprising.
+  const stamp = entryTimestampForTime(state.date, val);
+  if (!stamp) { showToast("Enter a time like 07:30"); return; }
+  // updateFoodEntry bumps updatedAt, which conflict resolution needs: a re-time is a real edit,
+  // and without a fresh stamp the merge sees cloud == local and the change bounces back.
+  updateFoodEntry(id, { timestamp: stamp });
+  closeEntryEditor();
+  rerender();
+};
+
 function closeEntryEditor() {
   state.ui.editingEntryId = null;
   state.ui.entrySection = "portion";
   state.ui.entryWeightInput = null;
+  state.ui.entryTimeInput = null;
   state.ui.entryMoveDate = null;
   state.ui.entryCopyDate = null;
   state.ui.entryNameInput = null;
@@ -2368,6 +2449,10 @@ actions.toggleEntryEditor = function(entryId) {
     state.ui.editingEntryId = entryId;
     state.ui.entrySection = "portion";
     state.ui.entryWeightInput = entry ? String(entry.weight) : "100";
+    // Seeded here as well as reset in closeEntryEditor: opening a different entry directly from
+    // an already-open one skips the close, and a leftover time from the previous entry would
+    // then be shown as if it were this one's.
+    state.ui.entryTimeInput = entry ? entryTimeInputValue(entry) : null;
     state.ui.entryMoveDate = state.date;
   }
   rerender();

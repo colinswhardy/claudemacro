@@ -113,6 +113,8 @@ const exportLine =
   "foodBaseGrams: foodBaseGrams, foodQuantityLabel: foodQuantityLabel, " +
   "isAnimalProteinEntry: isAnimalProteinEntry, entryBrandLine: entryBrandLine, entryHasZeroMacros: entryHasZeroMacros, " +
   "animalOverrideForFood: animalOverrideForFood, " +
+  "entryTimestampForTime: entryTimestampForTime, entryTimeInputValue: entryTimeInputValue, " +
+  "entryTimeLabel: entryTimeLabel, renderEntryEditor: renderEntryEditor, " +
   "targetsForDate: targetsForDate, recordTargetChange: recordTargetChange, syncTargetBaseline: syncTargetBaseline, " +
   "targetSnapshotOf: targetSnapshotOf, sameTargets: sameTargets, earliestLoggedDate: earliestLoggedDate, " +
   "mergeTargetHistoryFromCloud: mergeTargetHistoryFromCloud, renderTargetHistoryBlock: renderTargetHistoryBlock, " +
@@ -284,6 +286,97 @@ test("actions.saveEntryDetails: refuses to save a blank name", function () {
   M.actions.saveEntryDetails();
   assertEqual(M.state.foodLogs["2026-07-21"][0].name, "Loonie Dog", "original name preserved, blank rejected");
   assertEqual(M.state.ui.editingEntryId, "e1", "editor stays open since nothing was saved");
+});
+
+// ==== editing the time of day an entry was eaten ====
+// The dashboard groups the log by hour off entry.timestamp, so re-timing an entry is also the
+// mechanism for moving it into an hour that has nothing logged in it yet.
+function isoLocal(y, mo, d, h, mi) { return new Date(y, mo - 1, d, h, mi, 0, 0).toISOString(); }
+test("entryTimestampForTime: combines the entry's log date with the chosen wall-clock time", function () {
+  const stamp = M.entryTimestampForTime("2026-07-21", "07:30");
+  assertEqual(stamp, isoLocal(2026, 7, 21, 7, 30), "local 07:30 on that date");
+  const d = new Date(stamp);
+  assertEqual(d.getHours(), 7, "reads back as 7 in local time");
+  assertEqual(d.getMinutes(), 30, "and 30 minutes");
+  assertEqual(d.getSeconds(), 0, "seconds zeroed so hand-set times sort predictably");
+});
+// Built via the local-time Date constructor, never by splicing into the UTC ISO string -- that
+// would shift the entry by the timezone offset and land it in the wrong hour (or wrong day).
+test("entryTimestampForTime: keeps the entry on its own calendar date at the extremes", function () {
+  const midnight = new Date(M.entryTimestampForTime("2026-07-21", "00:00"));
+  assertEqual(M.fmtDate(midnight), "2026-07-21", "00:00 stays on the same local day");
+  assertEqual(midnight.getHours(), 0, "and reads as hour 0");
+  const late = new Date(M.entryTimestampForTime("2026-07-21", "23:59"));
+  assertEqual(M.fmtDate(late), "2026-07-21", "23:59 does not roll into the next day");
+  assertEqual(late.getHours(), 23, "and reads as hour 23");
+});
+test("entryTimestampForTime: rejects junk rather than writing a bad stamp", function () {
+  assertEqual(M.entryTimestampForTime("2026-07-21", "25:00"), null, "hour out of range");
+  assertEqual(M.entryTimestampForTime("2026-07-21", "12:75"), null, "minute out of range");
+  assertEqual(M.entryTimestampForTime("2026-07-21", "lunch"), null, "not a time at all");
+  assertEqual(M.entryTimestampForTime("2026-07-21", ""), null, "blank");
+  assertEqual(M.entryTimestampForTime("2026-07-21", null), null, "null");
+});
+test("entryTimeInputValue: renders 24-hour HH:MM for the native time picker", function () {
+  assertEqual(M.entryTimeInputValue({ timestamp: isoLocal(2026, 7, 21, 7, 5) }), "07:05", "zero-padded");
+  assertEqual(M.entryTimeInputValue({ timestamp: isoLocal(2026, 7, 21, 18, 30) }), "18:30", "afternoon stays 24-hour");
+  assertEqual(M.entryTimeInputValue({ timestamp: "not-a-date" }), "", "unparseable stamp yields an empty field, not NaN:NaN");
+});
+test("saveEntryTime: re-times the entry in place and bumps updatedAt for conflict resolution", function () {
+  M.state.date = "2026-07-21";
+  M.state.foodLogs = { "2026-07-21": [{ id: "e1", foodId: "f1", name: "Toast", weight: 60, macros: { calories: 160, protein: 5, carbs: 30, fat: 2, fiber: 2 }, timestamp: isoLocal(2026, 7, 21, 19, 0), updatedAt: "2026-07-21T19:00:00.000Z" }] };
+  M.state.ui = { editingEntryId: "e1", entryTimeInput: "07:30" };
+  M.actions.saveEntryTime();
+  const saved = M.state.foodLogs["2026-07-21"][0];
+  assertEqual(new Date(saved.timestamp).getHours(), 7, "moved to 7am");
+  assertEqual(M.fmtDate(new Date(saved.timestamp)), "2026-07-21", "still on the same day -- re-timing is not a move");
+  assertEqual(saved.updatedAt !== "2026-07-21T19:00:00.000Z", true, "updatedAt bumped, or the merge would bounce the change back");
+  assertEqual(M.state.ui.editingEntryId, null, "editor closes on save");
+});
+test("saveEntryTime: refuses an unparseable time instead of corrupting the stamp", function () {
+  M.state.date = "2026-07-21";
+  const original = isoLocal(2026, 7, 21, 19, 0);
+  M.state.foodLogs = { "2026-07-21": [{ id: "e1", name: "Toast", weight: 60, macros: { calories: 160, protein: 5, carbs: 30, fat: 2, fiber: 2 }, timestamp: original }] };
+  M.state.ui = { editingEntryId: "e1", entryTimeInput: "nope" };
+  M.actions.saveEntryTime();
+  assertEqual(M.state.foodLogs["2026-07-21"][0].timestamp, original, "timestamp untouched");
+  assertEqual(M.state.ui.editingEntryId, "e1", "editor stays open so the mistake is visible");
+});
+// The second half of the request: moving food into a time of day with nothing logged in it.
+test("re-timing lands an entry in an hour group that did not exist before", function () {
+  M.state.date = "2026-07-21";
+  M.state.foodLogs = { "2026-07-21": [
+    { id: "e1", name: "Dinner", weight: 300, macros: { calories: 700 }, timestamp: isoLocal(2026, 7, 21, 19, 0) },
+    { id: "e2", name: "Toast", weight: 60, macros: { calories: 160 }, timestamp: isoLocal(2026, 7, 21, 19, 30) },
+  ] };
+  const before = M.groupEntriesByHourNewestFirst(M.state.foodLogs["2026-07-21"]).map(function(g){ return g.hour; });
+  assertEqual(before, [19], "everything sits in one hour to start with");
+  M.state.ui = { editingEntryId: "e2", entryTimeInput: "07:30" };
+  M.actions.saveEntryTime();
+  const after = M.groupEntriesByHourNewestFirst(M.state.foodLogs["2026-07-21"]);
+  assertEqual(after.map(function(g){ return g.hour; }), [19, 7], "a 7am group appeared on its own, newest hour first");
+  assertEqual(after[1].label, "7 AM", "labelled from the timestamp, not from a fixed list of hours");
+  assertEqual(after[1].items.length, 1, "and holds the re-timed entry");
+  assertEqual(after[1].items[0].name, "Toast", "the right one");
+});
+test("renderEntryEditor: the Time tab is offered and Move Day still reachable beside it", function () {
+  M.state.date = "2026-07-21";
+  M.state.foodCache = {};
+  const entry = { id: "e1", foodId: "f1", name: "Toast", weight: 60, macros: { calories: 160, protein: 5, carbs: 30, fat: 2, fiber: 2 }, timestamp: isoLocal(2026, 7, 21, 7, 30) };
+  M.state.foodLogs = { "2026-07-21": [entry] };
+  M.state.ui = { editingEntryId: "e1", entrySection: "time" };
+  const html = M.renderEntryEditor(entry);
+  assertEqual(html.indexOf('data-arg="time"') >= 0, true, "Time tab button rendered");
+  assertEqual(html.indexOf('data-arg="move"') >= 0, true, "Move Day tab still present");
+  assertEqual(html.indexOf('data-action="saveEntryTime"') >= 0, true, "save action wired");
+  assertEqual(html.indexOf('type="time"') >= 0, true, "a real time field, so any time is reachable");
+  assertEqual(html.indexOf('data-action="setEntryTimePreset"') >= 0, true, "meal presets offered");
+  // The Move Day tab must still render its own body -- an early branch that swallowed it would
+  // leave the tab visible but dead.
+  M.state.ui.entrySection = "move";
+  const moveHtml = M.renderEntryEditor(entry);
+  assertEqual(moveHtml.indexOf('data-action="moveEntryCustomDate"') >= 0, true, "Move Day body intact");
+  assertEqual(moveHtml.indexOf('data-action="saveEntryTime"') >= 0, false, "and is not the Time body");
 });
 
 // ==== the plant/animal call sticks to the FOOD, not just one entry ====
