@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.19";
+const APP_VERSION = "1.20";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -286,6 +286,12 @@ const state = {
   // targetsForDate. Empty on an install that has never changed a target, which reads exactly
   // like the old behaviour (fall back to state.settings).
   targetHistory: db.get("targetHistory", {}),
+  // What the Fitness Dashboard measured, date -> one row of `dashboard_feed`. READ-ONLY
+  // here: the dashboard is the sole writer of that table and MacroLog only displays it, so
+  // there is deliberately no push/save-to-cloud counterpart (see pullDashboardFeedFromCloud).
+  // Cached locally like everything else so the block renders instantly and offline instead
+  // of popping in after a network round trip.
+  dashboardFeed: db.get("dashboardFeed", {}),
   session: db.get("supabaseSession", null),
   authError: null,
   authLoading: false,
@@ -544,6 +550,66 @@ async function pushWeightsToCloud() {
 async function pullWeightsFromCloud() {
   if (!state.session) return { error: "Not signed in" };
   return pullAllRows("weight_entries?user_id=eq." + state.session.userId + "&select=id,log_date,weight,unit,logged_at,updated_at&order=id");
+}
+
+// ---- Fitness Dashboard feed (READ-ONLY) ----
+// `dashboard_feed` is the one table in this project MacroLog does NOT own: the Fitness
+// Dashboard (separate app, separate DB) publishes one row per day holding what it measured
+// -- calibrated activity burn, the calorie target it would recommend, and its rolling
+// measured TDEE. MacroLog reads it to show "here's what your training actually cost today"
+// next to its own targets.
+//
+// There is deliberately NO push counterpart and no DELETE. Two writers on one table is the
+// conflict class this app's whole sync section exists to avoid, and the rows are derived
+// data the dashboard recomputes and re-upserts anyway -- anything written from here would
+// simply be overwritten on its next publish. If a feature ever needs to send something back
+// to the dashboard, give it its own table rather than making this one bidirectional.
+async function pullDashboardFeedFromCloud() {
+  if (!state.session) return { error: "Not signed in" };
+  return pullAllRows("dashboard_feed?user_id=eq." + state.session.userId +
+    "&select=date,activity_burn_kcal,burn_counted,base_target_kcal,boost_kcal,recommended_target_kcal,tdee_kcal,tdee_low_kcal,tdee_high_kcal,tdee_status,updated_at&order=date");
+}
+
+// Merged per-date rather than replacing the map wholesale: the dashboard publishes a
+// trailing window (14 days), so a wholesale replace would throw away every cached row older
+// than that window each time it syncs. No newer-wins comparison is needed the way food logs
+// need one -- the dashboard is the only writer, so the cloud copy is authoritative by
+// construction and simply wins.
+function mergeDashboardFeedFromCloud(rows) {
+  if (!rows || !rows.length) return 0;
+  let changed = 0;
+  rows.forEach(function(row) {
+    if (!row || !row.date) return;
+    state.dashboardFeed[row.date] = row;
+    changed++;
+  });
+  if (changed) db.set("dashboardFeed", state.dashboardFeed);
+  return changed;
+}
+
+// One day's published numbers, or null. Returns null for a row the dashboard couldn't build
+// a recommendation for, so callers can't render a target of 0 as if it were real.
+function dashboardFeedFor(dateStr) {
+  const row = state.dashboardFeed && state.dashboardFeed[dateStr];
+  if (!row) return null;
+  const rec = parseFloat(row.recommended_target_kcal);
+  if (!isFinite(rec)) return null;
+  const tdee = parseFloat(row.tdee_kcal);
+  return {
+    date: dateStr,
+    burn: Math.round(parseFloat(row.activity_burn_kcal) || 0),
+    // Whether the DASHBOARD counted that burn toward its own recommendation. Printed
+    // verbatim rather than reinterpreted -- the toggle lives over there.
+    burnCounted: row.burn_counted !== false,
+    baseTarget: Math.round(parseFloat(row.base_target_kcal) || 0),
+    boost: Math.round(parseFloat(row.boost_kcal) || 0),
+    recommended: Math.round(rec),
+    // NULL while the dashboard's estimate is still gated on too little data -- shown as
+    // absent rather than as a confident number, same as it does on its own Nutrition page.
+    tdee: isFinite(tdee) ? Math.round(tdee) : null,
+    tdeeLow: isFinite(parseFloat(row.tdee_low_kcal)) ? Math.round(parseFloat(row.tdee_low_kcal)) : null,
+    tdeeHigh: isFinite(parseFloat(row.tdee_high_kcal)) ? Math.round(parseFloat(row.tdee_high_kcal)) : null,
+  };
 }
 
 // ---- Automatic background sync ----
@@ -1010,11 +1076,18 @@ async function pullAndMergeAll() {
   // never a subset. It also makes food-log newer-wins correct: the blind id-upsert on push can't
   // clobber a newer cloud edit with a stale local one, because the merge pulled the newer cloud
   // version in first.
-  const [logsPull, weightsPull, recipesPull, barcodesPull, favsPull, recentPull, cachePull, boostsPull, targetsPull] = await Promise.all([
+  const [logsPull, weightsPull, recipesPull, barcodesPull, favsPull, recentPull, cachePull, boostsPull, targetsPull, feedPull] = await Promise.all([
     pullFoodLogsFromCloud(), pullWeightsFromCloud(), pullRecipesFromCloud(), pullCustomBarcodesFromCloud(),
     pullFavoritesFromCloud(), pullRecentFoodsFromCloud(), pullFoodCacheFromCloud(), pullDayBoostsFromCloud(),
-    pullTargetHistoryFromCloud(),
+    pullTargetHistoryFromCloud(), pullDashboardFeedFromCloud(),
   ]);
+  // feedPull is deliberately EXCLUDED from firstError. A failed pull aborts the whole sync
+  // before the push -- correct for MacroLog's own data, where pushing on top of a failed pull
+  // is the clobber risk -- but the dashboard feed is a read-only display extra owned by
+  // another app. Letting it fail the sync would mean a table missing on a fresh project, an
+  // RLS hiccup, or the dashboard simply never having published would silently stop food and
+  // weights from syncing at all. It fails on its own: the cached rows stay, the block just
+  // shows what it last knew.
   const firstError = logsPull.error || weightsPull.error || recipesPull.error || barcodesPull.error || favsPull.error || recentPull.error || cachePull.error || boostsPull.error || targetsPull.error;
   if (firstError) return { error: firstError };
 
@@ -1027,6 +1100,8 @@ async function pullAndMergeAll() {
   const cacheAdded = mergeFoodCacheFromCloud(cachePull.data && cachePull.data[0] && cachePull.data[0].data);
   mergeDayBoostsFromCloud(boostsPull.data && boostsPull.data[0] && boostsPull.data[0].data);
   mergeTargetHistoryFromCloud(targetsPull.data && targetsPull.data[0] && targetsPull.data[0].data);
+  // Read-only, so it has no place in the push block below -- merge and move on.
+  if (!feedPull.error) mergeDashboardFeedFromCloud(feedPull.data);
 
   // Now push the merged local state up, so anything this device had that the cloud lacked gets
   // persisted. Safe to overwrite the whole-blob collections now: local already contains the
@@ -2046,7 +2121,8 @@ function renderDashboard() {
     progressBar(totals.protein, t.proteinTarget, C.protein, "Protein", (set.showPlantProtein && totals.plantProtein > 0) ? "(" + Math.round(totals.plantProtein) + "g plant-based)" : "") +
     progressBar(totals.carbs, t.carbsTarget, C.carbs, "Carbs", totals.fiber > 0 ? "(" + Math.round(totals.fiber) + "g fiber)" : "") +
     progressBar(totals.fat, t.fatTarget, C.fat, "Fat") +
-    renderDayBoostBlock(t.boost)
+    renderDayBoostBlock(t.boost) +
+    renderDashboardFeedBlock(state.date, t)
   );
 
   html += '<div class="row" style="margin-bottom:16px">' + btn({ label: "\uFF0B Add Food", action: "setTab", arg: "food", full: true }) + '</div>';
@@ -2077,6 +2153,55 @@ function renderDashboard() {
 }
 
 // The per-day activity-boost control, rendered at the bottom of the dashboard's targets card.
+// What the Fitness Dashboard measured for this day, shown under the targets card.
+//
+// SHADOW MODE, deliberately: this reports, it does not decide. getDayTargets() is untouched,
+// so the big number at the top of the dashboard and every progress bar still come from
+// MacroLog's own targets plus its own ⚡ boost. The dashboard's recommendation sits beside
+// them as a second opinion, and acting on it is a manual ⚡ tap. Wiring it straight into the
+// day's target would mean a number Colin never chose moving his calorie goal every time a
+// watch sync landed -- worth doing eventually, but as its own decision with its own switch,
+// not as a side effect of being able to read the feed.
+//
+// Renders nothing at all when the day has no published row (before the dashboard's first
+// publish, or a day outside its trailing window) -- an empty framed block reads as broken.
+function renderDashboardFeedBlock(dateStr, dayTargets) {
+  const feed = dashboardFeedFor(dateStr);
+  if (!feed) return "";
+
+  const diff = feed.recommended - (dayTargets ? dayTargets.calorieTarget : 0);
+  let html = '<div style="border-top:1px solid ' + C.border + ';margin-top:14px;padding-top:12px">';
+  html += '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px">' +
+      '<span style="color:' + C.textSec + ';font-size:12px;font-weight:600">🏃 Fitness Dashboard</span>' +
+      '<span style="color:' + C.text + ';font-size:15px;font-weight:700">' + feed.recommended.toLocaleString() + ' kcal</span>' +
+    '</div>';
+
+  // The burn is the whole point of the integration, so it is named even when it's zero --
+  // "no training logged" is a real answer, and its absence would read as missing data.
+  const burnLine = feed.burn > 0
+    ? (feed.burn.toLocaleString() + ' kcal from activity' + (feed.burnCounted ? '' : ' (not counted in its total)'))
+    : 'No activity burn logged for this day';
+  html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">' + esc(burnLine) + '</div>';
+
+  if (feed.tdee) {
+    const band = (feed.tdeeLow && feed.tdeeHigh)
+      ? ' (' + feed.tdeeLow.toLocaleString() + '–' + feed.tdeeHigh.toLocaleString() + ')'
+      : '';
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:2px">Measured maintenance ' +
+      feed.tdee.toLocaleString() + band + ' kcal/day</div>';
+  }
+
+  // Only worth printing when the two disagree by enough to act on. Below that the difference
+  // is rounding and boost arithmetic, and a "+3 kcal" nudge is noise dressed as a finding.
+  if (Math.abs(diff) >= 25) {
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">' +
+      signedKcal(diff) + ' kcal vs your target here — tap ⚡ above to apply it to this day.</div>';
+  }
+
+  html += '</div>';
+  return html;
+}
+
 // Toggling and stepping are all BUTTONS (no text inputs), so plain rerender() per tap is safe
 // -- the no-rerender-on-keystroke rule only bites on typed fields.
 // Steps are +10g protein / +10g carbs / +5g fat per tap: comparable calorie increments
@@ -6095,6 +6220,10 @@ actions.clearAllData = async function() {
   }
   state.settings = Object.assign({}, DEFAULT_SETTINGS);
   state.foodLogs = {}; state.weights = {}; state.favorites = []; state.recentFoods = []; state.foodCache = {}; state.recipes = []; state.customBarcodes = {}; state.dayBoosts = {}; state.targetHistory = {};
+  // Local cache only, and no DELETE above: dashboard_feed belongs to the Fitness Dashboard.
+  // Clearing MacroLog's data must not destroy another app's records, and the rows repopulate
+  // on the next pull anyway.
+  state.dashboardFeed = {};
   // Re-baseline: with the history cleared, the current settings are once again the only thing
   // any day can be scored against, and the next edit should seed its baseline from them.
   syncTargetBaseline();
@@ -6102,6 +6231,10 @@ actions.clearAllData = async function() {
   // keep retrying deletes for rows that no longer exist and keep blocking their ids forever.
   savePendingDeletes([]);
   saveSettings(); saveFoodLogs(); saveWeights(); saveFavorites(); saveRecentFoods(); saveFoodCache(); saveRecipes(); saveCustomBarcodes(); saveDayBoosts(); saveTargetHistory();
+  // Written directly rather than through a save* helper: every one of those also schedules a
+  // cloud push, and this collection must never be pushed. Without this line the wipe is
+  // in-memory only and the old rows come back on the next reload.
+  db.set("dashboardFeed", {});
   su.clearing = false;
   su.confirmClear = false;
   rerender();

@@ -106,3 +106,42 @@ create policy "own rows only" on recipes          for all using (auth.uid() = us
 create policy "own rows only" on custom_barcodes  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "own rows only" on user_settings    for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "own rows only" on user_app_data    for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- ============================================================
+-- DASHBOARD FEED (written by the Fitness Dashboard, READ by MacroLog)
+-- ============================================================
+-- The one table here MacroLog does not own. The Fitness Dashboard (a separate app with its
+-- own database) publishes one row per day describing what it measured -- calibrated activity
+-- burn, the calorie target it would recommend, and its rolling measured TDEE -- and MacroLog
+-- displays it on the dashboard beside its own targets (see renderDashboardFeedBlock).
+--
+-- Already created in the live project by the dashboard's own migration (2026-08-02); this
+-- block exists so this file stays a complete description of the database, and so a
+-- from-scratch rebuild produces it too.
+--
+-- MacroLog has NO write path to this table and must not grow one: the dashboard recomputes
+-- and re-upserts these rows, so anything written from here is overwritten on its next
+-- publish. Two writers on one table is exactly the conflict class the sync engine avoids.
+create table if not exists dashboard_feed (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  date date not null,
+  activity_burn_kcal integer,                   -- calibrated NET burn for the day; 0 on rest days
+  burn_counted boolean not null default true,   -- did the dashboard count it in its own total
+  base_target_kcal integer,                     -- the dashboard's base target in force that day
+  boost_kcal integer not null default 0,
+  recommended_target_kcal integer,              -- base + (burn if counted) + boost
+  tdee_kcal integer,                            -- rolling measured maintenance; null (never 0)
+  tdee_low_kcal integer,                        -- while the estimate is gated on too little data
+  tdee_high_kcal integer,
+  tdee_status text,
+  updated_at timestamptz not null default now(),
+  primary key (user_id, date)
+);
+
+alter table dashboard_feed enable row level security;
+-- "for all" rather than select-only on purpose: the dashboard writes with the service key
+-- (which bypasses RLS), but if it were ever pointed at a signed-in session instead, a
+-- select-only policy would silently start rejecting its writes. The rows are derived and
+-- self-healing -- the next publish overwrites anything wrong -- so read-only on MacroLog's
+-- side is enforced by having no write path in the client, not by this policy.
+create policy "own rows" on dashboard_feed for all using (auth.uid() = user_id) with check (auth.uid() = user_id);

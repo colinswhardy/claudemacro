@@ -140,6 +140,8 @@ const exportLine =
   "signedKcal: signedKcal, weeklyDeltaLog: weeklyDeltaLog, renderWeeklyDeltaCard: renderWeeklyDeltaCard, " +
   "KEEPALIVE_BODY_BUDGET_BYTES: KEEPALIVE_BODY_BUDGET_BYTES, supabaseTable: supabaseTable, " +
   "flattenWeightsForSync: flattenWeightsForSync, pushWeightsToCloud: pushWeightsToCloud, " +
+  "dashboardFeedFor: dashboardFeedFor, mergeDashboardFeedFromCloud: mergeDashboardFeedFromCloud, " +
+  "renderDashboardFeedBlock: renderDashboardFeedBlock, pullAndMergeAll: pullAndMergeAll, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -3005,6 +3007,103 @@ test("the real weights payload shape at 694 rows exceeds the keepalive budget", 
   assertEqual(M.fitsKeepaliveQuota(body), false, "the payload that killed the sync is correctly kept off keepalive (" + M.utf8ByteLength(body) + " bytes)");
 });
 
+// ==== Fitness Dashboard feed (read-only) ====
+const FEED_ROW = {
+  date: "2026-08-02", activity_burn_kcal: 670, burn_counted: true,
+  base_target_kcal: 1703, boost_kcal: 0, recommended_target_kcal: 2373,
+  tdee_kcal: 2849, tdee_low_kcal: 2752, tdee_high_kcal: 2946, tdee_status: "ok",
+  updated_at: "2026-08-02T12:00:00.000Z",
+};
+
+test("dashboardFeedFor: reads a published day", function () {
+  M.state.dashboardFeed = { "2026-08-02": FEED_ROW };
+  const f = M.dashboardFeedFor("2026-08-02");
+  assertEqual(f.recommended, 2373, "the dashboard's recommended total");
+  assertEqual(f.burn, 670, "calibrated activity burn");
+  assertEqual(f.tdee, 2849, "rolling measured maintenance");
+});
+
+test("dashboardFeedFor: an unpublished day is null, not zeros", function () {
+  M.state.dashboardFeed = { "2026-08-02": FEED_ROW };
+  assertEqual(M.dashboardFeedFor("2026-07-04"), null, "a day with no row");
+  assertEqual(M.dashboardFeedFor("2026-08-02") !== null, true, "control: the published day still reads");
+});
+
+test("dashboardFeedFor: a row with no recommendation is null", function () {
+  // The dashboard skips days it has no goals for, but a null must never render as "0 kcal".
+  M.state.dashboardFeed = { "2026-08-02": Object.assign({}, FEED_ROW, { recommended_target_kcal: null }) };
+  assertEqual(M.dashboardFeedFor("2026-08-02"), null, "no recommendation means nothing to show");
+});
+
+test("dashboardFeedFor: a gated TDEE is null, never 0", function () {
+  M.state.dashboardFeed = { "2026-08-02": Object.assign({}, FEED_ROW, {
+    tdee_kcal: null, tdee_low_kcal: null, tdee_high_kcal: null, tdee_status: "insufficient_data" }) };
+  const f = M.dashboardFeedFor("2026-08-02");
+  assertEqual(f.tdee, null, "an ungated estimate stays absent rather than reading as zero maintenance");
+  assertEqual(f.recommended, 2373, "the rest of the row is still usable");
+});
+
+test("mergeDashboardFeedFromCloud: keeps rows outside the published window", function () {
+  // The dashboard publishes a trailing 14 days. A wholesale replace would drop every older
+  // cached row on each sync -- which is why the merge is per-date.
+  M.state.dashboardFeed = { "2026-07-01": Object.assign({}, FEED_ROW, { date: "2026-07-01" }) };
+  M.mergeDashboardFeedFromCloud([FEED_ROW]);
+  assertEqual(Object.keys(M.state.dashboardFeed).sort(), ["2026-07-01", "2026-08-02"], "old row survived a newer window");
+});
+
+test("mergeDashboardFeedFromCloud: the cloud copy wins for a date already held", function () {
+  M.state.dashboardFeed = { "2026-08-02": Object.assign({}, FEED_ROW, { recommended_target_kcal: 1 }) };
+  M.mergeDashboardFeedFromCloud([FEED_ROW]);
+  assertEqual(M.dashboardFeedFor("2026-08-02").recommended, 2373, "dashboard is the sole writer, so it is authoritative");
+});
+
+test("mergeDashboardFeedFromCloud: an empty or absent pull changes nothing", function () {
+  M.state.dashboardFeed = { "2026-08-02": FEED_ROW };
+  assertEqual(M.mergeDashboardFeedFromCloud(null), 0, "null pull");
+  assertEqual(M.mergeDashboardFeedFromCloud([]), 0, "empty pull");
+  assertEqual(M.dashboardFeedFor("2026-08-02").recommended, 2373, "cache intact");
+});
+
+test("renderDashboardFeedBlock: renders nothing for an unpublished day", function () {
+  M.state.dashboardFeed = {};
+  assertEqual(M.renderDashboardFeedBlock("2026-08-02", { calorieTarget: 2000 }), "", "no empty framed block");
+});
+
+test("renderDashboardFeedBlock: shows the total, the burn and the maintenance band", function () {
+  M.state.dashboardFeed = { "2026-08-02": FEED_ROW };
+  const html = M.renderDashboardFeedBlock("2026-08-02", { calorieTarget: 2000 });
+  assertEqual(html.indexOf("2,373") > -1, true, "the dashboard's recommended total");
+  assertEqual(html.indexOf("670 kcal from activity") > -1, true, "the burn is named");
+  assertEqual(html.indexOf("2,752–2,946") > -1, true, "the TDEE uncertainty band is shown, not just the point estimate");
+});
+
+test("renderDashboardFeedBlock: says so plainly on a rest day", function () {
+  M.state.dashboardFeed = { "2026-08-02": Object.assign({}, FEED_ROW, { activity_burn_kcal: 0, recommended_target_kcal: 1703 }) };
+  const html = M.renderDashboardFeedBlock("2026-08-02", { calorieTarget: 1703 });
+  assertEqual(html.indexOf("No activity burn logged") > -1, true, "zero burn is a real answer, not missing data");
+});
+
+test("renderDashboardFeedBlock: flags a meaningful gap but stays quiet about rounding", function () {
+  M.state.dashboardFeed = { "2026-08-02": FEED_ROW };
+  const wide = M.renderDashboardFeedBlock("2026-08-02", { calorieTarget: 2000 });
+  assertEqual(wide.indexOf("vs your target") > -1, true, "a 373 kcal gap is worth acting on");
+  const close = M.renderDashboardFeedBlock("2026-08-02", { calorieTarget: 2360 });
+  assertEqual(close.indexOf("vs your target") > -1, false, "a 13 kcal gap is noise, not a finding");
+});
+
+test("the feed is SHADOW MODE: it never moves the day's actual targets", function () {
+  // The whole safety property of this feature. If getDayTargets ever starts reading the feed,
+  // a number Colin never chose is silently driving his calorie goal -- that needs its own
+  // switch and its own decision, not to arrive as a side effect of being able to read it.
+  M.state.targetHistory = {};
+  M.state.dayBoosts = {};
+  M.state.settings.calorieTarget = 2000;
+  const before = M.getDayTargets("2026-08-02").calorieTarget;
+  M.state.dashboardFeed = { "2026-08-02": FEED_ROW };
+  assertEqual(M.getDayTargets("2026-08-02").calorieTarget, before, "the published 2,373 does not become the target");
+  assertEqual(before, 2000, "control: the target is still MacroLog's own");
+});
+
 (async function asyncTailThenExit() {
   const okResponse = function () {
     return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve([]); } });
@@ -3050,6 +3149,51 @@ test("the real weights payload shape at 694 rows exceeds the keepalive budget", 
     sandbox.fetch = function () { return Promise.reject(new TypeError("Failed to fetch")); };
     const res = await M.supabaseTable("weight_entries", {});
     assertEqual(typeof res.error, "string", "offline surfaces as {error}, never a throw");
+  });
+
+  await atest("pullAndMergeAll: a broken dashboard_feed pull does NOT abort the sync", async function () {
+    // The one way this read-only extra could do real harm. Every other pull is allowed to
+    // abort the sync before the push, because pushing on top of a failed pull is the clobber
+    // risk. The feed is another app's table -- missing on a fresh project, or briefly 500ing
+    // -- and letting it join that guard would silently stop food and weights from syncing.
+    const posts = [];
+    sandbox.fetch = function (url, init) {
+      if (String(url).indexOf("dashboard_feed") > -1) {
+        return Promise.resolve({ ok: false, status: 404, json: function () {
+          return Promise.resolve({ message: 'relation "public.dashboard_feed" does not exist' }); } });
+      }
+      if (init && init.method === "POST") posts.push(String(url));
+      return okResponse();
+    };
+    M.state.dashboardFeed = { "2026-08-02": FEED_ROW };
+    // Give the food push something to send: it short-circuits on an empty dataset, which
+    // would make the assertion below pass vacuously whether the guard works or not.
+    M.state.foodLogs = { "2026-08-02": [{ id: "log_1", name: "Test", weight: 100,
+      macros: { calories: 200, protein: 10, carbs: 20, fat: 5, fiber: 1 },
+      timestamp: "2026-08-02T12:00:00.000Z", updatedAt: "2026-08-02T12:00:00.000Z" }] };
+
+    const res = await M.pullAndMergeAll();
+
+    assertEqual(res.error, undefined, "the sync still reports success");
+    assertEqual(posts.some(function (u) { return u.indexOf("food_log_entries") > -1; }), true,
+      "and the food push still ran");
+    assertEqual(posts.some(function (u) { return u.indexOf("dashboard_feed") > -1; }), false,
+      "nothing is ever written back to the dashboard's table");
+    assertEqual(M.dashboardFeedFor("2026-08-02").recommended, 2373,
+      "the cached row survives a failed pull instead of being blanked");
+  });
+
+  await atest("pullAndMergeAll: a successful feed pull is merged into state", async function () {
+    sandbox.fetch = function (url) {
+      if (String(url).indexOf("dashboard_feed") > -1) {
+        return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve([FEED_ROW]); } });
+      }
+      return okResponse();
+    };
+    M.state.dashboardFeed = {};
+    const res = await M.pullAndMergeAll();
+    assertEqual(res.error, undefined, "sync ok");
+    assertEqual(M.dashboardFeedFor("2026-08-02").recommended, 2373, "the published row landed");
   });
 
   // Restore the default no-network stub for anything after us.
