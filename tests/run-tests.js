@@ -142,6 +142,14 @@ const exportLine =
   "flattenWeightsForSync: flattenWeightsForSync, pushWeightsToCloud: pushWeightsToCloud, " +
   "dashboardFeedFor: dashboardFeedFor, mergeDashboardFeedFromCloud: mergeDashboardFeedFromCloud, " +
   "renderDashboardFeedBlock: renderDashboardFeedBlock, pullAndMergeAll: pullAndMergeAll, " +
+  "hourGroupMacros: hourGroupMacros, barcodeScanConfirm: barcodeScanConfirm, " +
+  "BARCODE_CONFIRM_MS: BARCODE_CONFIRM_MS, BARCODE_CONFIRM_MIN_READS: BARCODE_CONFIRM_MIN_READS, " +
+  "BARCODE_CONFIRM_STALE_MS: BARCODE_CONFIRM_STALE_MS, " +
+  "weightChartHitBands: weightChartHitBands, renderSelectedWeightSlot: renderSelectedWeightSlot, " +
+  "renderWeightChart: renderWeightChart, renderManualEntryScreen: renderManualEntryScreen, " +
+  "flattenRecipesForSync: flattenRecipesForSync, " +
+  "PERSISTED_COLLECTIONS: PERSISTED_COLLECTIONS, NON_BACKED_UP_KEYS: NON_BACKED_UP_KEYS, " +
+  "changeActions: changeActions, " +
   "inputActions: inputActions, actions: actions, state: state, DEFAULT_SETTINGS: DEFAULT_SETTINGS };\n";
 
 try {
@@ -3198,6 +3206,396 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
 
   // Restore the default no-network stub for anything after us.
   sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+
+  // ==== THE BACKUP CONTRACT ====
+  // These are the tests that make "is everything actually backed up?" a fact rather than a
+  // memory. They walk PERSISTED_COLLECTIONS and check each entry is wired into every path that
+  // has to know about it -- and, crucially, check the reverse direction too: that no persisted
+  // key exists in the source WITHOUT being declared. A new collection added without a backup
+  // path is the failure this suite is here to catch, and it fails silently in every other way
+  // (nothing breaks; the data is just gone the next time he logs in on a new device).
+  test("backup contract: the registry is non-empty and its two lists don't overlap", function () {
+    assertEqual(M.PERSISTED_COLLECTIONS.length > 0, true, "registry has entries");
+    const backed = M.PERSISTED_COLLECTIONS.map(function (c) { return c.key; });
+    const overlap = backed.filter(function (k) { return M.NON_BACKED_UP_KEYS.indexOf(k) > -1; });
+    assertEqual(overlap, [], "no key is both backed up and exempt");
+  });
+
+  test("backup contract: every collection is in exportSnapshot()", function () {
+    const snap = M.exportSnapshot();
+    M.PERSISTED_COLLECTIONS.forEach(function (c) {
+      assertEqual(Object.prototype.hasOwnProperty.call(snap, c.key), true, c.key + " is in the export snapshot");
+    });
+  });
+
+  test("backup contract: every collection is restored by importData", function () {
+    const src = String(M.changeActions.importData);
+    M.PERSISTED_COLLECTIONS.forEach(function (c) {
+      assertEqual(src.indexOf("data." + c.key) > -1, true, c.key + " is restored on import");
+    });
+  });
+
+  test("backup contract: every collection is wiped by clearAllData", function () {
+    const src = String(M.actions.clearAllData);
+    M.PERSISTED_COLLECTIONS.forEach(function (c) {
+      assertEqual(src.indexOf("state." + c.key) > -1, true, c.key + " is cleared by Clear All Data");
+    });
+  });
+
+  test("backup contract: every collection has a real push/pull/merge trio", function () {
+    M.PERSISTED_COLLECTIONS.forEach(function (c) {
+      [c.push, c.pull, c.merge].forEach(function (fnName) {
+        assertEqual(typeof sandbox[fnName], "function", c.key + ": " + fnName + " exists");
+      });
+    });
+  });
+
+  test("backup contract: pullAndMergeAll actually calls each collection's pull and push", function () {
+    const src = String(M.pullAndMergeAll);
+    M.PERSISTED_COLLECTIONS.forEach(function (c) {
+      assertEqual(src.indexOf(c.pull) > -1, true, c.key + ": pulled during a full sync");
+      assertEqual(src.indexOf(c.push) > -1, true, c.key + ": pushed during a full sync");
+    });
+  });
+
+  // The reverse check, and the one that catches a collection added in six months' time: scan
+  // the real source for every localStorage key it reads or writes, and require each to be
+  // accounted for. Adding db.set("newThing", ...) without registering it fails right here.
+  test("backup contract: every persisted localStorage key is declared", function () {
+    const declared = M.PERSISTED_COLLECTIONS.map(function (c) { return c.key; }).concat(M.NON_BACKED_UP_KEYS);
+    const seen = new Set();
+    [...html.matchAll(/db\.(?:get|set)\(\s*"([^"]+)"/g)].forEach(function (m) { seen.add(m[1]); });
+    assertEqual(seen.size > 0, true, "the scan found some keys (the regex still matches)");
+    [...seen].sort().forEach(function (key) {
+      assertEqual(declared.indexOf(key) > -1, true,
+        'localStorage key "' + key + '" is declared in PERSISTED_COLLECTIONS or NON_BACKED_UP_KEYS');
+    });
+  });
+
+  // ==== recipes: newer-wins merge (was additive-only) ====
+  // The bug this replaced: a recipe edited on one device could never reach a device that
+  // already had it, and that device's blind id-upsert then pushed its stale copy back over the
+  // edit -- so the change wasn't just missing on one screen, it was destroyed in the cloud.
+  function resetRecipeState() {
+    M.state.recipes = [];
+    M.savePendingDeletes([]);
+    M.recentlyDeletedIds.recipes.clear();
+  }
+  test("mergeRecipesFromCloud: a newer cloud copy replaces the local one", function () {
+    resetRecipeState();
+    M.state.recipes.push({ id: "recipe_1", name: "Chili", ingredients: [{ name: "beans", weight: 100 }], createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" });
+    const n = M.mergeRecipesFromCloud([{ id: "recipe_1", name: "Chili (better)", ingredients: [{ name: "beans", weight: 200 }], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-02-01T00:00:00Z" }]);
+    assertEqual(n, 1, "counted as changed");
+    assertEqual(M.state.recipes[0].name, "Chili (better)", "the newer name won");
+    assertEqual(M.state.recipes[0].ingredients[0].weight, 200, "the newer ingredients won");
+    assertEqual(M.state.recipes.length, 1, "replaced in place, not duplicated");
+  });
+  test("mergeRecipesFromCloud: an older cloud copy does not clobber a local edit", function () {
+    resetRecipeState();
+    M.state.recipes.push({ id: "recipe_1", name: "Local edit", ingredients: [], createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-03-01T00:00:00Z" });
+    const n = M.mergeRecipesFromCloud([{ id: "recipe_1", name: "Stale", ingredients: [], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-02-01T00:00:00Z" }]);
+    assertEqual(n, 0, "nothing changed");
+    assertEqual(M.state.recipes[0].name, "Local edit", "the local edit survived");
+  });
+  test("mergeRecipesFromCloud: an unstamped cloud copy leaves local alone (backward compatible)", function () {
+    resetRecipeState();
+    M.state.recipes.push({ id: "recipe_1", name: "Local", ingredients: [] });
+    M.mergeRecipesFromCloud([{ id: "recipe_1", name: "Cloud", ingredients: [] }]);
+    assertEqual(M.state.recipes[0].name, "Local", "no stamp on either side keeps local, exactly as before");
+  });
+  test("mergeRecipesFromCloud: a recipe only in the cloud is still added", function () {
+    resetRecipeState();
+    const n = M.mergeRecipesFromCloud([{ id: "recipe_9", name: "New", ingredients: [], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }]);
+    assertEqual(n, 1, "added");
+    assertEqual(M.state.recipes[0].name, "New", "the cloud-only recipe arrived");
+  });
+  test("mergeRecipesFromCloud: a just-deleted recipe is not resurrected", function () {
+    resetRecipeState();
+    M.markRecentlyDeleted("recipes", "recipe_1");
+    M.mergeRecipesFromCloud([{ id: "recipe_1", name: "Zombie", ingredients: [], updated_at: "2030-01-01T00:00:00Z" }]);
+    assertEqual(M.state.recipes.length, 0, "tombstone still beats a newer cloud stamp");
+    M.recentlyDeletedIds.recipes.clear();
+  });
+  test("flattenRecipesForSync: sends updated_at so the other device can resolve the conflict", function () {
+    resetRecipeState();
+    const prevSession = M.state.session;
+    M.state.session = { userId: "u1" };
+    M.state.recipes.push({ id: "recipe_1", name: "R", ingredients: [], createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-05-05T00:00:00Z" });
+    const rows = M.flattenRecipesForSync();
+    assertEqual(rows[0].updated_at, "2026-05-05T00:00:00Z", "the stamp is in the payload");
+    M.state.session = prevSession;
+    resetRecipeState();
+  });
+
+  // ==== custom barcodes: newer-wins merge (was additive-only) ====
+  // Same failure as recipes, with a sharper edge: these rows are what the scanner trusts ahead
+  // of Open Food Facts, so a stale one is silently wrong on every future scan of that product.
+  // The stamp lives inside the `food` jsonb because the table has no updated_at column.
+  function resetBarcodeState() {
+    M.state.customBarcodes = {};
+    M.savePendingDeletes([]);
+    M.recentlyDeletedIds.custom_barcodes.clear();
+  }
+  test("mergeCustomBarcodesFromCloud: a newer correction replaces the local copy", function () {
+    resetBarcodeState();
+    M.state.customBarcodes["123"] = { id: "barcode_123", name: "Old", calories: 100, updatedAt: "2026-01-01T00:00:00Z" };
+    const n = M.mergeCustomBarcodesFromCloud([{ barcode: "123", food: { id: "barcode_123", name: "Corrected", calories: 240, updatedAt: "2026-02-01T00:00:00Z" } }]);
+    assertEqual(n, 1, "counted as changed");
+    assertEqual(M.state.customBarcodes["123"].calories, 240, "the correction arrived");
+  });
+  test("mergeCustomBarcodesFromCloud: an older cloud copy does not clobber a local correction", function () {
+    resetBarcodeState();
+    M.state.customBarcodes["123"] = { id: "barcode_123", name: "Local fix", calories: 240, updatedAt: "2026-03-01T00:00:00Z" };
+    const n = M.mergeCustomBarcodesFromCloud([{ barcode: "123", food: { id: "barcode_123", name: "Stale", calories: 100, updatedAt: "2026-02-01T00:00:00Z" } }]);
+    assertEqual(n, 0, "nothing changed");
+    assertEqual(M.state.customBarcodes["123"].calories, 240, "the local correction survived");
+  });
+  test("mergeCustomBarcodesFromCloud: an unstamped cloud copy leaves local alone", function () {
+    resetBarcodeState();
+    M.state.customBarcodes["123"] = { id: "barcode_123", calories: 240 };
+    M.mergeCustomBarcodesFromCloud([{ barcode: "123", food: { id: "barcode_123", calories: 100 } }]);
+    assertEqual(M.state.customBarcodes["123"].calories, 240, "no stamp keeps local, exactly as before");
+  });
+  test("mergeCustomBarcodesFromCloud: a barcode only in the cloud is still added", function () {
+    resetBarcodeState();
+    const n = M.mergeCustomBarcodesFromCloud([{ barcode: "999", food: { id: "barcode_999", calories: 50 } }]);
+    assertEqual(n, 1, "added");
+    assertEqual(M.state.customBarcodes["999"].calories, 50, "the cloud-only barcode arrived");
+    resetBarcodeState();
+  });
+  test("saveBarcodeCorrection stamps updatedAt, or the correction can never win a merge", function () {
+    resetBarcodeState();
+    const prevLogs = M.state.foodLogs, prevDate = M.state.date;
+    M.state.date = "2026-08-10";
+    M.state.foodLogs = { "2026-08-10": [{
+      id: "log_1", foodId: "barcode_555", name: "Bar", source: "Custom Barcode Entry",
+      weight: 60, macros: { calories: 250, protein: 20, carbs: 25, fat: 8, fiber: 1 },
+    }] };
+    M.actions.saveBarcodeCorrection("log_1");
+    assertEqual(typeof M.state.customBarcodes["555"].updatedAt, "string", "the saved correction carries a stamp");
+    M.state.foodLogs = prevLogs; M.state.date = prevDate;
+    resetBarcodeState();
+  });
+
+  // ==== hourGroupMacros (per-hour P/C/F on the dashboard log headings) ====
+  test("hourGroupMacros: sums calories and the three macros", function () {
+    const items = [
+      { name: "Rice", foodId: "f1", macros: { calories: 200, protein: 4, carbs: 44, fat: 1 } },
+      { name: "Oil", foodId: "f2", macros: { calories: 120, protein: 0, carbs: 0, fat: 14 } },
+    ];
+    const g = M.hourGroupMacros(items);
+    assertEqual([g.calories, g.protein, g.carbs, g.fat], [320, 4, 44, 15], "totals for the hour");
+  });
+  test("hourGroupMacros: plant protein uses the keyword guess by default", function () {
+    const g = M.hourGroupMacros([
+      { name: "Chicken Breast", foodId: "a", macros: { calories: 200, protein: 40, carbs: 0, fat: 4 } },
+      { name: "Black Beans", foodId: "b", macros: { calories: 120, protein: 8, carbs: 20, fat: 1 } },
+    ]);
+    assertEqual([g.protein, g.plantProtein], [48, 8], "total protein is all of it; the bracket is the plant share");
+  });
+  test("hourGroupMacros: an entry's own animalOverride beats the keyword guess", function () {
+    // "Chicken-flavoured" seitan: the name says animal, the manual call says plant.
+    const g = M.hourGroupMacros([
+      { name: "Chicken Style Seitan", foodId: "c", animalOverride: false, macros: { calories: 150, protein: 25, carbs: 5, fat: 2 } },
+    ]);
+    assertEqual([g.protein, g.plantProtein], [25, 25], "the override is respected, same as getDayTotals");
+  });
+  test("hourGroupMacros: empty and missing input are zeros, not NaN", function () {
+    assertEqual(M.hourGroupMacros([]), { calories: 0, protein: 0, carbs: 0, fat: 0, plantProtein: 0 }, "empty hour");
+    assertEqual(M.hourGroupMacros(null), { calories: 0, protein: 0, carbs: 0, fat: 0, plantProtein: 0 }, "null guard");
+  });
+  test("hourGroupMacros: the hour rows sum to the day's totals", function () {
+    const prevLogs = M.state.foodLogs, prevDate = M.state.date, prevCache = M.state.foodCache;
+    M.state.foodCache = {};
+    M.state.date = "2026-08-10";
+    M.state.foodLogs = { "2026-08-10": [
+      { id: "1", name: "Eggs", foodId: "e", timestamp: "2026-08-10T08:15:00", macros: { calories: 200, protein: 18, carbs: 2, fat: 14, fiber: 0 } },
+      { id: "2", name: "Lentil Soup", foodId: "l", timestamp: "2026-08-10T12:30:00", macros: { calories: 300, protein: 16, carbs: 40, fat: 6, fiber: 9 } },
+      { id: "3", name: "Tofu Stir Fry", foodId: "t", timestamp: "2026-08-10T12:50:00", macros: { calories: 400, protein: 22, carbs: 30, fat: 18, fiber: 5 } },
+    ] };
+    const day = M.getDayTotals("2026-08-10");
+    const groups = M.groupEntriesByHourNewestFirst(M.state.foodLogs["2026-08-10"]);
+    const summed = groups.reduce(function (a, grp) {
+      const g = M.hourGroupMacros(grp.items);
+      return { calories: a.calories + g.calories, protein: a.protein + g.protein, carbs: a.carbs + g.carbs, fat: a.fat + g.fat, plantProtein: a.plantProtein + g.plantProtein };
+    }, { calories: 0, protein: 0, carbs: 0, fat: 0, plantProtein: 0 });
+    assertEqual(summed.calories, day.calories, "calories reconcile");
+    assertEqual(summed.protein, day.protein, "protein reconciles");
+    assertEqual(summed.carbs, day.carbs, "carbs reconcile");
+    assertEqual(summed.fat, day.fat, "fat reconciles");
+    assertEqual(summed.plantProtein, day.plantProtein, "the plant share reconciles with the Protein bar");
+    M.state.foodLogs = prevLogs; M.state.date = prevDate; M.state.foodCache = prevCache;
+  });
+
+  // ==== barcodeScanConfirm (the scan-too-fast fix) ====
+  // The scanner used to act on the FIRST frame that decoded anything -- the frame most likely
+  // to be a misread, because the camera is still focusing. A misread code is a code no database
+  // has, which is why it surfaced as "barcode doesn't exist" and why rescanning worked.
+  const CMS = M.BARCODE_CONFIRM_MS;
+  test("barcodeScanConfirm: a single sighting is never accepted", function () {
+    const r = M.barcodeScanConfirm(null, "0123456789012", 1000);
+    assertEqual(r.accepted, null, "one frame is not enough");
+    assertEqual(r.pending.reads, 1, "but progress is recorded");
+  });
+  test("barcodeScanConfirm: a second sighting inside the window is still not accepted", function () {
+    const a = M.barcodeScanConfirm(null, "X", 1000);
+    const b = M.barcodeScanConfirm(a.pending, "X", 1000 + CMS - 1);
+    assertEqual(b.accepted, null, "two reads, but they don't span the window yet");
+    assertEqual(b.pending.reads, 2, "the read still counted");
+  });
+  test("barcodeScanConfirm: the same code twice across the window is accepted", function () {
+    const a = M.barcodeScanConfirm(null, "X", 1000);
+    const b = M.barcodeScanConfirm(a.pending, "X", 1000 + CMS);
+    assertEqual(b.accepted, "X", "agreed on by two frames spanning " + CMS + "ms");
+  });
+  test("barcodeScanConfirm: a disagreeing frame discards the misread and starts over", function () {
+    const a = M.barcodeScanConfirm(null, "MISREAD", 1000);
+    const b = M.barcodeScanConfirm(a.pending, "REAL", 1030);
+    assertEqual(b.accepted, null, "the new code has to earn its own confirmation");
+    assertEqual([b.pending.code, b.pending.reads], ["REAL", 1], "progress restarted on the new code");
+    const c = M.barcodeScanConfirm(b.pending, "REAL", 1030 + CMS);
+    assertEqual(c.accepted, "REAL", "and the real one confirms normally");
+  });
+  test("barcodeScanConfirm: a frame that reads nothing preserves progress", function () {
+    // Otherwise one blurred frame mid-confirmation restarts the count, and on a shaky hand the
+    // scanner could take arbitrarily long -- turning a fix for 'too fast' into 'never fires'.
+    const a = M.barcodeScanConfirm(null, "X", 1000);
+    const blank = M.barcodeScanConfirm(a.pending, null, 1050);
+    assertEqual(blank.pending.reads, 1, "the blank frame didn't reset it");
+    const c = M.barcodeScanConfirm(blank.pending, "X", 1000 + CMS);
+    assertEqual(c.accepted, "X", "confirmation still lands");
+  });
+  test("barcodeScanConfirm: progress goes stale so an old glimpse can't pair with a fresh read", function () {
+    const a = M.barcodeScanConfirm(null, "X", 1000);
+    const late = M.barcodeScanConfirm(a.pending, "X", 1000 + M.BARCODE_CONFIRM_STALE_MS + 1);
+    assertEqual(late.accepted, null, "too long since the last sighting to count as agreement");
+    assertEqual(late.pending.reads, 1, "started over instead");
+  });
+  test("barcodeScanConfirm: no code and no pending state is a no-op", function () {
+    assertEqual(M.barcodeScanConfirm(null, null, 1000), { pending: null, accepted: null }, "idle frame");
+  });
+
+  // ==== weightChartHitBands (bigger tap targets on the weight chart) ====
+  test("weightChartHitBands: bands are contiguous and cover the whole plot", function () {
+    const xs = [40, 100, 300, 450];
+    const bands = M.weightChartHitBands(xs, 36, 450);
+    assertEqual(bands[0].x, 36, "first band starts at the left edge");
+    assertEqual(Math.round(bands[3].x + bands[3].width), 450, "last band ends at the right edge");
+    for (let i = 1; i < bands.length; i++) {
+      assertClose(bands[i].x, bands[i - 1].x + bands[i - 1].width, 0.001, "no gap between band " + (i - 1) + " and " + i);
+    }
+  });
+  test("weightChartHitBands: every point falls inside its own band", function () {
+    const xs = [36, 120, 121, 400, 450];
+    const bands = M.weightChartHitBands(xs, 36, 450);
+    xs.forEach(function (x, i) {
+      const inside = x >= bands[i].x - 0.001 && x <= bands[i].x + bands[i].width + 0.001;
+      assertEqual(inside, true, "point " + i + " at x=" + x + " is inside its own band");
+    });
+  });
+  test("weightChartHitBands: a lone point gets the entire plot width", function () {
+    assertEqual(M.weightChartHitBands([200], 36, 450), [{ x: 36, width: 414 }], "nothing else to compete with");
+  });
+  test("weightChartHitBands: a tap anywhere in the plot maps to the nearest point", function () {
+    const xs = [40, 140, 240];
+    const bands = M.weightChartHitBands(xs, 36, 450);
+    const owner = function (x) {
+      for (let i = 0; i < bands.length; i++) if (x >= bands[i].x && x <= bands[i].x + bands[i].width) return i;
+      return -1;
+    };
+    assertEqual(owner(36), 0, "far left belongs to the first point");
+    assertEqual(owner(89), 0, "just left of the midpoint");
+    assertEqual(owner(91), 1, "just right of the midpoint");
+    assertEqual(owner(449), 2, "far right belongs to the last point (no dead space)");
+  });
+  test("renderWeightChart: the tap targets are full-height rects painted after the dots", function () {
+    const svg = M.renderWeightChart([{ date: "2026-08-01", weight: 180 }, { date: "2026-08-05", weight: 179 }], 150, "2026-08-05");
+    assertEqual(svg.indexOf('<rect') > -1, true, "hit bands are rendered");
+    assertEqual(svg.indexOf('data-action="selectWeightPoint"') > -1, true, "and they're tappable");
+    assertEqual(svg.indexOf('r="12"') === -1, true, "the old small circular hit area is gone");
+    assertEqual(svg.lastIndexOf('<rect') > svg.lastIndexOf('<circle'), true, "rects paint last, so they catch the tap");
+  });
+
+  // ==== renderSelectedWeightSlot (the readout above the chart) ====
+  // The slot must be the same height in every state -- that's the entire reason it moved above
+  // the chart and is always rendered. If any state changes height, the chart shifts under the
+  // user's thumb as they tap along the line, which is what this replaced.
+  test("renderSelectedWeightSlot: identical height whether or not a point is selected", function () {
+    const wu = { timeRange: "30d", confirmDeleteDate: null };
+    const empty = M.renderSelectedWeightSlot(null, wu, "lbs");
+    const filled = M.renderSelectedWeightSlot({ date: "2026-08-05", weight: 179.4 }, wu, "lbs");
+    const confirming = M.renderSelectedWeightSlot({ date: "2026-08-05", weight: 179.4 }, { timeRange: "30d", confirmDeleteDate: "2026-08-05" }, "lbs");
+    const heightOf = function (h) { const m = h.match(/height:(\d+)px/); return m ? m[1] : null; };
+    assertEqual(heightOf(empty) !== null, true, "the slot declares a fixed height");
+    assertEqual(heightOf(filled), heightOf(empty), "selecting a point doesn't move the chart");
+    assertEqual(heightOf(confirming), heightOf(empty), "confirming a delete doesn't move it either");
+  });
+  test("renderSelectedWeightSlot: shows the weight, date and both controls when selected", function () {
+    const out = M.renderSelectedWeightSlot({ date: "2026-08-05", weight: 179.4 }, { timeRange: "30d", confirmDeleteDate: null }, "lbs");
+    assertEqual(out.indexOf("179.4 lbs") > -1, true, "the weight and unit are shown");
+    assertEqual(out.indexOf('data-action="askDeleteWeight"') > -1, true, "delete is still reachable");
+    assertEqual(out.indexOf('data-action="selectWeightPoint"') > -1, true, "dismiss is still reachable");
+  });
+  test("renderSelectedWeightSlot: the All range spells out the year", function () {
+    const out = M.renderSelectedWeightSlot({ date: "2024-08-05", weight: 190 }, { timeRange: "all", confirmDeleteDate: null }, "lbs");
+    assertEqual(out.indexOf("2024") > -1, true, "a multi-year range needs the year to be unambiguous");
+  });
+
+  // ==== Manual Entry -> Save as Recipe ====
+  test("saveManualAsRecipe: creates a one-ingredient recipe from what was typed", function () {
+    const prevRecipes = M.state.recipes;
+    M.state.recipes = [];
+    const fu = M.foodUi();
+    fu.manual = { name: "Protein Shake", weight: "400", calories: "320", protein: "40", carbs: "20", fat: "8", fiber: "3" };
+    fu._recipeSaveLock = 0;
+    M.actions.saveManualAsRecipe();
+    assertEqual(M.state.recipes.length, 1, "a recipe was saved");
+    const r = M.state.recipes[0];
+    assertEqual(r.name, "Protein Shake", "named from the food name");
+    assertEqual(r.ingredients.length, 1, "one ingredient holding the whole thing");
+    assertEqual([r.ingredients[0].weight, r.ingredients[0].calories, r.ingredients[0].protein], [400, 320, 40], "macros carried over as typed");
+    assertEqual(typeof r.updatedAt, "string", "stamped for the newer-wins merge");
+    M.state.recipes = prevRecipes;
+  });
+  test("saveManualAsRecipe: refuses to save an unnamed recipe", function () {
+    const prevRecipes = M.state.recipes;
+    M.state.recipes = [];
+    const fu = M.foodUi();
+    fu.manual = { name: "   ", weight: "100", calories: "50", protein: "1", carbs: "1", fat: "1", fiber: "0" };
+    fu._recipeSaveLock = 0;
+    M.actions.saveManualAsRecipe();
+    assertEqual(M.state.recipes.length, 0, "a nameless recipe could never be found again");
+    M.state.recipes = prevRecipes;
+  });
+  test("saveManualAsRecipe: does not log anything to today", function () {
+    const prevRecipes = M.state.recipes, prevLogs = M.state.foodLogs, prevDate = M.state.date;
+    M.state.recipes = []; M.state.foodLogs = {}; M.state.date = "2026-08-10";
+    const fu = M.foodUi();
+    fu.manual = { name: "Chili", weight: "500", calories: "600", protein: "30", carbs: "60", fat: "20", fiber: "12" };
+    fu._recipeSaveLock = 0;
+    M.actions.saveManualAsRecipe();
+    assertEqual(M.state.recipes.length, 1, "the recipe was saved");
+    assertEqual((M.state.foodLogs["2026-08-10"] || []).length, 0, "saving a definition is not eating it");
+    M.state.recipes = prevRecipes; M.state.foodLogs = prevLogs; M.state.date = prevDate;
+  });
+  test("saveManualAsRecipe: double-tap doesn't create two recipes", function () {
+    const prevRecipes = M.state.recipes;
+    M.state.recipes = [];
+    const fu = M.foodUi();
+    fu.manual = { name: "Oats", weight: "80", calories: "300", protein: "10", carbs: "54", fat: "5", fiber: "8" };
+    fu._recipeSaveLock = 0;
+    M.actions.saveManualAsRecipe();
+    M.actions.saveManualAsRecipe();
+    assertEqual(M.state.recipes.length, 1, "the 600ms lock held");
+    M.state.recipes = prevRecipes;
+  });
+  test("renderManualEntryScreen: offers Save as Recipe alongside Add to Log", function () {
+    const fu = M.foodUi();
+    fu.manual = { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" };
+    const out = M.renderManualEntryScreen(fu);
+    assertEqual(out.indexOf('data-action="saveManualAsRecipe"') > -1, true, "the button is on the screen");
+    assertEqual(out.indexOf('data-action="addManualEntry"') > -1, true, "and logging still is too");
+  });
 
   console.log("\n" + pass + " passed, " + fail + " failed");
   process.exit(fail > 0 ? 1 : 0);

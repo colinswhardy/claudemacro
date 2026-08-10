@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.20";
+const APP_VERSION = "1.21";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -314,6 +314,49 @@ function saveRecipes() { db.set("recipes", state.recipes); scheduleCloudSync("re
 function saveCustomBarcodes() { db.set("customBarcodes", state.customBarcodes); scheduleCloudSync("customBarcodes", pushCustomBarcodesToCloud); }
 function saveDayBoosts() { db.set("dayBoosts", state.dayBoosts); scheduleCloudSync("dayBoosts", pushDayBoostsToCloud); }
 function saveTargetHistory() { db.set("targetHistory", state.targetHistory); scheduleCloudSync("targetHistory", pushTargetHistoryToCloud); }
+
+// ---- The backup contract ----
+// Every collection of Colin's data that has to survive a reinstall, a fresh login, or losing
+// the phone -- declared once, in one list, on purpose.
+//
+// This exists because "is everything actually backed up?" was previously only answerable by
+// reading six separate places (state, save*, exportSnapshot, importData, clearAllData,
+// pullAndMergeAll) and noticing an omission. That is precisely the check a human skips, and
+// the cost of skipping it is silent: nothing breaks, the data just isn't there the next time
+// you log in on a new device -- discovered far too late to recover it. foodCache went missing
+// from exportSnapshot exactly this way.
+//
+// tests/run-tests.js walks this list and fails if any entry is missing from the export
+// snapshot, the importer, the wipe, or the cloud push/pull/merge trio. It ALSO scans the
+// source for every localStorage key read or written through db, and fails on any key that
+// appears in neither this list nor NON_BACKED_UP_KEYS -- so adding a new persisted collection
+// and forgetting to back it up is a red test run, not a discovery months later. Add new
+// collections here first. (That scan is literal, so don't write a db-get/db-set call with a
+// placeholder key in a comment -- it will be picked up as a real one.)
+const PERSISTED_COLLECTIONS = [
+  { key: "settings",       push: "pushSettingsToCloud",       pull: "pullSettingsFromCloud",       merge: "mergeSettingsFromCloud" },
+  { key: "foodLogs",       push: "pushFoodLogsToCloud",       pull: "pullFoodLogsFromCloud",       merge: "mergeFoodLogsFromCloud" },
+  { key: "weights",        push: "pushWeightsToCloud",        pull: "pullWeightsFromCloud",        merge: "mergeWeightsFromCloud" },
+  { key: "favorites",      push: "pushFavoritesToCloud",      pull: "pullFavoritesFromCloud",      merge: "mergeFavoritesFromCloud" },
+  { key: "recentFoods",    push: "pushRecentFoodsToCloud",    pull: "pullRecentFoodsFromCloud",    merge: "mergeRecentFoodsFromCloud" },
+  { key: "foodCache",      push: "pushFoodCacheToCloud",      pull: "pullFoodCacheFromCloud",      merge: "mergeFoodCacheFromCloud" },
+  { key: "recipes",        push: "pushRecipesToCloud",        pull: "pullRecipesFromCloud",        merge: "mergeRecipesFromCloud" },
+  { key: "customBarcodes", push: "pushCustomBarcodesToCloud", pull: "pullCustomBarcodesFromCloud", merge: "mergeCustomBarcodesFromCloud" },
+  { key: "dayBoosts",      push: "pushDayBoostsToCloud",      pull: "pullDayBoostsFromCloud",      merge: "mergeDayBoostsFromCloud" },
+  { key: "targetHistory",  push: "pushTargetHistoryToCloud",  pull: "pullTargetHistoryFromCloud",  merge: "mergeTargetHistoryFromCloud" },
+];
+// Persisted, but deliberately NOT part of the backup contract -- each for a specific reason,
+// stated here so the test's exemption list can't quietly become a place to dump new keys.
+const NON_BACKED_UP_KEYS = [
+  // An auth token. Re-obtained by signing in; backing it up would only copy a credential around.
+  "supabaseSession",
+  // The outstanding-DELETE retry queue. Machinery, not data -- and device-local by definition:
+  // it describes what THIS device still owes the server.
+  "pendingDeletes",
+  // The Fitness Dashboard's rows. Another app owns them and republishes them; MacroLog holds a
+  // read-only cache and has no write path to that table (see pullDashboardFeedFromCloud).
+  "dashboardFeed",
+];
 
 function cleanExpiredPhotos() {
   const now = new Date().toISOString();
@@ -990,7 +1033,14 @@ function mergeFoodCacheFromCloud(cloudDict) {
 // ---- Recipes: one row per recipe, upsert on push, explicit delete on removal ----
 function flattenRecipesForSync() {
   return state.recipes.map(function(r) {
-    return { id: r.id, user_id: state.session.userId, name: r.name, ingredients: r.ingredients, created_at: r.createdAt || new Date().toISOString() };
+    return {
+      id: r.id, user_id: state.session.userId, name: r.name, ingredients: r.ingredients,
+      created_at: r.createdAt || new Date().toISOString(),
+      // Sent so the merge on the other device can tell a newer recipe from an older one. Every
+      // local write path (saveRecipe, and the ingredient rescale in propagateCustomFoodEdit)
+      // stamps updatedAt; the createdAt fallback covers recipes saved before it did.
+      updated_at: r.updatedAt || r.createdAt || new Date().toISOString(),
+    };
   });
 }
 async function pushRecipesToCloud() {
@@ -1001,22 +1051,43 @@ async function pushRecipesToCloud() {
 }
 async function pullRecipesFromCloud() {
   if (!state.session) return { error: "Not signed in" };
-  return supabaseTable("recipes?user_id=eq." + state.session.userId + "&select=id,name,ingredients,created_at");
+  return supabaseTable("recipes?user_id=eq." + state.session.userId + "&select=id,name,ingredients,created_at,updated_at");
 }
-// Note: the recipes table has no updated_at column (unlike food_log_entries/weight_entries),
-// so this stays an additive id-based merge rather than true newer-wins conflict resolution --
-// upgrading it would need a schema migration first.
+// Newer-wins by updated_at, the same rule food_log_entries and weight_entries use (fixed
+// 2026-08-10). This was additive-only by id, which cost real edits: renaming a recipe or
+// changing its ingredients on one device could never reach a second device that already had
+// that recipe -- and because the push is a blind id-upsert, the stale device then pushed its
+// own old copy straight back over the edit. The change wasn't just invisible on one screen,
+// it was destroyed in the cloud on the next sync from anywhere else.
+//
+// No migration was needed: recipes.updated_at has existed since the table was created (it's
+// in supabase/schema.sql and confirmed present in the live project) -- the old comment here
+// claiming otherwise was simply wrong, and it's what kept this un-upgraded.
+//
+// Mutated IN PLACE (index assignment, never a reassignment of state.recipes) for the same
+// reason mergeFoodLogsFromCloud is: a concurrent local mutation must not be swapped out from
+// under it. Records with no updated_at on either side keep the local copy, exactly as before,
+// so nothing already in the database gets reshuffled by this shipping.
 function mergeRecipesFromCloud(cloudRows) {
-  const localIds = new Set(state.recipes.map(function(r){ return r.id; }));
-  let added = 0;
+  const indexById = new Map();
+  state.recipes.forEach(function(r, i) { if (r && r.id) indexById.set(r.id, i); });
+  let changed = 0;
   (cloudRows || []).forEach(function(row) {
-    if (localIds.has(row.id)) return;
     if (wasRecentlyDeleted("recipes", row.id)) return;
-    state.recipes.push({ id: row.id, name: row.name, ingredients: row.ingredients, createdAt: row.created_at });
-    added++;
+    const recipe = { id: row.id, name: row.name, ingredients: row.ingredients, createdAt: row.created_at, updatedAt: row.updated_at || row.created_at };
+    if (!indexById.has(row.id)) {
+      indexById.set(row.id, state.recipes.length);
+      state.recipes.push(recipe);
+      changed++;
+      return;
+    }
+    const i = indexById.get(row.id);
+    if (!foodRecordIsNewer(recipe, state.recipes[i])) return; // local is same-or-newer, keep it
+    state.recipes[i] = recipe;
+    changed++;
   });
   db.set("recipes", state.recipes);
-  return added;
+  return changed;
 }
 
 // ---- Custom barcodes: one row per barcode, upsert on push (no delete UI exists for these) ----
@@ -1035,14 +1106,28 @@ async function pullCustomBarcodesFromCloud() {
   if (!state.session) return { error: "Not signed in" };
   return supabaseTable("custom_barcodes?user_id=eq." + state.session.userId + "&select=barcode,food");
 }
+// Newer-wins per barcode (fixed 2026-08-10), previously additive-only by barcode -- which had
+// exactly the failure mode the recipes merge did: a correction saved for a product on one
+// device could never reach a device that had already scanned it, and that device's blind
+// upsert then pushed the wrong numbers back over the fix. These rows are the ones the scanner
+// trusts ahead of Open Food Facts, so a stale one is silently wrong on every future scan.
+//
+// The stamp is read from INSIDE the food blob rather than a column: custom_barcodes has no
+// updated_at column, but `food` is jsonb and every write path stamps food.updatedAt, so this
+// needed no migration. Same backward-compatible rule as everywhere else (foodRecordIsNewer):
+// a cloud copy only wins by claiming a genuinely newer stamp, so rows written before this
+// shipped carry none and keep behaving additively until something touches them.
 function mergeCustomBarcodesFromCloud(cloudRows) {
-  let added = 0;
+  let changed = 0;
   (cloudRows || []).forEach(function(row) {
     if (wasRecentlyDeleted("custom_barcodes", row.barcode)) return;
-    if (!state.customBarcodes[row.barcode]) { state.customBarcodes[row.barcode] = row.food; added++; }
+    const local = state.customBarcodes[row.barcode];
+    if (local && !foodRecordIsNewer(row.food, local)) return;
+    state.customBarcodes[row.barcode] = row.food;
+    changed++;
   });
   db.set("customBarcodes", state.customBarcodes);
-  return added;
+  return changed;
 }
 
 // Safe to call anytime (login, or periodically in the background).
@@ -2134,10 +2219,23 @@ function renderDashboard() {
       '<span style="color:' + C.textMut + ';font-size:13px">' + entries.length + ' items</span></div>';
 
     groups.forEach(function(group) {
-      const groupCals = group.items.reduce(function(a,i){ return a + (i.macros.calories||0); }, 0);
-      logHtml += '<div style="display:flex;justify-content:space-between;align-items:center;margin:12px 0 8px">' +
-        '<span style="color:' + C.textSec + ';font-size:13px;font-weight:600">\u{1F550} ' + group.label + '</span>' +
-        '<span style="color:' + C.textMut + ';font-size:12px">' + groupCals + ' kcal</span></div>';
+      const gm = hourGroupMacros(group.items);
+      // Bracketed plant share, on the same terms as the Protein progress bar above: only when
+      // there is some, and only when the preference is on. "(0)" on an all-animal hour would
+      // be noise on the row it's meant to annotate.
+      const plantSuffix = (set.showPlantProtein && gm.plantProtein > 0) ? ' (' + Math.round(gm.plantProtein) + ')' : '';
+      // flex-wrap on both the row and the label group: on a narrow phone the macros drop to
+      // their own line rather than squeezing the hour or pushing the kcal off the edge.
+      logHtml += '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;margin:12px 0 8px">' +
+        '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;min-width:0">' +
+          '<span style="color:' + C.textSec + ';font-size:13px;font-weight:600">\u{1F550} ' + group.label + '</span>' +
+          '<span style="display:flex;gap:8px;font-size:11px">' +
+            '<span style="color:' + C.protein + '">P: ' + Math.round(gm.protein) + 'g' + plantSuffix + '</span>' +
+            '<span style="color:' + C.carbs + '">C: ' + Math.round(gm.carbs) + 'g</span>' +
+            '<span style="color:' + C.fat + '">F: ' + Math.round(gm.fat) + 'g</span>' +
+          '</span>' +
+        '</div>' +
+        '<span style="color:' + C.textMut + ';font-size:12px">' + Math.round(gm.calories) + ' kcal</span></div>';
       group.items.forEach(function(entry) {
         logHtml += renderFoodEntry(entry);
       });
@@ -2289,6 +2387,30 @@ function groupEntriesByHourNewestFirst(entries) {
       .map(function(x){ return x.entry; });
     return { hour: h, label: (h === 0 ? 12 : h > 12 ? h - 12 : h) + " " + (h >= 12 ? "PM" : "AM"), items: items };
   });
+}
+
+// Macro rollup for one hour group's heading on the dashboard log.
+//
+// Plant protein comes from isAnimalProteinEntry, NOT the raw isAnimalProteinFood keyword test
+// -- the same three-tier resolution getDayTotals uses (this entry's own call, then the food
+// record's saved call, then the keyword guess). Anything else and an hour row could contradict
+// the Protein bar directly above it about the same food, and the hour rows would stop summing
+// to the day.
+//
+// Pure and state-only (it reads nothing but the entries handed to it, plus the same food
+// records getDayTotals reads), so it's unit-tested directly.
+function hourGroupMacros(items) {
+  return (items || []).reduce(function(acc, e) {
+    const m = e.macros || {};
+    const protein = m.protein || 0;
+    return {
+      calories: acc.calories + (m.calories || 0),
+      protein: acc.protein + protein,
+      carbs: acc.carbs + (m.carbs || 0),
+      fat: acc.fat + (m.fat || 0),
+      plantProtein: acc.plantProtein + (isAnimalProteinEntry(e) ? 0 : protein),
+    };
+  }, { calories: 0, protein: 0, carbs: 0, fat: 0, plantProtein: 0 });
 }
 
 // ---- Editing the time of day an entry was eaten ----
@@ -2708,6 +2830,7 @@ function propagateCustomFoodEdit(entry, newMacros) {
         // servingSizes[0] -- so that has to be re-stated too, not just baseGrams.
         const barcodeUpdates = Object.assign({}, updates);
         if (w > 0) barcodeUpdates.servingSizes = [{ label: round1(w) + "g", grams: w }];
+        barcodeUpdates.updatedAt = new Date().toISOString(); // conflict-resolution stamp (see mergeCustomBarcodesFromCloud)
         state.customBarcodes[code] = Object.assign({}, state.customBarcodes[code], barcodeUpdates);
         saveCustomBarcodes();
       }
@@ -2810,6 +2933,9 @@ actions.saveBarcodeCorrection = function(entryId) {
     id: "barcode_" + code, name: entry.name, brand: entry.brand || "", source: "Custom Barcode Entry",
     per100g: false, calories: m.calories, protein: m.protein, carbs: m.carbs, fat: m.fat, fiber: m.fiber || 0,
     state: "—", baseGrams: w, servingSizes: [{ label: round1(w) + "g", grams: w }],
+    // Required, not decorative: mergeCustomBarcodesFromCloud resolves conflicts on this stamp,
+    // and an unstamped correction can never beat the older copy already in the cloud.
+    updatedAt: new Date().toISOString(),
   };
   saveCustomBarcodes();
   showToast("Saved — future scans will use this");
@@ -3631,6 +3757,10 @@ function renderBarcodeScanScreen(fu) {
     '<video id="barcodeVideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;display:block"></video>' +
     '<div style="position:absolute;inset:15%;border:2px solid ' + C.primary + '88;border-radius:8px;pointer-events:none"></div>' +
   '</div>';
+  // Filled in by patchBarcodeScanHint() while a code is being confirmed across frames, so the
+  // extra fraction of a second reads as the scanner working rather than as it ignoring you.
+  // Fixed height: the text appearing and disappearing must not shift the controls below it.
+  inner += '<div id="barcodeScanHint" style="height:18px;text-align:center;color:' + C.primary + ';font-size:12px;margin-bottom:6px"></div>';
   if (fu.scanLoading) inner += '<div style="text-align:center;color:' + C.textMut + ';font-size:13px;margin-bottom:12px">Looking up product…</div>';
   if (fu.scanError) inner += '<div style="padding:10px 12px;background:' + C.warning + '15;border-radius:8px;color:' + C.warning + ';font-size:13px;margin-bottom:12px">' + esc(fu.scanError) + '</div>';
   inner += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:16px">Point your camera at a barcode — it scans automatically. Or type the number in below.</div>';
@@ -3645,6 +3775,49 @@ function renderBarcodeScanScreen(fu) {
 function stopBarcodeCamera() {
   if (barcodeDetectionRAF) { cancelAnimationFrame(barcodeDetectionRAF); barcodeDetectionRAF = null; }
   if (barcodeStream) { barcodeStream.getTracks().forEach(function(t){ t.stop(); }); barcodeStream = null; }
+}
+
+// ---- Scan confirmation window (added 2026-08-10) ----
+// The scan loop used to accept the very FIRST frame BarcodeDetector returned anything for, and
+// act on it immediately. That first frame is the worst one available: the camera is still
+// autofocusing and metering, so a partial or misread value is entirely normal there -- and a
+// misread code is a code no database has, which surfaced as "this barcode doesn't exist" for a
+// product that scans fine on the second try. The retry worked not because the barcode changed
+// but because by then the camera had settled.
+//
+// So a value now has to be READ TWICE, and those reads have to span at least 200ms, before it
+// counts. That's the ~0.2s Colin offered to trade for accuracy, and it's spent on the specific
+// thing that was going wrong: a one-frame misread is discarded because the next read disagrees
+// with it, while a genuine barcode reads the same every frame and confirms as fast as the
+// window allows.
+const BARCODE_CONFIRM_MS = 200;
+const BARCODE_CONFIRM_MIN_READS = 2;
+// How long a partial confirmation survives without a fresh sighting.
+const BARCODE_CONFIRM_STALE_MS = 1500;
+// Pure: (pending, codeSeenThisFrame|null, now) -> {pending, accepted}. Unit-tested directly.
+function barcodeScanConfirm(pending, code, now) {
+  // A frame that reads nothing does NOT reset progress. A blurred or shaky frame between two
+  // good reads is completely normal, and starting over on each one would make confirmation take
+  // arbitrarily long -- turning a fix for "too fast" into a scanner that never fires. Progress
+  // does go stale on its own timer instead: past BARCODE_CONFIRM_STALE_MS since the last
+  // sighting it starts over, so a code glimpsed once and then lost can't pair up with a single
+  // fresh read much later to manufacture a confirmation neither of them earned.
+  const alive = (pending && (now - pending.lastSeenAt) <= BARCODE_CONFIRM_STALE_MS) ? pending : null;
+  if (!code) return { pending: alive, accepted: null };
+  // A DIFFERENT value does reset, and that's the whole point: it's the disagreement between two
+  // frames that identifies one of them as a misread.
+  if (!alive || alive.code !== code) return { pending: { code: code, firstSeenAt: now, lastSeenAt: now, reads: 1 }, accepted: null };
+  const next = { code: code, firstSeenAt: alive.firstSeenAt, lastSeenAt: now, reads: alive.reads + 1 };
+  const settled = next.reads >= BARCODE_CONFIRM_MIN_READS && (now - next.firstSeenAt) >= BARCODE_CONFIRM_MS;
+  return { pending: next, accepted: settled ? code : null };
+}
+// Patched directly, never via rerender(): a rerender rebuilds the <video> element and would
+// tear down the camera stream mid-scan. Same no-rerender discipline the typed inputs follow,
+// for a different reason.
+function patchBarcodeScanHint(pending) {
+  const el = document.getElementById("barcodeScanHint");
+  if (!el) return;
+  el.textContent = pending ? "Reading " + pending.code + " — hold steady…" : "";
 }
 
 async function startBarcodeCamera() {
@@ -3663,13 +3836,19 @@ async function startBarcodeCamera() {
     video.srcObject = stream;
     await video.play();
     const detector = new BarcodeDetector({ formats: ["ean_13", "ean_8", "upc_a", "upc_e", "code_128"] });
+    // Confirmation progress for the current candidate code. Scoped to this closure, so opening
+    // the scanner again always starts clean without needing an explicit reset.
+    let pendingScan = null;
     const tick = async function() {
       if (!foodUi().scanningBarcode) return;
       try {
         const codes = await detector.detect(video);
-        if (codes.length > 0) {
+        const step = barcodeScanConfirm(pendingScan, codes.length > 0 ? codes[0].rawValue : null, Date.now());
+        pendingScan = step.pending;
+        patchBarcodeScanHint(step.pending);
+        if (step.accepted) {
           stopBarcodeCamera();
-          handleBarcodeDetected(codes[0].rawValue);
+          handleBarcodeDetected(step.accepted);
           return;
         }
       } catch (e) { /* keep trying next frame */ }
@@ -3814,6 +3993,7 @@ actions.saveCustomBarcode = function() {
     per100g: false, calories: Math.max(0, parseFloat(m.calories) || 0), protein: Math.max(0, parseFloat(m.protein) || 0),
     carbs: Math.max(0, parseFloat(m.carbs) || 0), fat: Math.max(0, parseFloat(m.fat) || 0), fiber: Math.max(0, parseFloat(m.fiber) || 0),
     state: "—", baseGrams: weight, servingSizes: [{ label: round1(weight) + "g", grams: weight }],
+    updatedAt: new Date().toISOString(), // conflict-resolution stamp (see mergeCustomBarcodesFromCloud)
   };
   state.customBarcodes[code] = food;
   saveCustomBarcodes();
@@ -4536,7 +4716,14 @@ function renderManualEntryScreen(fu) {
     '<div class="row" style="margin-top:16px">' +
       btn({ label: "Cancel", action: "closeManualEntry", outline: true, full: true }) +
       btn({ label: "Add to Log", action: "addManualEntry", full: true }) +
-    '</div>'
+    '</div>' +
+    // On its own row rather than a third button squeezed above: it isn't an alternative to
+    // logging, it's a separate thing you can do with what you just typed, and doing both is
+    // normal (save the definition, then log today's serving).
+    '<div style="margin-top:10px">' +
+      btn({ label: "\u{1F372} Save as Recipe", action: "saveManualAsRecipe", outline: true, full: true }) +
+    '</div>' +
+    '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px">Saves this as a reusable recipe you can re-log at any weight, add ingredients to, or nest inside another recipe. Doesn’t log it.</div>'
   );
 }
 function manualField(key, label, value, color, id) {
@@ -4587,6 +4774,52 @@ actions.addManualEntry = function() {
   addFoodToLog(food);
   fu.manual = { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" };
   stepBackOneLevel();
+};
+
+// Save what's typed on the Manual Entry screen as a one-ingredient recipe (added 2026-08-10).
+//
+// A manual food already lands in History and can be re-added, so what this buys is the thing
+// only a recipe is: a definition that stays editable as a COMPOSITION. It can be re-logged at
+// any weight against its own total, gain ingredients later, and be nested inside another
+// recipe -- none of which a fixed History record can do.
+//
+// Deliberately does NOT log anything to today. "Add to Log" sits right beside it, and saving a
+// reusable definition and eating a serving of it are two different intentions; doing both is
+// just two taps. It stays on the screen afterwards for exactly that reason.
+actions.saveManualAsRecipe = function() {
+  const fu = foodUi();
+  const m = fu.manual;
+  const name = (m.name || "").trim();
+  // Checked here rather than by disabling the button: the name field doesn't rerender on
+  // keystroke (see the no-rerender-on-keystroke rule), so a `disabled` computed at render time
+  // would be stale the moment he typed. addManualEntry can default an unnamed food to "Custom
+  // Food"; a recipe can't -- the name is how it's found again.
+  if (!name) { showToast("Give it a name first"); return; }
+  const now = Date.now();
+  // Its own lock, not the shared fu._confirmLock: this action doesn't exit the screen, and
+  // sharing one would make "Save as Recipe" then "Add to Log" swallow the second tap.
+  if (fu._recipeSaveLock && now - fu._recipeSaveLock < 600) return;
+  fu._recipeSaveLock = now;
+  const weight = positiveGramsOr(m.weight, 100);
+  const stamp = new Date().toISOString();
+  state.recipes.push({
+    id: "recipe_" + now,
+    name: name,
+    // One ingredient holding the whole thing. sumRecipeIngredients totals the list, so the
+    // recipe's own weight and macros come out exactly as typed, and adding a second ingredient
+    // later needs no special case anywhere.
+    ingredients: [{
+      id: "ing_" + now + "_" + Math.random().toString(36).slice(2,7),
+      name: name, weight: weight,
+      calories: Math.max(0, parseFloat(m.calories) || 0), protein: Math.max(0, parseFloat(m.protein) || 0),
+      carbs: Math.max(0, parseFloat(m.carbs) || 0), fat: Math.max(0, parseFloat(m.fat) || 0),
+      fiber: Math.max(0, parseFloat(m.fiber) || 0),
+    }],
+    createdAt: stamp,
+    updatedAt: stamp, // conflict-resolution stamp (see mergeRecipesFromCloud)
+  });
+  saveRecipes();
+  showToast("Saved to Recipes");
 };
 
 // ---- AI Estimation screen ----
@@ -5233,39 +5466,15 @@ function renderWeightTab() {
   }
 
   if (chartData.length > 1) {
+    const selPoint = wu.selectedPoint ? chartData.find(function(d){ return d.date === wu.selectedPoint; }) : null;
     let histInner = '<h3 class="cardTitle" style="margin-bottom:4px">Weight History</h3>' +
-      '<div class="row" style="margin-bottom:16px">' +
+      '<div class="row">' +
         ["7d","30d","90d","6m","all"].map(function(r) {
           return '<button class="chip' + (wu.timeRange === r ? ' active' : '') + '" data-action="setWeightRange" data-arg="' + r + '" style="flex:1;text-align:center">' + (r === "all" ? "All" : r) + '</button>';
         }).join('') +
       '</div>' +
+      renderSelectedWeightSlot(selPoint, wu, unit) +
       renderWeightChart(chartData, set.goalWeight, wu.selectedPoint);
-    const selPoint = wu.selectedPoint ? chartData.find(function(d){ return d.date === wu.selectedPoint; }) : null;
-    if (selPoint) {
-      const confirmingDeleteWeight = wu.confirmDeleteDate === selPoint.date;
-      // "All" can span multiple years, where the usual weekday/month/day label is ambiguous
-      // about which year a point falls in -- every other range tab is well under a year, so
-      // dayLabel's existing format stays unambiguous there.
-      const selDateLabel = wu.timeRange === "all"
-        ? parseDateStr(selPoint.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" })
-        : dayLabel(selPoint.date);
-      histInner += '<div style="margin-top:12px;padding:12px 14px;background:' + C.inputBg + ';border:1px solid ' + C.border + ';border-radius:12px">' +
-        '<div style="display:flex;justify-content:space-between;align-items:center">' +
-          '<div><div style="color:' + C.textMut + ';font-size:12px">' + esc(selDateLabel) + '</div>' +
-          '<div style="font-size:18px;font-weight:700;margin-top:2px;color:' + C.text + '">' + selPoint.weight + ' ' + unit + '</div></div>' +
-          '<div style="display:flex;align-items:center;gap:4px">' +
-            '<button data-action="askDeleteWeight" data-arg="' + selPoint.date + '" style="background:none;border:none;color:' + C.textMut + ';font-size:16px;cursor:pointer;padding:4px">\u{1F5D1}</button>' +
-            '<button data-action="selectWeightPoint" data-arg="" style="background:none;border:none;color:' + C.textMut + ';font-size:18px;cursor:pointer;padding:4px">✕</button>' +
-          '</div>' +
-        '</div>' +
-        (confirmingDeleteWeight ?
-          '<div class="row" style="margin-top:10px">' +
-            btn({ label: "Cancel", action: "cancelDeleteWeight", small: true, outline: true, full: true }) +
-            btn({ label: "Delete Entry?", action: "deleteWeight", arg: selPoint.date, small: true, full: true, color: "danger" }) +
-          '</div>'
-        : '') +
-      '</div>';
-    }
     html += card(histInner);
   } else {
     html += card('<div style="text-align:center;padding:30px"><div style="font-size:28px;margin-bottom:8px">\u{1F4C8}</div><div style="color:' + C.textMut + ';font-size:14px">Log at least 2 days of weight to see your chart</div></div>');
@@ -5292,6 +5501,80 @@ function weightChartXPositions(dates, x0, plotWidth) {
   return dates.map(function(d) {
     if (tSpan <= 0) return x0;
     return x0 + ((parseDateStr(d).getTime() - t0) / tSpan) * plotWidth;
+  });
+}
+
+// The tapped weigh-in, shown in the gap between the range chips and the chart (moved up from
+// below the chart, 2026-08-10).
+//
+// The slot is a FIXED height and is always rendered, empty state included. That's the whole
+// point: the readout used to appear below the chart only once a point was selected, so every
+// tap grew the card and shoved everything under it down the screen -- and every dismissal
+// snapped it back. Reserving the space unconditionally means selecting, changing and clearing
+// a point never moves the chart by a pixel, so you can walk along the line and read off days
+// without it sliding around under your thumb.
+//
+// All three states (nothing selected / a point selected / confirming a delete) are one row at
+// the same height for the same reason -- the delete confirmation replaces the readout in place
+// rather than expanding underneath it.
+const SELECTED_WEIGHT_SLOT_H = 44;
+function renderSelectedWeightSlot(selPoint, wu, unit) {
+  const wrap = function(content) {
+    return '<div style="height:' + SELECTED_WEIGHT_SLOT_H + 'px;display:flex;align-items:center;justify-content:space-between;gap:8px;overflow:hidden">' + content + '</div>';
+  };
+  if (!selPoint) {
+    return wrap('<span style="color:' + C.textMut + ';font-size:12px">Tap the chart to see a day’s weight</span>');
+  }
+  // "All" can span multiple years, where the usual weekday/month/day label is ambiguous about
+  // which year a point falls in -- every other range chip is well under a year, so dayLabel's
+  // existing format stays unambiguous there.
+  const selDateLabel = wu.timeRange === "all"
+    ? parseDateStr(selPoint.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" })
+    : dayLabel(selPoint.date);
+  if (wu.confirmDeleteDate === selPoint.date) {
+    return wrap(
+      '<span style="color:' + C.textMut + ';font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Delete ' + esc(selDateLabel) + '?</span>' +
+      '<div style="display:flex;gap:6px;flex:none">' +
+        btn({ label: "Cancel", action: "cancelDeleteWeight", small: true, outline: true }) +
+        btn({ label: "Delete", action: "deleteWeight", arg: selPoint.date, small: true, color: "danger" }) +
+      '</div>'
+    );
+  }
+  return wrap(
+    '<div style="min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">' +
+      '<span style="color:' + C.textMut + ';font-size:12px">' + esc(selDateLabel) + '</span> ' +
+      '<span style="font-size:17px;font-weight:700;color:' + C.text + '">' + selPoint.weight + ' ' + esc(unit) + '</span>' +
+    '</div>' +
+    '<div style="display:flex;align-items:center;gap:2px;flex:none">' +
+      '<button data-action="askDeleteWeight" data-arg="' + selPoint.date + '" style="background:none;border:none;color:' + C.textMut + ';font-size:16px;cursor:pointer;padding:4px">\u{1F5D1}</button>' +
+      '<button data-action="selectWeightPoint" data-arg="" style="background:none;border:none;color:' + C.textMut + ';font-size:18px;cursor:pointer;padding:4px">✕</button>' +
+    '</div>'
+  );
+}
+
+// Tap targets for the weight chart: one full-plot-height vertical band per point, each running
+// from the midpoint to its left neighbour to the midpoint to its right (clamped to the plot).
+//
+// Replaces a transparent r=12 circle centred on each dot (2026-08-10). That circle required
+// hitting within ~12 units of the dot in BOTH axes on a chart drawn at 460 units wide and
+// scaled down to phone width, so a tap that landed above or below the line -- or in the gap
+// between two dots -- did nothing at all, which reads as the chart ignoring you. Bands fix the
+// real problem, which was dead space rather than size: every pixel of the plot now belongs to
+// exactly one point, vertical position stops mattering entirely, and the point selected is
+// always the nearest one horizontally.
+//
+// Deliberately NOT given a minimum width. Widening them past the midpoints would make adjacent
+// bands overlap, and on overlap the later-painted band wins -- so a tap right next to one dot
+// could select its neighbour. On a dense range the bands are narrow because the points really
+// are that close together; nearest-point is still the best answer available there.
+// Pure (numbers in, numbers out), so it's unit-tested directly.
+function weightChartHitBands(xs, x0, x1) {
+  return xs.map(function(x, i) {
+    const rawLeft = i === 0 ? x0 : (xs[i - 1] + x) / 2;
+    const rawRight = i === xs.length - 1 ? x1 : (x + xs[i + 1]) / 2;
+    const left = Math.max(x0, Math.min(rawLeft, x1));
+    const right = Math.max(x0, Math.min(rawRight, x1));
+    return { x: left, width: Math.max(0, right - left) };
   });
 }
 
@@ -5354,9 +5637,23 @@ function renderWeightChart(data, goalWeight, selectedDate) {
   data.forEach(function(d, i) {
     const cx = xScale(i).toFixed(1), cy = yScale(d.weight).toFixed(1);
     const isSel = d.date === selectedDate;
-    // Larger invisible circle first so small dots stay easy to tap on mobile.
-    dots += '<circle cx="' + cx + '" cy="' + cy + '" r="12" fill="transparent" data-action="selectWeightPoint" data-arg="' + d.date + '" style="cursor:pointer"></circle>';
-    dots += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (isSel ? 6 : 3) + '" fill="' + (isSel ? C.warning : C.primary) + '"' + (isSel ? ' stroke="#fff" stroke-width="2"' : '') + ' data-action="selectWeightPoint" data-arg="' + d.date + '" style="cursor:pointer;pointer-events:none"></circle>';
+    dots += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (isSel ? 6 : 3) + '" fill="' + (isSel ? C.warning : C.primary) + '"' + (isSel ? ' stroke="#fff" stroke-width="2"' : '') + ' style="pointer-events:none"></circle>';
+  });
+
+  // The tap targets (see weightChartHitBands). Painted LAST so they sit above the line and the
+  // dots and catch every tap in the plot; they're transparent, so nothing changes visually.
+  // A selected band also draws a faint vertical marker, which is what makes it obvious which
+  // column you actually hit on a dense range.
+  let hitAreas = "";
+  const plotTop = padT, plotH = h - padT - padB;
+  const bands = weightChartHitBands(xs, padL, w - padR);
+  data.forEach(function(d, i) {
+    const b = bands[i];
+    if (b.width <= 0) return;
+    if (d.date === selectedDate) {
+      hitAreas += '<line x1="' + xScale(i).toFixed(1) + '" y1="' + plotTop + '" x2="' + xScale(i).toFixed(1) + '" y2="' + (plotTop + plotH) + '" stroke="' + C.warning + '" stroke-width="1" stroke-dasharray="2,3" style="pointer-events:none"></line>';
+    }
+    hitAreas += '<rect x="' + b.x.toFixed(1) + '" y="' + plotTop + '" width="' + b.width.toFixed(1) + '" height="' + plotH + '" fill="transparent" data-action="selectWeightPoint" data-arg="' + d.date + '" style="cursor:pointer"></rect>';
   });
 
   let gridLines = "";
@@ -5392,7 +5689,7 @@ function renderWeightChart(data, goalWeight, selectedDate) {
   return '<div style="width:100%;overflow-x:auto"><svg viewBox="0 0 ' + w + ' ' + h + '" style="width:100%;height:220px" preserveAspectRatio="xMidYMid meet">' +
     gridLines + yLabels + xLabels + goalLine +
     '<path d="' + path + '" fill="none" stroke="' + C.primary + '" stroke-width="2"></path>' +
-    dots +
+    dots + hitAreas +
   '</svg></div>';
 }
 
@@ -6092,6 +6389,7 @@ actions.saveEditBarcode = function() {
     per100g: false, calories: Math.max(0, parseFloat(m.calories) || 0), protein: Math.max(0, parseFloat(m.protein) || 0),
     carbs: Math.max(0, parseFloat(m.carbs) || 0), fat: Math.max(0, parseFloat(m.fat) || 0), fiber: Math.max(0, parseFloat(m.fiber) || 0),
     state: "—", baseGrams: weight, servingSizes: [{ label: round1(weight) + "g", grams: weight }],
+    updatedAt: new Date().toISOString(), // conflict-resolution stamp (see mergeCustomBarcodesFromCloud)
   };
   state.customBarcodes[code] = food;
   saveCustomBarcodes();
