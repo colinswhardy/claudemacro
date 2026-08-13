@@ -146,6 +146,11 @@ const exportLine =
   "BARCODE_CONFIRM_MS: BARCODE_CONFIRM_MS, BARCODE_CONFIRM_MIN_READS: BARCODE_CONFIRM_MIN_READS, " +
   "BARCODE_CONFIRM_STALE_MS: BARCODE_CONFIRM_STALE_MS, " +
   "weightChartHitBands: weightChartHitBands, renderSelectedWeightSlot: renderSelectedWeightSlot, " +
+  "weightRangeDays: weightRangeDays, weightChartWindowBounds: weightChartWindowBounds, " +
+  "clampWeightPanOffset: clampWeightPanOffset, renderWeightTab: renderWeightTab, " +
+  "waistEntryIsEmpty: waistEntryIsEmpty, mergeWaistEntriesFromCloud: mergeWaistEntriesFromCloud, " +
+  "waistEntriesForDisplay: waistEntriesForDisplay, waistUnitLabel: waistUnitLabel, " +
+  "renderWaistSection: renderWaistSection, " +
   "renderWeightChart: renderWeightChart, renderManualEntryScreen: renderManualEntryScreen, " +
   "flattenRecipesForSync: flattenRecipesForSync, " +
   "PERSISTED_COLLECTIONS: PERSISTED_COLLECTIONS, NON_BACKED_UP_KEYS: NON_BACKED_UP_KEYS, " +
@@ -3595,6 +3600,228 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     const out = M.renderManualEntryScreen(fu);
     assertEqual(out.indexOf('data-action="saveManualAsRecipe"') > -1, true, "the button is on the screen");
     assertEqual(out.indexOf('data-action="addManualEntry"') > -1, true, "and logging still is too");
+  });
+
+  // ==== weight chart: manual range + panning ====
+  test("weightRangeDays: named chips, the manual count, and the unbounded cases", function () {
+    assertEqual(M.weightRangeDays("7d", 0), 7, "7d");
+    assertEqual(M.weightRangeDays("6m", 0), 180, "6m");
+    assertEqual(M.weightRangeDays("all", 0), null, "All is unbounded");
+    assertEqual(M.weightRangeDays("manual", 45), 45, "manual uses the applied day count");
+    assertEqual(M.weightRangeDays("manual", "45"), 45, "a string count still parses");
+    assertEqual(M.weightRangeDays("manual", 1), null, "a 1-day chart is meaningless");
+    assertEqual(M.weightRangeDays("manual", 0), null, "unconfigured Manual behaves like All, not a guess");
+  });
+  test("weightChartWindowBounds: 7d spans exactly 7 calendar days ending on the viewed day", function () {
+    const b = M.weightChartWindowBounds("7d", 0, 0, "2026-08-13");
+    assertEqual(b.startMs, new Date(2026, 7, 7).getTime(), "starts 6 days back at local midnight");
+    assertEqual(b.endMs, new Date(2026, 7, 13).getTime(), "ends on the viewed day itself");
+  });
+  test("weightChartWindowBounds: the pan offset slides the whole window back, both ends", function () {
+    const b = M.weightChartWindowBounds("7d", 0, 7, "2026-08-13");
+    assertEqual(b.startMs, new Date(2026, 6, 31).getTime(), "start moved back a week");
+    assertEqual(b.endMs, new Date(2026, 7, 6).getTime(), "end moved back a week too -- newer entries drop out");
+  });
+  test("weightChartWindowBounds: manual uses the entered day count", function () {
+    const b = M.weightChartWindowBounds("manual", 14, 0, "2026-08-13");
+    assertEqual(b.startMs, new Date(2026, 6, 31).getTime(), "14 calendar days inclusive of the end day");
+  });
+  test("weightChartWindowBounds: unbounded ranges admit everything, pan or no pan", function () {
+    const b = M.weightChartWindowBounds("all", 0, 5, "2026-08-13");
+    assertEqual(b.startMs, 0, "no lower bound");
+    assertEqual(b.endMs === Infinity, true, "no upper bound");
+  });
+  test("weightChartCutoff: still the un-panned window's start, so its old callers keep working", function () {
+    assertEqual(M.weightChartCutoff("30d", "2026-08-13"), M.weightChartWindowBounds("30d", 0, 0, "2026-08-13").startMs, "named range");
+    assertEqual(M.weightChartCutoff("all", "2026-08-13"), 0, "All admits everything");
+  });
+  test("clampWeightPanOffset: bounded below by 0 and above by the data span", function () {
+    // Jul 1 -> Aug 13 is a 43-day span; a 7-day window can therefore sit at most 37 days back
+    // (earliest weigh-in at the window's left edge) before it shows guaranteed-empty space.
+    assertEqual(M.clampWeightPanOffset(100, 7, "2026-07-01", "2026-08-13"), 37, "clamped to the far limit");
+    assertEqual(M.clampWeightPanOffset(Infinity, 7, "2026-07-01", "2026-08-13"), 37, "Infinity asks for the far limit exactly");
+    assertEqual(M.clampWeightPanOffset(-5, 7, "2026-07-01", "2026-08-13"), 0, "never negative");
+    assertEqual(M.clampWeightPanOffset(10, 7, "2026-07-01", "2026-08-13"), 10, "an in-range offset passes through");
+    assertEqual(M.clampWeightPanOffset(9, null, "2026-07-01", "2026-08-13"), 0, "an unbounded range can't pan");
+    assertEqual(M.clampWeightPanOffset(9, 7, null, "2026-08-13"), 0, "no data, no pan");
+  });
+  test("weightStatsRangeLabel: manual reads as its day count", function () {
+    assertEqual(M.weightStatsRangeLabel("manual", 45), "last 45 days", "manual with a count");
+    assertEqual(M.weightStatsRangeLabel("30d"), "last 30 days", "named chips unchanged");
+  });
+  test("renderWeightTab: six chips on one line ending in Manual, pan strip, swipeable chart", function () {
+    const prevWeights = M.state.weights, prevUi = M.state.ui, prevDate = M.state.date;
+    M.state.date = "2026-08-13";
+    M.state.weights = {
+      "2026-06-01": { weight: 185, unit: "lbs", timestamp: "2026-06-01T08:00:00.000Z" },
+      "2026-08-01": { weight: 181, unit: "lbs", timestamp: "2026-08-01T08:00:00.000Z" },
+      "2026-08-10": { weight: 180, unit: "lbs", timestamp: "2026-08-10T08:00:00.000Z" },
+    };
+    M.state.ui = {};
+    const out = M.renderWeightTab();
+    const chipOrder = out.indexOf('data-arg="all"') < out.indexOf('data-action="openManualRange"');
+    assertEqual(out.indexOf('data-action="openManualRange"') > -1, true, "the Manual chip exists");
+    assertEqual(chipOrder, true, "and sits to the right of All");
+    assertEqual(out.indexOf(">Manual<") > -1, true, "labelled Manual while inactive");
+    assertEqual(out.indexOf('data-action="panWeightChart"') > -1, true, "pan strip present for a bounded range");
+    assertEqual(out.indexOf('data-panzone="weight"') > -1, true, "the chart is a swipe target");
+    M.state.weights = prevWeights; M.state.ui = prevUi; M.state.date = prevDate;
+  });
+  test("applyManualRange: applies a valid day count, rejects a useless one", function () {
+    const prevWeights = M.state.weights, prevUi = M.state.ui, prevDate = M.state.date;
+    M.state.date = "2026-08-13";
+    M.state.weights = {
+      "2026-08-01": { weight: 181, unit: "lbs", timestamp: "2026-08-01T08:00:00.000Z" },
+      "2026-08-10": { weight: 180, unit: "lbs", timestamp: "2026-08-10T08:00:00.000Z" },
+    };
+    M.state.ui = {};
+    M.actions.openManualRange();
+    const wu = M.state.ui.weight;
+    assertEqual(wu.showManualPanel, true, "the chip opens the popup");
+    wu.manualDaysInput = "45";
+    M.actions.applyManualRange();
+    assertEqual([wu.timeRange, wu.manualDays, wu.showManualPanel], ["manual", 45, false], "applied and closed");
+    assertEqual(wu.panOffsetDays, 0, "re-anchored to the latest weigh-in");
+    assertEqual(M.renderWeightTab().indexOf(">45d<") > -1, true, "the active chip shows its day count");
+    wu.manualDaysInput = "1";
+    M.actions.applyManualRange();
+    assertEqual(wu.manualDays, 45, "a 1-day request is refused, the applied count stands");
+    M.state.weights = prevWeights; M.state.ui = prevUi; M.state.date = prevDate;
+  });
+  test("renderWeightTab: panning into a gap keeps the card, with a placeholder instead of a dead end", function () {
+    const prevWeights = M.state.weights, prevUi = M.state.ui, prevDate = M.state.date;
+    M.state.date = "2026-08-13";
+    M.state.weights = {
+      "2026-06-01": { weight: 185, unit: "lbs", timestamp: "2026-06-01T08:00:00.000Z" },
+      "2026-08-10": { weight: 180, unit: "lbs", timestamp: "2026-08-10T08:00:00.000Z" },
+      "2026-08-12": { weight: 179.5, unit: "lbs", timestamp: "2026-08-12T08:00:00.000Z" },
+    };
+    M.state.ui = { weight: { input: "", timeRange: "7d", importMsg: "", editingStart: false, startInputDate: "", startInputWeight: "", selectedPoint: null, confirmDeleteDate: null, statsFollowsRange: false, manualDays: 0, manualDaysInput: "", showManualPanel: false, panOffsetDays: 30 } };
+    const out = M.renderWeightTab();
+    assertEqual(out.indexOf("No weigh-ins in this window") > -1, true, "empty window says so");
+    assertEqual(out.indexOf('data-action="panWeightChart"') > -1, true, "and the pan controls are still there to get back");
+    M.state.weights = prevWeights; M.state.ui = prevUi; M.state.date = prevDate;
+  });
+
+  // ==== waist measurements (Strategy > Waist & Photos) ====
+  test("waistEntryIsEmpty: tombstones are empty, anything real is not", function () {
+    assertEqual(M.waistEntryIsEmpty(null), true, "missing entry");
+    assertEqual(M.waistEntryIsEmpty({ waist: null, notes: "", photos: [], updatedAt: "2026-08-13T00:00:00.000Z" }), true, "the delete tombstone");
+    assertEqual(M.waistEntryIsEmpty({ waist: 34.5, notes: "", photos: [] }), false, "a measurement");
+    assertEqual(M.waistEntryIsEmpty({ waist: null, notes: "note", photos: [] }), false, "a notes-only entry");
+    assertEqual(M.waistEntryIsEmpty({ waist: null, notes: "", photos: ["data:image/jpeg;base64,x"] }), false, "a photos-only entry");
+  });
+  test("mergeWaistEntriesFromCloud: adds new dates, and a newer cloud edit wins", function () {
+    const prev = M.state.waistEntries;
+    M.state.waistEntries = { "2026-08-01": { waist: 35, notes: "", photos: [], updatedAt: "2026-08-01T00:00:00.000Z" } };
+    const changed = M.mergeWaistEntriesFromCloud({
+      "2026-08-01": { waist: 34.5, notes: "corrected", photos: [], updatedAt: "2026-08-02T00:00:00.000Z" },
+      "2026-08-05": { waist: 34, notes: "", photos: [], updatedAt: "2026-08-05T00:00:00.000Z" },
+    });
+    assertEqual(changed, 2, "both rows applied");
+    assertEqual(M.state.waistEntries["2026-08-01"].waist, 34.5, "the newer cloud edit reached this device");
+    assertEqual(M.state.waistEntries["2026-08-05"].waist, 34, "the new date was added");
+    M.state.waistEntries = prev;
+  });
+  test("mergeWaistEntriesFromCloud: an older cloud copy never overwrites a newer local edit", function () {
+    const prev = M.state.waistEntries;
+    M.state.waistEntries = { "2026-08-01": { waist: 34, notes: "fixed here", photos: [], updatedAt: "2026-08-03T00:00:00.000Z" } };
+    const changed = M.mergeWaistEntriesFromCloud({ "2026-08-01": { waist: 35, notes: "", photos: [], updatedAt: "2026-08-01T00:00:00.000Z" } });
+    assertEqual(changed, 0, "nothing applied");
+    assertEqual(M.state.waistEntries["2026-08-01"].waist, 34, "local edit kept");
+    M.state.waistEntries = prev;
+  });
+  test("mergeWaistEntriesFromCloud: a newer tombstone carries a delete across devices", function () {
+    const prev = M.state.waistEntries;
+    M.state.waistEntries = { "2026-08-01": { waist: 35, notes: "", photos: ["data:image/jpeg;base64,x"], updatedAt: "2026-08-01T00:00:00.000Z" } };
+    M.mergeWaistEntriesFromCloud({ "2026-08-01": { waist: null, notes: "", photos: [], updatedAt: "2026-08-02T00:00:00.000Z" } });
+    assertEqual(M.waistEntryIsEmpty(M.state.waistEntries["2026-08-01"]), true, "the delete made on the other device lands here");
+    M.state.waistEntries = prev;
+  });
+  test("saveWaistEntry: writes a stamped entry and clears the form", function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui;
+    M.state.waistEntries = {};
+    M.state.ui = { strategy: { section: "waist", waistDate: "2026-08-01", waistInput: "34.5", waistNotes: "  feeling leaner  ", waistPhotos: ["data:image/jpeg;base64,AAA"], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null } };
+    M.actions.saveWaistEntry();
+    const e = M.state.waistEntries["2026-08-01"];
+    assertEqual(e.waist, 34.5, "the measurement was saved");
+    assertEqual(e.notes, "feeling leaner", "notes saved trimmed");
+    assertEqual(e.photos.length, 1, "photos travel with the entry");
+    assertEqual(typeof e.updatedAt, "string", "stamped, or the merge can never propagate it");
+    assertEqual(M.state.ui.strategy.waistInput, "", "the form cleared for the next entry");
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi;
+  });
+  test("saveWaistEntry: an all-empty form saves nothing", function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui;
+    M.state.waistEntries = {};
+    M.state.ui = { strategy: { section: "waist", waistDate: "2026-08-01", waistInput: "", waistNotes: "   ", waistPhotos: [], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null } };
+    M.actions.saveWaistEntry();
+    assertEqual(Object.keys(M.state.waistEntries).length, 0, "no empty entry was created");
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi;
+  });
+  test("saveWaistEntry: correcting the date while editing tombstones the old date", function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui;
+    M.state.waistEntries = { "2026-08-01": { waist: 35, notes: "", photos: [], updatedAt: "2026-08-01T00:00:00.000Z" } };
+    M.state.ui = {};
+    M.actions.editWaistEntry("2026-08-01");
+    M.state.ui.strategy.waistDate = "2026-08-02";
+    M.actions.saveWaistEntry();
+    assertEqual(M.state.waistEntries["2026-08-02"].waist, 35, "the entry moved to the corrected date");
+    assertEqual(M.waistEntryIsEmpty(M.state.waistEntries["2026-08-01"]), true, "the old date holds a tombstone");
+    assertEqual(typeof M.state.waistEntries["2026-08-01"].updatedAt, "string", "stamped, so the move wins the merge on other devices");
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi;
+  });
+  test("waist delete: two-step, and leaves a stamped tombstone rather than removing the key", function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui;
+    M.state.waistEntries = { "2026-08-05": { waist: 34, notes: "hi", photos: [], updatedAt: "2026-08-05T00:00:00.000Z" } };
+    M.state.ui = {};
+    M.actions.askDeleteWaistEntry("2026-08-05");
+    assertEqual(M.waistEntryIsEmpty(M.state.waistEntries["2026-08-05"]), false, "arming does not delete");
+    assertEqual(M.state.ui.strategy.confirmDeleteWaistDate, "2026-08-05", "armed");
+    M.actions.deleteWaistEntry("2026-08-05");
+    const t = M.state.waistEntries["2026-08-05"];
+    assertEqual(M.waistEntryIsEmpty(t), true, "confirming deletes");
+    assertEqual(t !== undefined, true, "the key stays, as a tombstone for the merge");
+    assertEqual(Date.parse(t.updatedAt) > Date.parse("2026-08-05T00:00:00.000Z"), true, "fresh stamp so the delete wins elsewhere");
+    assertEqual(M.state.ui.strategy.confirmDeleteWaistDate, null, "disarmed");
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi;
+  });
+  test("waistEntriesForDisplay: newest first, tombstones hidden, deltas vs the previous measurement", function () {
+    const prev = M.state.waistEntries;
+    M.state.waistEntries = {
+      "2026-08-01": { waist: 35, notes: "", photos: [], updatedAt: "2026-08-01T00:00:00.000Z" },
+      "2026-08-08": { waist: 34, notes: "cut going well", photos: [], updatedAt: "2026-08-08T00:00:00.000Z" },
+      "2026-08-12": { waist: null, notes: "", photos: [], updatedAt: "2026-08-12T00:00:00.000Z" },
+      "2026-08-20": { waist: 33, notes: "", photos: [], updatedAt: "2026-08-20T00:00:00.000Z" },
+    };
+    const rows = M.waistEntriesForDisplay();
+    assertEqual(rows.map(function (r) { return r.date; }), ["2026-08-20", "2026-08-08", "2026-08-01"], "newest first, tombstone excluded");
+    assertEqual(rows.map(function (r) { return r.delta; }), [-1, -1, null], "each delta measured against the previous actual measurement");
+    M.state.waistEntries = prev;
+  });
+  test("waistUnitLabel: follows the weight unit's measurement system", function () {
+    const prevUnit = M.state.settings.weightUnit;
+    M.state.settings.weightUnit = "lbs";
+    assertEqual(M.waistUnitLabel(), "in", "imperial weight, imperial waist");
+    M.state.settings.weightUnit = "kg";
+    assertEqual(M.waistUnitLabel(), "cm", "metric weight, metric waist");
+    M.state.settings.weightUnit = prevUnit;
+  });
+  test("renderWaistSection: form, list, photos and controls are all wired", function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui, prevUnit = M.state.settings.weightUnit;
+    M.state.settings.weightUnit = "lbs";
+    M.state.waistEntries = { "2026-08-01": { waist: 35, notes: "note here", photos: ["data:image/jpeg;base64,AAA"], updatedAt: "2026-08-01T00:00:00.000Z" } };
+    M.state.ui = {};
+    const out = M.renderWaistSection();
+    assertEqual(out.indexOf('data-bind="waistNotes"') > -1, true, "the notes box is bound");
+    assertEqual(out.indexOf('data-change="waistPhotos"') > -1, true, "the photo picker is bound");
+    assertEqual(out.indexOf('data-action="saveWaistEntry"') > -1, true, "save is wired");
+    assertEqual(out.indexOf("35 in") > -1, true, "the saved measurement is listed with its unit");
+    assertEqual(out.indexOf("note here") > -1, true, "notes are shown");
+    assertEqual(out.indexOf('data-action="viewWaistPhoto"') > -1, true, "photos open the lightbox");
+    assertEqual(out.indexOf('data-action="editWaistEntry"') > -1, true, "entries can be edited");
+    assertEqual(out.indexOf('data-action="askDeleteWaistEntry"') > -1, true, "delete is two-step armed");
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi; M.state.settings.weightUnit = prevUnit;
   });
 
   console.log("\n" + pass + " passed, " + fail + " failed");
