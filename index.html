@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.22";
+const APP_VERSION = "1.23";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -287,12 +287,14 @@ const state = {
   // like the old behaviour (fall back to state.settings).
   targetHistory: db.get("targetHistory", {}),
   // Waist measurements with progress photos and notes: date -> {waist, notes, photos,
-  // updatedAt}. photos is an array of compressed JPEG data URLs -- stored inline with the
-  // entry (not a separate collection) so one date's measurement, notes and photos always
-  // travel and merge together. A "deleted" entry is kept as an EMPTY entry (no waist, no
-  // notes, no photos) with a fresh updatedAt rather than removed -- the same tombstone trick
-  // dayBoosts uses -- so a delete can win the newer-wins merge instead of the old entry
-  // resurrecting from another device's copy. waistEntryIsEmpty is the single test for that.
+  // updatedAt}. photos is an array of Supabase Storage PATHS ("userId/filename.jpg") -- the
+  // image bytes live as real files in the private "progress-photos" bucket, never inline here
+  // (inline base64 was the first design; ~30 photos would have exhausted the shared ~5MB
+  // localStorage quota and taken food/weight logging down with it -- see the Storage helper
+  // block by mergeWaistEntriesFromCloud). A "deleted" entry is kept as an EMPTY entry (no
+  // waist, no notes, no photos) with a fresh updatedAt rather than removed -- the same
+  // tombstone trick dayBoosts uses -- so a delete can win the newer-wins merge instead of the
+  // old entry resurrecting from another device's copy. waistEntryIsEmpty is the single test.
   waistEntries: db.get("waistEntries", {}),
   // What the Fitness Dashboard measured, date -> one row of `dashboard_feed`. READ-ONLY
   // here: the dashboard is the sole writer of that table and MacroLog only displays it, so
@@ -1054,6 +1056,172 @@ function mergeWaistEntriesFromCloud(cloudMap) {
   db.set("waistEntries", state.waistEntries);
   return changed;
 }
+
+// ---- Progress photo FILES (Supabase Storage, bucket "progress-photos") ----
+// The photos themselves live as real JPEG files in a private Storage bucket, NOT inline in the
+// waistEntries blob. Inline base64 was the original design and it put every photo inside
+// localStorage -- which is capped at ~5MB shared with ALL of MacroLog's data, so ~30 photos
+// would have started failing writes for food logs and weights too (the app's single worst
+// failure). An entry's `photos` array therefore holds storage PATHS ("userId/filename.jpg");
+// the only data-URL strings that ever appear there are in the FORM's pending list, before
+// upload (see isPendingWaistPhoto). Entries in state/localStorage/cloud never contain bytes.
+//
+// Consequences handled elsewhere, listed here because they're easy to lose:
+// - Save uploads files BEFORE writing the entry, so an entry never references a file that
+//   doesn't exist (actions.saveWaistEntry).
+// - The export inlines the file bytes (waistPhotoData) or it isn't a backup; import re-uploads
+//   them (actions.exportData / restoreProgressPhotoFiles).
+// - Clear All Data wipes the user's Storage folder alongside the six tables.
+// - File deletes are best-effort with NO durable retry queue, unlike row deletes. The failure
+//   mode is an orphaned file that nothing references: invisible to the app and effectively
+//   free (1GB bucket vs ~300KB files), which is not worth the pendingDeletes machinery. A row
+//   resurrection -- what that queue exists for -- can't happen here, because merges only carry
+//   paths, never files.
+const PROGRESS_PHOTO_BUCKET = "progress-photos";
+
+// A photo array item is either a not-yet-uploaded data URL (form only) or a storage path.
+function isPendingWaistPhoto(p) { return typeof p === "string" && p.indexOf("data:") === 0; }
+
+// Every storage path referenced by any entry -- what the export has to fetch, and what a
+// restore has to put back. Tombstones have empty photo arrays so they contribute nothing.
+function progressPhotoPathsInEntries(entries) {
+  const paths = [];
+  Object.keys(entries || {}).forEach(function(date) {
+    (((entries[date] || {}).photos) || []).forEach(function(p) {
+      if (p && !isPendingWaistPhoto(p)) paths.push(p);
+    });
+  });
+  return paths;
+}
+
+// Random names, deliberately: a deterministic name could collide with a photo already on the
+// entry. The cost is that a save that fails after some uploads leaves those files orphaned
+// (see the block comment above -- accepted).
+function newProgressPhotoName(dateStr) {
+  return dateStr + "-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8) + ".jpg";
+}
+
+// Replace the userId folder segment. Restores can legitimately land in a different account
+// than the one that exported (path "olduid/x.jpg" would be RLS-blocked there).
+function rewriteProgressPhotoPath(path, userId) {
+  const parts = String(path).split("/");
+  parts[0] = userId;
+  return parts.join("/");
+}
+
+function dataUrlToBlob(dataUrl) {
+  const bin = atob(dataUrl.split(",")[1]);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: "image/jpeg" });
+}
+
+function blobToDataUrl(blob) {
+  return new Promise(function(resolve, reject) {
+    const reader = new FileReader();
+    reader.onload = function(ev) { resolve(ev.target.result); };
+    reader.onerror = function() { reject(new Error("could not read photo data")); };
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Shared plumbing for the Storage API (a different URL root and mostly-binary bodies, so
+// supabaseTable doesn't fit). Success hands back the raw Response -- upload ignores it,
+// download wants .blob(), list wants .json(). Same auth as everything else: the refreshed
+// access token plus apikey. No keepalive gating needed; photo bodies are far past the quota
+// and these aren't fire-on-background pushes anyway.
+async function storageFetch(path, options) {
+  options = options || {};
+  const token = await getValidAccessToken();
+  if (!token) return { error: "Not signed in or offline" };
+  try {
+    const r = await fetch(SUPABASE_URL + "/storage/v1/" + path, {
+      method: options.method || "GET",
+      headers: Object.assign({ "apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + token }, options.headers || {}),
+      body: options.body,
+    });
+    if (!r.ok) {
+      const errBody = await r.json().catch(function(){ return {}; });
+      return { error: errBody.message || errBody.error || ("HTTP " + r.status) };
+    }
+    return { data: r };
+  } catch (e) { return { error: e.message }; }
+}
+
+// x-upsert so a retried save (same path) or an import over existing files overwrites
+// harmlessly instead of failing on "already exists".
+async function uploadProgressPhoto(dataUrl, path) {
+  return storageFetch("object/" + PROGRESS_PHOTO_BUCKET + "/" + path, {
+    method: "POST",
+    headers: { "Content-Type": "image/jpeg", "x-upsert": "true" },
+    body: dataUrlToBlob(dataUrl),
+  });
+}
+
+async function fetchProgressPhotoBlob(path) {
+  const r = await storageFetch("object/authenticated/" + PROGRESS_PHOTO_BUCKET + "/" + path, {});
+  if (r.error) return r;
+  try { return { data: await r.data.blob() }; } catch (e) { return { error: e.message }; }
+}
+
+async function deleteProgressPhotos(paths) {
+  if (!paths || paths.length === 0) return { data: null };
+  return storageFetch("object/" + PROGRESS_PHOTO_BUCKET, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prefixes: paths }),
+  });
+}
+
+// Everything in this user's folder, for Clear All Data. One page of 1000 is far beyond the
+// cap of 6 photos x realistic entry counts; if that's ever wrong, clearing twice finishes it.
+async function listProgressPhotoPaths() {
+  if (!state.session) return { data: [] };
+  const uid = state.session.userId;
+  const r = await storageFetch("object/list/" + PROGRESS_PHOTO_BUCKET, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prefix: uid, limit: 1000, offset: 0 }),
+  });
+  if (r.error) return r;
+  try {
+    const rows = await r.data.json();
+    return { data: (rows || []).map(function(f){ return uid + "/" + f.name; }) };
+  } catch (e) { return { error: e.message }; }
+}
+
+// ---- Displaying private photos ----
+// An <img src> can't send the Authorization header a private bucket requires, so photos are
+// fetched with the token and served to the <img> as in-memory object URLs. The cache lives
+// for the session (never revoked -- bounded by how many photos get viewed, each a few hundred
+// KB). A path not yet cached renders as a transparent placeholder carrying data-photopath;
+// when its fetch lands, the bytes are PATCHED into those imgs directly rather than
+// rerendering -- this resolves at an arbitrary moment, possibly mid-keystroke in the notes
+// box, and a surprise rerender would steal focus (the standard no-rerender rule). A failed
+// fetch just leaves the placeholder; the next render retries it.
+const progressPhotoObjectUrls = {}; // path -> object URL
+const progressPhotoLoads = {};      // path -> true while a fetch is in flight
+const PROGRESS_PHOTO_PLACEHOLDER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+function progressPhotoImgAttrs(photo) {
+  if (isPendingWaistPhoto(photo)) return ' src="' + photo + '"';
+  const url = progressPhotoObjectUrls[photo];
+  if (url) return ' src="' + url + '"';
+  ensureProgressPhotoLoaded(photo);
+  return ' src="' + PROGRESS_PHOTO_PLACEHOLDER + '" data-photopath="' + photo + '"';
+}
+function ensureProgressPhotoLoaded(path) {
+  if (progressPhotoObjectUrls[path] || progressPhotoLoads[path]) return;
+  progressPhotoLoads[path] = true;
+  fetchProgressPhotoBlob(path).then(function(r) {
+    delete progressPhotoLoads[path];
+    if (!r.data) return;
+    const url = URL.createObjectURL(r.data);
+    progressPhotoObjectUrls[path] = url;
+    const imgs = document.querySelectorAll('img[data-photopath="' + path + '"]');
+    for (let i = 0; i < imgs.length; i++) imgs[i].src = url;
+  });
+}
+
 function mergeFoodCacheFromCloud(cloudDict) {
   if (!cloudDict) return 0;
   let changed = 0;
@@ -6045,8 +6213,9 @@ changeActions.renphoImport = function(el) {
 function strategyUi() {
   if (!state.ui.strategy) state.ui.strategy = { section: "targets", inputMode: "grams", confirmClear: false, syncTesting: false, syncTestMsg: null, editingBarcodeCode: null, editBarcodeManual: null, confirmDeleteBarcodeCode: null,
     // Waist & Photos section: the in-progress form (waistDate null = "today"), which entry an
-    // edit is loading from, the armed two-step delete, and the open lightbox photo.
-    waistDate: null, waistInput: "", waistNotes: "", waistPhotos: [], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null };
+    // edit is loading from, the armed two-step delete, the open lightbox photo, and whether a
+    // save's photo uploads are in flight (doubles as the double-tap guard).
+    waistDate: null, waistInput: "", waistNotes: "", waistPhotos: [], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null, waistSaving: false };
   return state.ui.strategy;
 }
 
@@ -6408,12 +6577,13 @@ inputActions.goalsStartWeight = function(v) { state.settings.startWeight = v ? p
 
 // ---- Waist & Photos (Strategy section) ----
 // One measurement per date: waist value, free-form notes, and up to MAX_WAIST_PHOTOS progress
-// photos. Photos are downscaled and recompressed on the device before they ever touch state --
-// full camera images are multi-MB each and localStorage is the source of truth here, so storing
-// originals would burn the quota (the app's single worst failure) within a handful of entries.
+// photos. Photos are downscaled and recompressed on the device before upload -- full camera
+// images are multi-MB each, which is upload time and egress with no visual payoff at phone
+// size. These settings are for the STORAGE-file era (roomy: ~200-400KB each against a 1GB
+// bucket); they were 1000px/0.6 when photos still had to fit inside localStorage.
 const MAX_WAIST_PHOTOS = 6;
-const WAIST_PHOTO_MAX_DIM = 1000; // px, longest edge
-const WAIST_PHOTO_QUALITY = 0.6;  // JPEG quality -- ~60-150KB per photo at this size
+const WAIST_PHOTO_MAX_DIM = 1600; // px, longest edge
+const WAIST_PHOTO_QUALITY = 0.8;  // JPEG quality
 
 // Waist follows the weight unit's measurement system rather than having its own setting.
 function waistUnitLabel() {
@@ -6442,8 +6612,10 @@ function renderPendingWaistPhotos(su) {
   if (photos.length === 0) return '';
   let html = '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px">';
   photos.forEach(function(p, i) {
+    // During an edit the list mixes not-yet-uploaded data URLs with already-stored paths;
+    // progressPhotoImgAttrs renders either (paths via the authenticated object-URL cache).
     html += '<div style="position:relative">' +
-      '<img src="' + p + '" data-action="viewWaistPhoto" data-arg="pending" data-arg2="' + i + '" style="width:64px;height:64px;object-fit:cover;border-radius:8px;cursor:pointer">' +
+      '<img' + progressPhotoImgAttrs(p) + ' data-action="viewWaistPhoto" data-arg="pending" data-arg2="' + i + '" style="width:64px;height:64px;object-fit:cover;border-radius:8px;cursor:pointer;background:#0F1220">' +
       '<button data-action="removeWaistPhoto" data-arg="' + i + '" style="position:absolute;top:-6px;right:-6px;width:20px;height:20px;border-radius:10px;border:none;background:' + C.danger + ';color:#fff;font-size:11px;line-height:1;cursor:pointer;padding:0">✕</button>' +
     '</div>';
   });
@@ -6466,11 +6638,11 @@ function renderWaistSection() {
       '<input type="file" accept="image/*" multiple id="waistPhotoInput" data-change="waistPhotos" style="display:none">' +
       renderPendingWaistPhotos(su) +
       btn({ label: "\u{1F4F7} Add Photos", action: "clickWaistPhotoInput", outline: true, small: true }) +
-      '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px">Up to ' + MAX_WAIST_PHOTOS + ' per entry — compressed on your phone before saving.</div>' +
+      '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px">Up to ' + MAX_WAIST_PHOTOS + ' per entry — compressed on your phone, stored privately in your account’s cloud storage.</div>' +
     '</div>' +
     '<div style="display:flex;gap:8px;margin-top:14px">' +
-      (editing ? btn({ label: "Cancel", action: "cancelWaistEdit", outline: true, extraStyle: "flex:1" }) : '') +
-      btn({ label: editing ? "Save Changes" : "Save Measurement", action: "saveWaistEntry", extraStyle: "flex:1" }) +
+      (editing ? btn({ label: "Cancel", action: "cancelWaistEdit", outline: true, extraStyle: "flex:1", disabled: su.waistSaving }) : '') +
+      btn({ label: su.waistSaving ? "Uploading…" : (editing ? "Save Changes" : "Save Measurement"), action: "saveWaistEntry", extraStyle: "flex:1", disabled: su.waistSaving }) +
     '</div>'
   );
 
@@ -6483,7 +6655,7 @@ function renderWaistSection() {
       if (r.photos.length > 0) {
         thumbs = '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">';
         r.photos.forEach(function(p, i) {
-          thumbs += '<img src="' + p + '" data-action="viewWaistPhoto" data-arg="' + r.date + '" data-arg2="' + i + '" style="width:64px;height:64px;object-fit:cover;border-radius:8px;cursor:pointer">';
+          thumbs += '<img' + progressPhotoImgAttrs(p) + ' data-action="viewWaistPhoto" data-arg="' + r.date + '" data-arg2="' + i + '" style="width:64px;height:64px;object-fit:cover;border-radius:8px;cursor:pointer;background:#0F1220">';
         });
         thumbs += '</div>';
       }
@@ -6514,19 +6686,23 @@ function renderWaistSection() {
   }
 
   // Full-screen lightbox for a tapped photo; tapping anywhere closes it (the img has no
-  // data-action of its own, so the tap bubbles up to the overlay's).
+  // data-action of its own, so the tap bubbles up to the overlay's). A storage-path photo
+  // renders through the same placeholder-then-patch mechanism as the thumbnails, and usually
+  // instantly: viewing full-screen almost always follows seeing the thumbnail, whose fetch
+  // already populated the object-URL cache.
   if (su.viewingPhoto) {
-    const url = waistPhotoUrl(su.viewingPhoto);
-    if (url) {
+    const photo = waistPhotoRefItem(su.viewingPhoto);
+    if (photo) {
       html += '<div data-action="closeWaistPhoto" style="position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px;cursor:pointer">' +
-        '<img src="' + url + '" style="max-width:100%;max-height:100%;border-radius:8px">' +
+        '<img' + progressPhotoImgAttrs(photo) + ' style="max-width:100%;max-height:100%;border-radius:8px">' +
       '</div>';
     }
   }
   return html;
 }
 
-function waistPhotoUrl(ref) {
+// Resolves a lightbox ref to the photo item itself (a pending data URL or a storage path).
+function waistPhotoRefItem(ref) {
   if (!ref) return null;
   if (ref.src === "pending") {
     const photos = strategyUi().waistPhotos || [];
@@ -6615,22 +6791,65 @@ actions.cancelWaistEdit = function() {
   rerender();
 };
 
-actions.saveWaistEntry = function() {
+actions.saveWaistEntry = async function() {
   const su = strategyUi();
+  if (su.waistSaving) return; // uploads in flight; the button is disabled but a stale DOM could still tap it
   const date = su.waistDate || todayStr();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { showToast("Pick a valid date"); return; }
   const waist = parseFloat(su.waistInput);
   const notes = (su.waistNotes || "").trim();
   const photos = (su.waistPhotos || []).slice();
   if (!(waist > 0) && !notes && photos.length === 0) { showToast("Nothing to save yet"); return; }
+  const pendingCount = photos.filter(isPendingWaistPhoto).length;
+  // Photos are FILES in cloud storage, so unlike everything else in this offline-first app a
+  // photo save genuinely needs the network. Refusing up front (form intact, retry later)
+  // beats writing an entry whose photos exist nowhere. Colin explicitly accepted photos being
+  // online-only. A save with no new photos stays instant and offline like everything else.
+  if (pendingCount > 0 && !state.session) { showToast("Sign in to save photos"); return; }
+
+  // Upload new photos BEFORE writing the entry, so the entry only ever references files that
+  // actually exist. Any failure aborts the whole save with the form intact -- files already
+  // uploaded this attempt become unreferenced orphans, which is the accepted failure mode
+  // (see the Storage helper block).
+  const finalPhotos = [];
+  if (pendingCount > 0) { su.waistSaving = true; rerender(); }
+  for (let i = 0; i < photos.length; i++) {
+    if (!isPendingWaistPhoto(photos[i])) { finalPhotos.push(photos[i]); continue; }
+    const path = state.session.userId + "/" + newProgressPhotoName(date);
+    const up = await uploadProgressPhoto(photos[i], path);
+    if (up.error) {
+      su.waistSaving = false;
+      showToast("Photo upload failed — nothing saved");
+      rerender();
+      return;
+    }
+    finalPhotos.push(path);
+  }
+
+  // Files displaced by this save, collected BEFORE the writes below overwrite the entries:
+  // photos removed while editing (removal only takes effect on save -- Cancel keeps them),
+  // plus the photos of an entry this save overwrites outright (saving fresh onto a date, or
+  // moving an edit onto a date that already had an entry).
+  const displaced = [];
+  const priorTargets = su.waistEditingDate && su.waistEditingDate !== date
+    ? [state.waistEntries[su.waistEditingDate], state.waistEntries[date]]
+    : [state.waistEntries[date]];
+  priorTargets.forEach(function(e) {
+    ((e && e.photos) || []).forEach(function(p) {
+      if (!isPendingWaistPhoto(p) && finalPhotos.indexOf(p) < 0 && displaced.indexOf(p) < 0) displaced.push(p);
+    });
+  });
+
   // Editing an entry and correcting its date moves it: the old date gets a tombstone (an empty
   // entry with a fresh stamp -- see waistEntryIsEmpty) so the move propagates to other devices
   // instead of the entry surviving under both dates.
   if (su.waistEditingDate && su.waistEditingDate !== date) {
     state.waistEntries[su.waistEditingDate] = { waist: null, notes: "", photos: [], updatedAt: new Date().toISOString() };
   }
-  state.waistEntries[date] = { waist: waist > 0 ? waist : null, notes: notes, photos: photos, updatedAt: new Date().toISOString() };
+  state.waistEntries[date] = { waist: waist > 0 ? waist : null, notes: notes, photos: finalPhotos, updatedAt: new Date().toISOString() };
   saveWaistEntries();
+  if (displaced.length > 0) deleteProgressPhotos(displaced); // best-effort; a lost delete is an invisible orphan
+  su.waistSaving = false;
   su.waistEditingDate = null; su.waistDate = null; su.waistInput = ""; su.waistNotes = ""; su.waistPhotos = [];
   showToast("Measurement saved");
 };
@@ -6639,6 +6858,11 @@ actions.askDeleteWaistEntry = function(date) { strategyUi().confirmDeleteWaistDa
 actions.cancelDeleteWaistEntry = function() { strategyUi().confirmDeleteWaistDate = null; rerender(); };
 actions.deleteWaistEntry = function(date) {
   const su = strategyUi();
+  // The entry's photo files go with it. Captured before the tombstone overwrites the array;
+  // best-effort (a lost delete is an invisible orphan file, see the Storage helper block).
+  const entry = state.waistEntries[date];
+  const filePaths = ((entry && entry.photos) || []).filter(function(p){ return !isPendingWaistPhoto(p); });
+  if (filePaths.length > 0) deleteProgressPhotos(filePaths);
   // Tombstone, not `delete`: the empty entry's fresh updatedAt is what lets this deletion win
   // the newer-wins merge against another device's older copy of the entry.
   state.waistEntries[date] = { waist: null, notes: "", photos: [], updatedAt: new Date().toISOString() };
@@ -6914,8 +7138,27 @@ function exportSnapshot() {
   };
 }
 
-actions.exportData = function() {
-  const blob = new Blob([JSON.stringify(exportSnapshot(), null, 2)], { type: "application/json" });
+actions.exportData = async function() {
+  const snapshot = exportSnapshot();
+  // The export is the app's only backup, so it has to carry the progress photos' BYTES, not
+  // just their storage paths -- paths point into an account's bucket, and a backup that
+  // depends on the very account it exists to protect against losing is not a backup. Each
+  // referenced file is fetched and inlined as a data URL under waistPhotoData (importData
+  // re-uploads them). Failures are LOUD and the export still downloads with everything else:
+  // a silent partial backup discovered at restore time is this app's worst failure mode.
+  const photoPaths = progressPhotoPathsInEntries(state.waistEntries);
+  if (photoPaths.length > 0) {
+    const photoData = {};
+    let failed = 0;
+    for (let i = 0; i < photoPaths.length; i++) {
+      const r = await fetchProgressPhotoBlob(photoPaths[i]);
+      if (r.error) { failed++; continue; }
+      try { photoData[photoPaths[i]] = await blobToDataUrl(r.data); } catch (e) { failed++; }
+    }
+    snapshot.waistPhotoData = photoData;
+    if (failed > 0) alert(failed + " progress photo(s) could not be fetched and are NOT in this backup. Check your connection and export again if you need them.");
+  }
+  const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -6948,6 +7191,10 @@ changeActions.importData = function(el) {
       if (data.dayBoosts) { state.dayBoosts = data.dayBoosts; saveDayBoosts(); }
       if (data.targetHistory) { state.targetHistory = data.targetHistory; saveTargetHistory(); }
       if (data.waistEntries) { state.waistEntries = data.waistEntries; saveWaistEntries(); }
+      // v1.2 exports carry the photo files inline (see exportData); put them back into
+      // Storage. Fire-and-forget on purpose: the entries above are already restored and
+      // usable, the uploads catch the photos up in the background, and a failure toasts.
+      if (data.waistPhotoData) restoreProgressPhotoFiles(data.waistPhotoData);
       if (data.recipes) { state.recipes = data.recipes; saveRecipes(); }
       if (data.customBarcodes) { state.customBarcodes = data.customBarcodes; saveCustomBarcodes(); }
       alert("Data imported successfully!");
@@ -6957,6 +7204,34 @@ changeActions.importData = function(el) {
   reader.readAsText(file);
   el.value = "";
 };
+
+// Re-uploads a backup's inlined photo files. Paths are rewritten to the CURRENT user's folder
+// first: a restore into a different account than the one that exported would otherwise try to
+// write into the old account's folder and be blocked by RLS (for the usual same-account
+// restore the rewrite is a no-op). x-upsert makes restoring over still-existing files
+// harmless. When a rewrite changed any path, the entries pointing at it are updated too.
+async function restoreProgressPhotoFiles(photoData) {
+  if (!state.session) return;
+  const uid = state.session.userId;
+  const oldPaths = Object.keys(photoData || {});
+  let failed = 0, rewrote = false;
+  for (let i = 0; i < oldPaths.length; i++) {
+    const newPath = rewriteProgressPhotoPath(oldPaths[i], uid);
+    const up = await uploadProgressPhoto(photoData[oldPaths[i]], newPath);
+    if (up.error) { failed++; continue; }
+    if (newPath !== oldPaths[i]) {
+      rewrote = true;
+      const oldPath = oldPaths[i];
+      Object.keys(state.waistEntries).forEach(function(date) {
+        const e = state.waistEntries[date];
+        if (e && e.photos) e.photos = e.photos.map(function(p){ return p === oldPath ? newPath : p; });
+      });
+    }
+  }
+  if (rewrote) saveWaistEntries();
+  if (failed > 0) showToast(failed + " photo(s) couldn’t be restored");
+}
+
 actions.askConfirmClear = function() { strategyUi().confirmClear = true; rerender(); };
 actions.cancelConfirmClear = function() { strategyUi().confirmClear = false; rerender(); };
 actions.clearAllData = async function() {
@@ -6968,6 +7243,10 @@ actions.clearAllData = async function() {
   // (RLS-scoped to just this user's rows via user_id) are the only thing that really clears it.
   if (state.session) {
     const uid = state.session.userId;
+    // The progress photo FILES live in Storage, not in any of the six tables -- list this
+    // user's folder and delete it too, or "Clear All Data" would leave the photos behind.
+    const photoList = await listProgressPhotoPaths();
+    if (photoList.data && photoList.data.length > 0) await deleteProgressPhotos(photoList.data);
     await Promise.all([
       supabaseTable("food_log_entries?user_id=eq." + uid, { method: "DELETE" }),
       supabaseTable("weight_entries?user_id=eq." + uid, { method: "DELETE" }),

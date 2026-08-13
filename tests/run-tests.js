@@ -82,6 +82,8 @@ const sandbox = {
   screen: { orientation: null },
   // Node's TextEncoder, forwarded so utf8ByteLength measures real UTF-8 bytes in tests too.
   TextEncoder: TextEncoder,
+  // Node's atob, forwarded so dataUrlToBlob can decode pending photos in upload tests.
+  atob: atob,
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
@@ -150,7 +152,8 @@ const exportLine =
   "clampWeightPanOffset: clampWeightPanOffset, renderWeightTab: renderWeightTab, " +
   "waistEntryIsEmpty: waistEntryIsEmpty, mergeWaistEntriesFromCloud: mergeWaistEntriesFromCloud, " +
   "waistEntriesForDisplay: waistEntriesForDisplay, waistUnitLabel: waistUnitLabel, " +
-  "renderWaistSection: renderWaistSection, " +
+  "renderWaistSection: renderWaistSection, isPendingWaistPhoto: isPendingWaistPhoto, " +
+  "progressPhotoPathsInEntries: progressPhotoPathsInEntries, rewriteProgressPhotoPath: rewriteProgressPhotoPath, " +
   "renderWeightChart: renderWeightChart, renderManualEntryScreen: renderManualEntryScreen, " +
   "flattenRecipesForSync: flattenRecipesForSync, " +
   "PERSISTED_COLLECTIONS: PERSISTED_COLLECTIONS, NON_BACKED_UP_KEYS: NON_BACKED_UP_KEYS, " +
@@ -3738,38 +3741,156 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     assertEqual(M.waistEntryIsEmpty(M.state.waistEntries["2026-08-01"]), true, "the delete made on the other device lands here");
     M.state.waistEntries = prev;
   });
-  test("saveWaistEntry: writes a stamped entry and clears the form", function () {
+  await atest("saveWaistEntry: writes a stamped entry and clears the form (no photos = fully offline)", async function () {
     const prevWaist = M.state.waistEntries, prevUi = M.state.ui;
     M.state.waistEntries = {};
-    M.state.ui = { strategy: { section: "waist", waistDate: "2026-08-01", waistInput: "34.5", waistNotes: "  feeling leaner  ", waistPhotos: ["data:image/jpeg;base64,AAA"], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null } };
-    M.actions.saveWaistEntry();
+    M.state.ui = { strategy: { section: "waist", waistDate: "2026-08-01", waistInput: "34.5", waistNotes: "  feeling leaner  ", waistPhotos: [], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null, waistSaving: false } };
+    await M.actions.saveWaistEntry();
     const e = M.state.waistEntries["2026-08-01"];
     assertEqual(e.waist, 34.5, "the measurement was saved");
     assertEqual(e.notes, "feeling leaner", "notes saved trimmed");
-    assertEqual(e.photos.length, 1, "photos travel with the entry");
     assertEqual(typeof e.updatedAt, "string", "stamped, or the merge can never propagate it");
     assertEqual(M.state.ui.strategy.waistInput, "", "the form cleared for the next entry");
     M.state.waistEntries = prevWaist; M.state.ui = prevUi;
   });
-  test("saveWaistEntry: an all-empty form saves nothing", function () {
+  await atest("saveWaistEntry: an all-empty form saves nothing", async function () {
     const prevWaist = M.state.waistEntries, prevUi = M.state.ui;
     M.state.waistEntries = {};
-    M.state.ui = { strategy: { section: "waist", waistDate: "2026-08-01", waistInput: "", waistNotes: "   ", waistPhotos: [], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null } };
-    M.actions.saveWaistEntry();
+    M.state.ui = { strategy: { section: "waist", waistDate: "2026-08-01", waistInput: "", waistNotes: "   ", waistPhotos: [], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null, waistSaving: false } };
+    await M.actions.saveWaistEntry();
     assertEqual(Object.keys(M.state.waistEntries).length, 0, "no empty entry was created");
     M.state.waistEntries = prevWaist; M.state.ui = prevUi;
   });
-  test("saveWaistEntry: correcting the date while editing tombstones the old date", function () {
+  await atest("saveWaistEntry: correcting the date while editing tombstones the old date", async function () {
     const prevWaist = M.state.waistEntries, prevUi = M.state.ui;
     M.state.waistEntries = { "2026-08-01": { waist: 35, notes: "", photos: [], updatedAt: "2026-08-01T00:00:00.000Z" } };
     M.state.ui = {};
     M.actions.editWaistEntry("2026-08-01");
     M.state.ui.strategy.waistDate = "2026-08-02";
-    M.actions.saveWaistEntry();
+    await M.actions.saveWaistEntry();
     assertEqual(M.state.waistEntries["2026-08-02"].waist, 35, "the entry moved to the corrected date");
     assertEqual(M.waistEntryIsEmpty(M.state.waistEntries["2026-08-01"]), true, "the old date holds a tombstone");
     assertEqual(typeof M.state.waistEntries["2026-08-01"].updatedAt, "string", "stamped, so the move wins the merge on other devices");
     M.state.waistEntries = prevWaist; M.state.ui = prevUi;
+  });
+
+  // ==== progress photo FILES (Supabase Storage) ====
+  test("isPendingWaistPhoto: data URLs are pending, storage paths are not", function () {
+    assertEqual(M.isPendingWaistPhoto("data:image/jpeg;base64,AAAA"), true, "an un-uploaded form photo");
+    assertEqual(M.isPendingWaistPhoto("u1/2026-08-13-abc.jpg"), false, "an uploaded file's path");
+  });
+  test("progressPhotoPathsInEntries: collects only real storage paths", function () {
+    const paths = M.progressPhotoPathsInEntries({
+      "2026-08-01": { waist: 35, photos: ["u1/a.jpg", "data:image/jpeg;base64,AAAA"] },
+      "2026-08-02": { waist: null, notes: "", photos: [], updatedAt: "x" }, // tombstone
+      "2026-08-03": { waist: 34, photos: ["u1/b.jpg"] },
+    });
+    assertEqual(paths, ["u1/a.jpg", "u1/b.jpg"], "paths only -- pending data URLs and tombstones contribute nothing");
+  });
+  test("rewriteProgressPhotoPath: swaps the account folder, keeps the filename", function () {
+    assertEqual(M.rewriteProgressPhotoPath("old-uid/2026-08-13-x.jpg", "new-uid"), "new-uid/2026-08-13-x.jpg", "cross-account restore lands in the importer's own folder");
+  });
+  await atest("saveWaistEntry: uploads pending photos to Storage and stores their PATHS, never bytes", async function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui, prevSession = M.state.session;
+    M.state.waistEntries = {};
+    M.state.session = { userId: "u1", accessToken: "tok", refreshToken: "r", expiresAt: Date.now() + 3600000 };
+    const calls = [];
+    sandbox.fetch = function (url, init) {
+      calls.push({ url: String(url), init: init || {} });
+      return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({}); } });
+    };
+    M.state.ui = { strategy: { section: "waist", waistDate: "2026-08-13", waistInput: "34", waistNotes: "", waistPhotos: ["data:image/jpeg;base64,AAAA"], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null, waistSaving: false } };
+    await M.actions.saveWaistEntry();
+    const e = M.state.waistEntries["2026-08-13"];
+    assertEqual(e.photos.length, 1, "one photo on the entry");
+    assertEqual(e.photos[0].indexOf("u1/2026-08-13-") === 0, true, "stored as a storage path in the user's own folder");
+    assertEqual(e.photos[0].indexOf("data:"), -1, "no image bytes anywhere in the entry");
+    const upload = calls.find(function (c) { return c.url.indexOf("/storage/v1/object/progress-photos/u1/") > -1 && c.init.method === "POST"; });
+    assertEqual(!!upload, true, "uploaded to the progress-photos bucket");
+    assertEqual(upload.init.headers["x-upsert"], "true", "upsert, so a retried save can't fail on already-exists");
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi; M.state.session = prevSession;
+  });
+  await atest("saveWaistEntry: refuses pending photos while signed out, keeping the form", async function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui, prevSession = M.state.session;
+    M.state.waistEntries = {};
+    M.state.session = null;
+    M.state.ui = { strategy: { section: "waist", waistDate: "2026-08-13", waistInput: "34", waistNotes: "", waistPhotos: ["data:image/jpeg;base64,AAAA"], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null, waistSaving: false } };
+    await M.actions.saveWaistEntry();
+    assertEqual(Object.keys(M.state.waistEntries).length, 0, "nothing saved -- an entry must never reference a file that was never uploaded");
+    assertEqual(M.state.ui.strategy.waistPhotos.length, 1, "the form keeps the photo for a retry");
+    assertEqual(M.state.ui.strategy.waistInput, "34", "and the rest of the form too");
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi; M.state.session = prevSession;
+  });
+  await atest("saveWaistEntry: a failed upload aborts the whole save with the form intact", async function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui, prevSession = M.state.session;
+    M.state.waistEntries = {};
+    M.state.session = { userId: "u1", accessToken: "tok", refreshToken: "r", expiresAt: Date.now() + 3600000 };
+    sandbox.fetch = function () {
+      return Promise.resolve({ ok: false, status: 500, json: function () { return Promise.resolve({ message: "storage down" }); } });
+    };
+    M.state.ui = { strategy: { section: "waist", waistDate: "2026-08-13", waistInput: "34", waistNotes: "", waistPhotos: ["data:image/jpeg;base64,AAAA"], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null, waistSaving: false } };
+    await M.actions.saveWaistEntry();
+    assertEqual(Object.keys(M.state.waistEntries).length, 0, "no entry written on upload failure");
+    assertEqual(M.state.ui.strategy.waistPhotos.length, 1, "the form keeps everything for a retry");
+    assertEqual(M.state.ui.strategy.waistSaving, false, "the saving flag is released");
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi; M.state.session = prevSession;
+  });
+  await atest("editing an entry and removing a photo deletes its file on save -- and only its file", async function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui, prevSession = M.state.session;
+    M.state.waistEntries = { "2026-08-10": { waist: 34, notes: "", photos: ["u1/a.jpg", "u1/b.jpg"], updatedAt: "2026-08-10T00:00:00.000Z" } };
+    M.state.session = { userId: "u1", accessToken: "tok", refreshToken: "r", expiresAt: Date.now() + 3600000 };
+    const calls = [];
+    sandbox.fetch = function (url, init) {
+      calls.push({ url: String(url), init: init || {} });
+      return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({}); } });
+    };
+    M.state.ui = {};
+    M.actions.editWaistEntry("2026-08-10");
+    M.state.ui.strategy.waistPhotos = ["u1/a.jpg"]; // removed b
+    await M.actions.saveWaistEntry();
+    await new Promise(function (r) { setTimeout(r, 0); }); // the file delete is fire-and-forget
+    assertEqual(M.state.waistEntries["2026-08-10"].photos, ["u1/a.jpg"], "the entry keeps the remaining photo");
+    const del = calls.find(function (c) { return c.init.method === "DELETE" && c.url.indexOf("/storage/v1/object/progress-photos") > -1; });
+    assertEqual(!!del, true, "a storage delete went out");
+    assertEqual(String(del.init.body).indexOf("u1/b.jpg") > -1, true, "for the removed photo");
+    assertEqual(String(del.init.body).indexOf("u1/a.jpg"), -1, "and not the kept one");
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi; M.state.session = prevSession;
+  });
+  await atest("deleteWaistEntry: the entry's photo files are deleted with it", async function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui, prevSession = M.state.session;
+    M.state.waistEntries = { "2026-08-05": { waist: 34, notes: "", photos: ["u1/gone.jpg"], updatedAt: "2026-08-05T00:00:00.000Z" } };
+    M.state.session = { userId: "u1", accessToken: "tok", refreshToken: "r", expiresAt: Date.now() + 3600000 };
+    const calls = [];
+    sandbox.fetch = function (url, init) {
+      calls.push({ url: String(url), init: init || {} });
+      return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({}); } });
+    };
+    M.state.ui = {};
+    M.actions.deleteWaistEntry("2026-08-05");
+    await new Promise(function (r) { setTimeout(r, 0); });
+    assertEqual(M.waistEntryIsEmpty(M.state.waistEntries["2026-08-05"]), true, "the entry is tombstoned");
+    const del = calls.find(function (c) { return c.init.method === "DELETE" && c.url.indexOf("/storage/v1/object/progress-photos") > -1; });
+    assertEqual(!!del && String(del.init.body).indexOf("u1/gone.jpg") > -1, true, "and its file was deleted from storage");
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi; M.state.session = prevSession;
+  });
+  test("the export/import/clear paths all know about the photo files (source contract)", function () {
+    assertEqual(String(M.actions.exportData).indexOf("waistPhotoData") > -1, true, "export inlines the photo bytes -- paths alone are not a backup");
+    assertEqual(String(M.changeActions.importData).indexOf("waistPhotoData") > -1, true, "import puts them back into storage");
+    assertEqual(String(M.actions.clearAllData).indexOf("listProgressPhotoPaths") > -1, true, "Clear All Data wipes the storage folder too");
+  });
+  test("renderWaistSection: a storage-path photo renders through the authenticated loader", function () {
+    const prevWaist = M.state.waistEntries, prevUi = M.state.ui, prevSession = M.state.session;
+    M.state.session = null; // loader no-ops signed out; the img still renders with its path marker
+    M.state.waistEntries = { "2026-08-01": { waist: 35, notes: "", photos: ["u9/x.jpg"], updatedAt: "2026-08-01T00:00:00.000Z" } };
+    M.state.ui = {};
+    const out = M.renderWaistSection();
+    assertEqual(out.indexOf('data-photopath="u9/x.jpg"') > -1, true, "the thumbnail carries its path for the async patch");
+    assertEqual(out.indexOf("u9/x.jpg\" src=") === -1 && out.indexOf('src="u9/x.jpg"') === -1, true, "the raw path is never used as an img src (it wouldn't authenticate)");
+    M.state.waistEntries = prevWaist; M.state.ui = prevUi; M.state.session = prevSession;
   });
   test("waist delete: two-step, and leaves a stamped tombstone rather than removing the key", function () {
     const prevWaist = M.state.waistEntries, prevUi = M.state.ui;

@@ -145,3 +145,37 @@ alter table dashboard_feed enable row level security;
 -- self-healing -- the next publish overwrites anything wrong -- so read-only on MacroLog's
 -- side is enforced by having no write path in the client, not by this policy.
 create policy "own rows" on dashboard_feed for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- ============================================================
+-- Storage: progress photos (added 2026-08-13)
+-- ============================================================
+-- Waist progress photos are FILES in a private bucket, not rows. The photos' bytes must
+-- never live inline in user_app_data / localStorage: localStorage is ~5MB shared with all
+-- of MacroLog's data, so inline base64 photos would have started failing food/weight
+-- writes within ~30 photos. Entries in user_app_data reference these files by path
+-- ("userId/filename.jpg").
+--
+-- Already applied to the live project (2026-08-13, migration `progress_photos_bucket`);
+-- kept here so a from-scratch rebuild produces it too.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('progress-photos', 'progress-photos', false, 10485760, array['image/jpeg'])
+on conflict (id) do nothing;
+
+-- Files live under {auth.uid()}/{filename}; every verb is scoped to the caller's own
+-- folder. All four are needed: the app's x-upsert upload does insert-or-update.
+create policy "progress photos select own" on storage.objects
+  for select to authenticated
+  using (bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy "progress photos insert own" on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy "progress photos update own" on storage.objects
+  for update to authenticated
+  using (bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text)
+  with check (bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy "progress photos delete own" on storage.objects
+  for delete to authenticated
+  using (bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text);

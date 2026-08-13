@@ -49,3 +49,13 @@ in the app is unaffected).
 alter table food_log_entries add column if not exists brand text;
 alter table food_log_entries add column if not exists animal_override boolean;
 ```
+
+### 2026-08-13 — progress-photos Storage bucket
+
+Needed for: the Strategy > Waist & Photos section's progress photos, which are stored
+as real JPEG files in a private Storage bucket (never inline in the database or on the
+phone — see the note in `schema.sql`).
+
+**Already applied to the live project** (via the `progress_photos_bucket` migration),
+so there is nothing to run — this entry exists for the record, and the SQL lives at the
+bottom of `schema.sql` for a from-scratch rebuild.
