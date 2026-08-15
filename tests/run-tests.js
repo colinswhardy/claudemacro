@@ -2783,6 +2783,7 @@ test("weeklyDeltaLog: spans a month boundary by calendar days", function () {
 });
 test("renderWeeklyDeltaCard: renders rows, net, and the no-data state without throwing", function () {
   M.state.targetHistory = {};
+  M.state.dayBoosts = {};
   M.state.settings.calorieTarget = 2000;
   M.state.date = "2026-07-28";
   M.state.foodLogs = { "2026-07-28": [{ id: "a", macros: { calories: 1900 } }] };
@@ -2792,6 +2793,52 @@ test("renderWeeklyDeltaCard: renders rows, net, and the no-data state without th
   assertEqual(html.indexOf("no log") >= 0, true, "empty days say so");
   M.state.foodLogs = {};
   assertEqual(M.renderWeeklyDeltaCard().indexOf("Nothing logged") >= 0, true, "empty week has a friendly state");
+});
+test("weeklyDeltaLog: rows also carry the day's SET target (base + boost) and its own delta", function () {
+  M.state.targetHistory = {};
+  M.state.settings.calorieTarget = 2000;
+  M.state.foodLogs = {
+    "2026-07-27": [{ id: "a", macros: { calories: 1700 } }],
+    "2026-07-28": [{ id: "b", macros: { calories: 2350 } }],
+  };
+  // +50g protein boost on the 28th -> that day's SET target is 2000 + 200 = 2200.
+  M.state.dayBoosts = { "2026-07-28": { protein: 50, carbs: 0, fat: 0, updatedAt: "2026-07-28T10:00:00.000Z" } };
+  const rows = M.weeklyDeltaLog("2026-07-28", 7);
+  const d27 = rows.find(function(r){ return r.date === "2026-07-27"; });
+  const d28 = rows.find(function(r){ return r.date === "2026-07-28"; });
+  assertEqual([d27.dayTarget, d27.dayDelta, d27.boosted], [2000, -300, false], "an unboosted day: set target == base, same delta");
+  assertEqual([d28.dayTarget, d28.dayDelta, d28.boosted], [2200, 150, true], "the boosted day is also scored against the target he actually set");
+  assertEqual(d28.delta, 350, "while the base-goal scoring is still carried unchanged");
+  M.state.dayBoosts = {};
+});
+test("renderWeeklyDeltaCard: a boosted week shows the ⚡ target column and BOTH running nets", function () {
+  M.state.targetHistory = {};
+  M.state.settings.calorieTarget = 2000;
+  M.state.date = "2026-07-28";
+  M.state.foodLogs = {
+    "2026-07-27": [{ id: "a", macros: { calories: 1700 } }],
+    "2026-07-28": [{ id: "b", macros: { calories: 2350 } }],
+  };
+  M.state.dayBoosts = { "2026-07-28": { protein: 50, carbs: 0, fat: 0, updatedAt: "2026-07-28T10:00:00.000Z" } };
+  const html = M.renderWeeklyDeltaCard();
+  assertEqual(html.indexOf("⚡2,200") >= 0, true, "the boosted day's set target is a visible column entry");
+  assertEqual(html.indexOf("+150") >= 0, true, "the row's delta is vs that set target, matching what the progress bar said that day");
+  assertEqual(html.indexOf("Net vs day targets") >= 0, true, "the running counter vs day targets");
+  assertEqual(html.indexOf("Net vs standing goal") >= 0, true, "and the un-boosted yardstick stays on the card");
+  assertEqual(html.indexOf("−150") >= 0, true, "day-target net: -300 + 150");
+  assertEqual(html.indexOf("+50") >= 0, true, "standing-goal net: -300 + 350");
+  M.state.dayBoosts = {};
+});
+test("renderWeeklyDeltaCard: a boost-free week keeps the single familiar net line", function () {
+  M.state.targetHistory = {};
+  M.state.dayBoosts = {};
+  M.state.settings.calorieTarget = 2000;
+  M.state.date = "2026-07-28";
+  M.state.foodLogs = { "2026-07-28": [{ id: "a", macros: { calories: 1900 } }] };
+  const html = M.renderWeeklyDeltaCard();
+  assertEqual(html.indexOf("Net (1 logged day)") >= 0, true, "the familiar single-net label");
+  assertEqual(html.indexOf("Net vs standing goal") === -1, true, "no duplicate second line when the two yardsticks are identical");
+  assertEqual(html.indexOf("2,000") >= 0, true, "the target column still shows the day's goal");
 });
 
 // ==== target history: a past day is scored against the goal that was standing THEN ====
