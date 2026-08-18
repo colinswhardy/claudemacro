@@ -156,6 +156,9 @@ const exportLine =
   "dataHealthBasisFindings: dataHealthBasisFindings, dataHealthAtwaterFindings: dataHealthAtwaterFindings, " +
   "dataHealthRecordFindings: dataHealthRecordFindings, runDataHealthCheck: runDataHealthCheck, " +
   "buildInsightsSummary: buildInsightsSummary, renderInsightsSection: renderInsightsSection, " +
+  "phaseCoach: phaseCoach, renderPhaseCoachCard: renderPhaseCoachCard, " +
+  "applyCalorieTargetWithLocks: applyCalorieTargetWithLocks, renderWeightGoalsSection: renderWeightGoalsSection, " +
+  "renderDisplaySection: renderDisplaySection, " +
   "clampWeightPanOffset: clampWeightPanOffset, renderWeightTab: renderWeightTab, " +
   "waistEntryIsEmpty: waistEntryIsEmpty, mergeWaistEntriesFromCloud: mergeWaistEntriesFromCloud, " +
   "waistEntriesForDisplay: waistEntriesForDisplay, waistUnitLabel: waistUnitLabel, " +
@@ -4276,6 +4279,108 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     M.state.settings.claudeApiKey = "";
     M.state.ui = prevUi;
   });
+
+  // ==== phases & coach (experimental, default OFF) ====
+  // estimateMaintenanceCalories reads the REAL clock (last 28 days), so these fixtures build
+  // dates relative to today. Flat 155 lb weigh-ins + 2,000 kcal complete days => measured
+  // maintenance is exactly 2,000 and the 7d trend is 155 with zero weekly change.
+  function daysAgoStr(n) { const d = new Date(); d.setDate(d.getDate() - n); return M.fmtDate(d); }
+  const coachPrevSettings = JSON.parse(JSON.stringify(M.state.settings));
+  function coachFixture(settingsOverrides, weight) {
+    M.state.foodLogs = {}; M.state.weights = {}; M.state.targetHistory = {};
+    for (let i = 1; i <= 16; i++) {
+      M.state.foodLogs[daysAgoStr(i)] = [{ id: "e" + i, name: "Meal", weight: 500, macros: { calories: 2000, protein: 150, carbs: 200, fat: 60, fiber: 20 } }];
+    }
+    for (let i = 0; i <= 20; i++) {
+      M.state.weights[daysAgoStr(i)] = { weight: weight || 155, unit: "lbs", timestamp: "2026-01-01T00:00:00.000Z" };
+    }
+    Object.assign(M.state.settings, {
+      phasesEnabled: true, weightUnit: "lbs", calorieTarget: 1876, proteinTarget: 163, carbsTarget: 153, fatTarget: 68,
+      macroLocks: { protein: false, carbs: false, fat: false }, goalWeight: 150, goalDate: "", goalRatePerWeek: "",
+      goalType: "cut", phaseStartedAt: daysAgoStr(2), phaseStartCalories: 1876, phaseStartTrendAvg: 155,
+      reverseStage: 1, reverseStage2At: null, maintainAnchor: null, maintainBand: 2, bulkRate: 0.75,
+    }, settingsOverrides || {});
+  }
+  test("phaseCoach: disabled means null, and the UI renders exactly as before", function () {
+    coachFixture({ phasesEnabled: false });
+    assertEqual(M.phaseCoach(), null, "no coach when the toggle is off");
+    const goals = M.renderWeightGoalsSection();
+    assertEqual(goals.indexOf("Reverse Diet"), -1, "no Reverse chip when off");
+    assertEqual(goals.indexOf("applyCoachSuggestion"), -1, "no coach card when off");
+  });
+  test("phaseCoach cut: goal reached suggests starting the reverse diet", function () {
+    coachFixture({ goalWeight: 155 }); // trend avg is exactly 155
+    const s = M.phaseCoach();
+    assertEqual(s.switchTo, "reverse", "the RP next step");
+    assertEqual(s.title.indexOf("Goal reached") > -1, true, "celebrated");
+  });
+  test("phaseCoach cut: a stalled trend suggests a ~100 kcal drop", function () {
+    coachFixture(); // goal 150, trend flat at 155 => stalled
+    const s = M.phaseCoach();
+    assertEqual(s.apply.calories, 1776, "current 1876 minus 100");
+  });
+  test("phaseCoach reverse step 1: suggests the RP midpoint between end-cut and maintenance", function () {
+    coachFixture({ goalType: "reverse" });
+    const s = M.phaseCoach();
+    assertEqual(s.apply.calories, 1940, "(1876 + 2000) / 2, rounded to 10");
+    assertEqual(s.apply.stage, undefined, "not a stage advance yet");
+  });
+  test("phaseCoach reverse step 1: after ~3 weeks at the midpoint, suggests full maintenance", function () {
+    coachFixture({ goalType: "reverse", phaseStartedAt: daysAgoStr(22), calorieTarget: 1940 });
+    const s = M.phaseCoach();
+    assertEqual(s.apply.calories, 2000, "step 2 is the full measured maintenance");
+    assertEqual(s.apply.stage, 2, "and advances the stage when applied");
+  });
+  test("applyCoachSuggestion: applies the shown suggestion through the macro locks", function () {
+    coachFixture({ goalType: "reverse", phaseStartedAt: daysAgoStr(22), calorieTarget: 1940, macroLocks: { protein: true, carbs: false, fat: false } });
+    M.actions.applyCoachSuggestion();
+    assertEqual(M.state.settings.calorieTarget, 2000, "target applied");
+    assertEqual(M.state.settings.proteinTarget, 163, "locked protein untouched -- the step went to carbs/fat");
+    assertEqual(M.state.settings.reverseStage, 2, "stage advanced");
+    assertEqual(typeof M.state.settings.reverseStage2At, "string", "stage-2 start stamped");
+  });
+  test("phaseCoach maintain: drift beyond the ±2 band suggests a correction; in-band says hold", function () {
+    coachFixture({ goalType: "maintain", maintainAnchor: 150, maintainBand: 2, calorieTarget: 2000 }, 153);
+    const s = M.phaseCoach();
+    assertEqual(s.apply.calories, 1875, "trend 153 vs anchor 150 = +3 drift, trim 125");
+    coachFixture({ goalType: "maintain", maintainAnchor: 155, maintainBand: 2, calorieTarget: 2000 });
+    assertEqual(M.phaseCoach().apply, null, "inside the band, nothing to change");
+  });
+  test("phaseCoach maintain: consolidated after the RP hold, opens the door to the bulk", function () {
+    coachFixture({ goalType: "maintain", maintainAnchor: 155, maintainBand: 2, calorieTarget: 2000, phaseStartedAt: daysAgoStr(49) });
+    const s = M.phaseCoach();
+    assertEqual(s.switchTo, "bulk", "7 weeks in-band = consolidated");
+  });
+  test("phaseCoach bulk: below maintenance suggests the +0.75/wk surplus target", function () {
+    coachFixture({ goalType: "bulk", calorieTarget: 2000 });
+    const s = M.phaseCoach();
+    assertEqual(s.apply.calories, 2375, "maintenance 2000 + round(0.75 * 3500 / 7)");
+  });
+  test("phaseCoach bulk: gaining too slowly vs the 0.75 target suggests +100", function () {
+    coachFixture({ goalType: "bulk", calorieTarget: 2400 }); // flat trend = 0/wk gain
+    const s = M.phaseCoach();
+    assertEqual(s.apply.calories, 2500, "under half the target pace, add 100");
+  });
+  test("setGoalType: entering a phase stamps its starting point (only when phases are on)", function () {
+    coachFixture({ goalType: "cut", phaseStartedAt: daysAgoStr(30), phaseStartCalories: 1700 });
+    M.actions.setGoalType("reverse");
+    assertEqual(M.state.settings.phaseStartedAt, daysAgoStr(0), "stamped today");
+    assertEqual(M.state.settings.phaseStartCalories, 1876, "from the current target");
+    assertEqual(M.state.settings.reverseStage, 1, "reverse starts at step 1");
+    M.actions.setGoalType("reverse"); // re-tap the active chip
+    assertEqual(M.state.settings.phaseStartedAt, daysAgoStr(0), "re-tapping does not re-stamp");
+  });
+  test("phases UI: enabled shows the Reverse chip and the coach card; Preferences carries the toggle", function () {
+    coachFixture({ goalType: "reverse" });
+    const goals = M.renderWeightGoalsSection();
+    assertEqual(goals.indexOf("Reverse Diet") > -1, true, "the fourth chip");
+    assertEqual(goals.indexOf("Coach") > -1, true, "the coach card renders in Weight Goals");
+    assertEqual(M.renderDisplaySection().indexOf("togglePhasesEnabled") > -1, true, "the experimental toggle lives in Preferences");
+  });
+  // Leave no residue for anything after us.
+  M.state.foodLogs = {}; M.state.weights = {}; M.state.targetHistory = {};
+  Object.assign(M.state.settings, coachPrevSettings);
+  M.syncTargetBaseline();
 
   console.log("\n" + pass + " passed, " + fail + " failed");
   process.exit(fail > 0 ? 1 : 0);

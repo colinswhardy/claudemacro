@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.27";
+const APP_VERSION = "1.28";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -206,6 +206,16 @@ const DEFAULT_SETTINGS = {
   aiProvider: "claude-sonnet", aiEnabled: true, geminiApiKey: "", claudeApiKey: "", compareWithGemini: false,
   macroPreset: "Custom",
   macroLocks: { protein: false, carbs: false, fat: false },
+  // Phases & Coach (EXPERIMENTAL, default OFF -- with this false the app renders exactly as
+  // it did before the feature existed). goalType doubles as the active phase; these fields
+  // are the coach's reference points, all living in the settings blob (no migration).
+  phasesEnabled: false,
+  phaseStartedAt: null,      // date the current phase began (stamped by setGoalType)
+  phaseStartCalories: null,  // calorie target when it began (reverse step 1 = midpoint math)
+  phaseStartTrendAvg: null,  // 7d-trend average when it began (the refill-window baseline)
+  reverseStage: 1, reverseStage2At: null, // RP two-step reverse: halfway, then full maintenance
+  maintainAnchor: null, maintainBand: 2,  // maintenance watch band, ± this many weight units
+  bulkRate: 0.75,            // target gain per week while bulking (Colin: new lifter, 0.75)
 };
 
 // ============================================================
@@ -6655,10 +6665,11 @@ inputActions.carbsTarget = function(v) { state.settings.carbsTarget = parseInt(v
 inputActions.fatTarget = function(v) { state.settings.fatTarget = parseInt(v,10) || 0; state.settings.macroPreset = "Custom"; syncCalorieFromMacros(); };
 
 // Editing calories redistributes the change across unlocked macros only, preserving their
-// relative proportion to each other; locked macros' grams are left untouched.
-inputActions.calorieTarget = function(v) {
+// relative proportion to each other; locked macros' grams are left untouched. Shared with
+// the coach's Apply button, so an applied suggestion respects macro locks exactly like
+// typing the number would (lock protein and every applied step flows into carbs/fat).
+function applyCalorieTargetWithLocks(newCal) {
   const set = state.settings;
-  const newCal = parseInt(v, 10) || 0;
   set.calorieTarget = newCal;
   const locks = set.macroLocks || {};
   const keys = ["protein", "carbs", "fat"];
@@ -6675,9 +6686,12 @@ inputActions.calorieTarget = function(v) {
   }
   set.macroPreset = "Custom";
   saveSettings();
-  keys.forEach(function(k) {
+}
+inputActions.calorieTarget = function(v) {
+  applyCalorieTargetWithLocks(parseInt(v, 10) || 0);
+  ["protein", "carbs", "fat"].forEach(function(k) {
     const el = document.getElementById(k + "TargetInput");
-    if (el) el.value = set[k + "Target"];
+    if (el) el.value = state.settings[k + "Target"];
   });
 };
 
@@ -6825,6 +6839,209 @@ function patchGoalPlanBlock() {
   if (el) el.innerHTML = renderGoalPlanBlock();
 }
 
+// ============================================================
+// PHASES & COACH (experimental -- settings.phasesEnabled, default OFF)
+// ============================================================
+// The app's phase-aware suggestion engine. With phasesEnabled false, none of this renders and
+// the app behaves exactly as before. THE ONE IRON RULE: the coach SUGGESTS and Colin APPLIES
+// -- no target ever changes without a tap, and applied changes go through the normal settings
+// path so targetHistory records them like any hand edit.
+//
+// The reverse-diet mechanics follow RP's "How to Reverse Diet The RIGHT Way" (Dr. Mike
+// Israetel), which Colin asked for by link: no months-long micro-stepping. Step 1: eat halfway
+// between end-of-cut calories and measured maintenance for ~3 weeks (expecting a ~2.5 lb
+// water/glycogen refill that is NOT fat). Step 2: move up to full maintenance, re-measured
+// post-refill. Then hold maintenance ~6-8 weeks (roughly as long as the cut) before bulking.
+// Bulk pace is Colin's spec: +0.75/week (new lifter). All verdicts read the 7-DAY TREND, never
+// single weigh-ins.
+function phaseTrendReadout() {
+  const dates = Object.keys(state.weights).sort();
+  if (dates.length === 0) return null;
+  const allData = dates.map(function(d){ return { date: d, weight: state.weights[d].weight }; });
+  return { data: allData, latestDate: dates[dates.length - 1], readout: weightTrendReadout(allData, dates[dates.length - 1]) };
+}
+function coachDaysSince(dateStr) {
+  if (!dateStr) return null;
+  return Math.round((parseDateStr(todayStr()) - parseDateStr(dateStr)) / 86400000);
+}
+function coachRateText(rate, unit) {
+  return rate == null ? "not yet measurable" : (rate > 0 ? "+" : "−") + Math.abs(rate) + " " + unit + "/week";
+}
+function phaseCoach() {
+  const set = state.settings;
+  if (!set.phasesEnabled) return null;
+  const unit = set.weightUnit || "lbs";
+  const t = phaseTrendReadout();
+  const S = { title: "Coach", lines: [], apply: null, applyLabel: null, switchTo: null, switchLabel: null };
+  if (!t || t.data.length < 2) {
+    S.lines.push("Not enough weigh-ins yet — the coach reads your 7-day trend, so log a few weights first.");
+    return S;
+  }
+  const tr = t.readout;
+  const rate = tr ? tr.change : null; // trend change over the last 7 days; null in the first week
+  const estRes = estimateMaintenanceCalories();
+  const est = estRes ? estRes.maintenance : null;
+  const phase = set.goalType || "cut";
+  const days = coachDaysSince(set.phaseStartedAt);
+
+  if (phase === "cut") {
+    const proj = weightGoalProjection(t.data, t.latestDate, set.goalWeight);
+    if (proj && proj.reached) {
+      S.title = "🎉 Goal reached";
+      S.lines.push("Your 7-day trend (" + proj.avg + " " + unit + ") has met your " + set.goalWeight + " " + unit + " goal. Per the RP playbook: don’t linger in the deficit and don’t jump straight to a bulk — reverse diet to maintenance first.");
+      S.switchTo = "reverse"; S.switchLabel = "Start Reverse Diet";
+    } else if (rate != null && rate > -0.15) {
+      S.title = "Cut stalled";
+      S.lines.push("Trend moved " + coachRateText(rate, unit) + " this week. If next week looks the same, take ~100 kcal off" + (est ? " — or take a 1-week diet break at maintenance (~" + est.toLocaleString() + ") if fatigue is high" : "") + ".");
+      S.apply = { calories: Math.max(1200, set.calorieTarget - 100) };
+      S.applyLabel = "Apply " + Math.max(1200, set.calorieTarget - 100).toLocaleString() + " kcal";
+    } else {
+      S.title = "Cut — on pace";
+      S.lines.push("Trend " + coachRateText(rate, unit) + "." + (proj && proj.date ? " At this pace: " + set.goalWeight + " " + unit + " around " + dayLabel(proj.date) + "." : ""));
+    }
+    return S;
+  }
+
+  if (phase === "reverse") {
+    if (!est) {
+      S.title = "Reverse diet";
+      S.lines.push("Maintenance can’t be measured yet (needs ~2 weeks of complete food days and weigh-ins). Hold your current target until it can.");
+      return S;
+    }
+    const refillGain = (set.phaseStartTrendAvg != null && tr && tr.avg != null) ? round1(tr.avg - set.phaseStartTrendAvg) : null;
+    if (set.reverseStage !== 2) {
+      const startCal = set.phaseStartCalories || set.calorieTarget;
+      const mid = Math.round((startCal + est) / 2 / 10) * 10;
+      S.title = "Reverse diet — step 1 of 2";
+      if (Math.abs(set.calorieTarget - mid) > 25) {
+        S.lines.push("RP step 1: eat halfway between your end-of-cut calories (" + startCal.toLocaleString() + ") and measured maintenance (~" + est.toLocaleString() + ") for ~3 weeks. That’s ~" + mid.toLocaleString() + " kcal.");
+        S.apply = { calories: mid };
+        S.applyLabel = "Apply " + mid.toLocaleString() + " kcal";
+      } else {
+        S.lines.push("Holding the halfway step at " + set.calorieTarget.toLocaleString() + " kcal — day " + (days != null ? days : 0) + " of ~21.");
+      }
+      if (refillGain != null && refillGain > 0 && refillGain <= 2.5) {
+        S.lines.push("Trend is up " + refillGain + " " + unit + " since starting — that’s the expected glycogen/water refill, not fat. On script.");
+      }
+      if (refillGain != null && refillGain > 2.5) {
+        S.lines.push("⚠ Trend is up " + refillGain + " " + unit + " — past the ~2.5 " + unit + " refill allowance. Hold this step until it settles before stepping up.");
+      }
+      if (days != null && days >= 21 && !(refillGain != null && refillGain > 2.5)) {
+        S.lines.push("Step 1 is done — move to step 2: full maintenance (~" + est.toLocaleString() + " kcal, re-measured after the refill).");
+        S.apply = { calories: est, stage: 2 };
+        S.applyLabel = "Step up to " + est.toLocaleString() + " kcal";
+      } else if (rate != null && rate <= -0.5) {
+        S.lines.push("Still losing " + Math.abs(rate) + " " + unit + "/week at the halfway step — you can move to step 2 early.");
+        S.apply = { calories: est, stage: 2 };
+        S.applyLabel = "Step up to " + est.toLocaleString() + " kcal";
+      }
+    } else {
+      const d2 = coachDaysSince(set.reverseStage2At);
+      S.title = "Reverse diet — step 2 of 2";
+      S.lines.push("At full maintenance (" + set.calorieTarget.toLocaleString() + " kcal)" + (d2 != null ? " — day " + d2 + " of ~14" : "") + ". Watching for the trend to flatten.");
+      if (rate != null && d2 != null && d2 >= 14 && Math.abs(rate) <= 0.3) {
+        S.lines.push("Trend is flat — maintenance found. Lock it in and consolidate before any bulk.");
+        S.switchTo = "maintain"; S.switchLabel = "Switch to Maintenance";
+      } else if (rate != null && rate <= -0.4) {
+        S.lines.push("Still losing at “maintenance” — your real number is higher. Add ~100.");
+        S.apply = { calories: set.calorieTarget + 100 };
+        S.applyLabel = "Apply " + (set.calorieTarget + 100).toLocaleString() + " kcal";
+      } else if (rate != null && rate >= 0.6 && refillGain != null && refillGain > 2.5) {
+        S.lines.push("Trend is climbing beyond what refill explains. Trim ~100.");
+        S.apply = { calories: Math.max(1200, set.calorieTarget - 100) };
+        S.applyLabel = "Apply " + Math.max(1200, set.calorieTarget - 100).toLocaleString() + " kcal";
+      }
+    }
+    return S;
+  }
+
+  if (phase === "maintain") {
+    const band = parseFloat(set.maintainBand) > 0 ? parseFloat(set.maintainBand) : 2;
+    const anchor = parseFloat(set.maintainAnchor) > 0 ? parseFloat(set.maintainAnchor) : (tr ? tr.avg : null);
+    if (anchor == null || !tr) { S.title = "Maintenance"; S.lines.push("Log a few weigh-ins to establish the anchor."); return S; }
+    const drift = round1(tr.avg - anchor);
+    const weeksIn = days != null ? Math.floor(days / 7) : null;
+    S.title = "Maintenance";
+    if (Math.abs(drift) <= band) {
+      S.lines.push("Trend " + tr.avg + " " + unit + " — inside your " + anchor + " ± " + band + " " + unit + " band. Nothing to change.");
+      if (weeksIn != null && weeksIn < 6) {
+        S.lines.push("Consolidating: week " + (weeksIn + 1) + " of ~6–8. (RP: hold maintenance roughly as long as the cut lasted before growing.)");
+      } else {
+        S.lines.push("Consolidated. A lean bulk is on the table whenever you’re ready — at your +" + (parseFloat(set.bulkRate) || 0.75) + " " + unit + "/week target that means roughly maintenance + " + Math.round((parseFloat(set.bulkRate) || 0.75) * (KCAL_PER_WEIGHT_UNIT[unit] || 3500) / 7) + " kcal.");
+        S.switchTo = "bulk"; S.switchLabel = "Start Bulk";
+      }
+    } else if (drift > band) {
+      S.lines.push("Trend " + tr.avg + " " + unit + " is " + drift + " above your " + anchor + " anchor (band ±" + band + "). Sustained, not a spike — trim ~125.");
+      S.apply = { calories: Math.max(1200, set.calorieTarget - 125) };
+      S.applyLabel = "Apply " + Math.max(1200, set.calorieTarget - 125).toLocaleString() + " kcal";
+    } else {
+      S.lines.push("Trend " + tr.avg + " " + unit + " is " + Math.abs(drift) + " below your " + anchor + " anchor (band ±" + band + "). Add ~125.");
+      S.apply = { calories: set.calorieTarget + 125 };
+      S.applyLabel = "Apply " + (set.calorieTarget + 125).toLocaleString() + " kcal";
+    }
+    return S;
+  }
+
+  if (phase === "bulk") {
+    const targetRate = parseFloat(set.bulkRate) > 0 ? parseFloat(set.bulkRate) : 0.75;
+    const surplusCal = est != null ? est + Math.round(targetRate * (KCAL_PER_WEIGHT_UNIT[unit] || 3500) / 7) : null;
+    S.title = "Bulk";
+    if (est != null && set.calorieTarget < est + 100) {
+      S.lines.push("Your target (" + set.calorieTarget.toLocaleString() + ") is at or below measured maintenance (~" + est.toLocaleString() + "). For +" + targetRate + " " + unit + "/week: ~" + surplusCal.toLocaleString() + " kcal.");
+      S.apply = { calories: surplusCal };
+      S.applyLabel = "Apply " + surplusCal.toLocaleString() + " kcal";
+    } else if (rate != null && rate < targetRate * 0.5) {
+      S.lines.push("Gaining " + coachRateText(rate, unit) + " vs the +" + targetRate + " target. Add ~100.");
+      S.apply = { calories: set.calorieTarget + 100 };
+      S.applyLabel = "Apply " + (set.calorieTarget + 100).toLocaleString() + " kcal";
+    } else if (rate != null && rate > targetRate * 1.4) {
+      S.lines.push("Gaining " + coachRateText(rate, unit) + " — past the +" + targetRate + " target, and the excess past that pace is mostly fat. Trim ~100.");
+      S.apply = { calories: Math.max(1200, set.calorieTarget - 100) };
+      S.applyLabel = "Apply " + Math.max(1200, set.calorieTarget - 100).toLocaleString() + " kcal";
+    } else {
+      S.lines.push("Trend " + coachRateText(rate, unit) + " vs the +" + targetRate + " " + unit + "/week target. Keep protein ≥ " + set.proteinTarget + "g.");
+    }
+    if (days != null && days < 21) {
+      S.lines.push("(First ~3 weeks of a bulk include glycogen refill — expect the scale to run hot before it settles.)");
+    }
+    return S;
+  }
+  return null;
+}
+
+actions.applyCoachSuggestion = function() {
+  // Recomputed rather than cached: phaseCoach is deterministic from state, so this applies
+  // exactly what the card is currently showing.
+  const s = phaseCoach();
+  if (!s || !s.apply) return;
+  const set = state.settings;
+  if (s.apply.calories != null) applyCalorieTargetWithLocks(Math.max(1200, Math.round(s.apply.calories)));
+  if (s.apply.stage === 2) { set.reverseStage = 2; set.reverseStage2At = todayStr(); }
+  if (s.apply.anchor != null) set.maintainAnchor = s.apply.anchor;
+  saveSettings();
+  showToast("Applied");
+};
+
+function renderPhaseCoachCard() {
+  const set = state.settings;
+  if (!set.phasesEnabled) return '';
+  const s = phaseCoach();
+  if (!s) return '';
+  let html = '<div style="border-top:1px solid ' + C.border + ';margin:20px 0 16px"></div>' +
+    '<div class="label" style="margin-bottom:4px;text-transform:uppercase;font-weight:600;letter-spacing:0.5px">Coach <span style="color:' + C.textMut + ';text-transform:none;font-weight:400;letter-spacing:0">— suggests only, never changes anything itself</span></div>' +
+    '<div style="padding:12px 14px;background:' + C.inputBg + ';border-radius:12px;margin-top:8px">' +
+      '<div style="font-size:14px;font-weight:700">' + s.title + '</div>' +
+      s.lines.map(function(l){ return '<div style="color:' + C.textSec + ';font-size:12px;margin-top:6px;line-height:1.5">' + l + '</div>'; }).join('') +
+      ((s.apply || s.switchTo)
+        ? '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">' +
+            (s.apply ? btn({ label: s.applyLabel || "Apply", action: "applyCoachSuggestion", small: true }) : '') +
+            (s.switchTo ? btn({ label: s.switchLabel, action: "setGoalType", arg: s.switchTo, small: true, outline: !!s.apply }) : '') +
+          '</div>'
+        : '') +
+    '</div>';
+  return html;
+}
+
 function renderWeightGoalsSection() {
   const set = state.settings;
   const allWeights = Object.keys(state.weights).sort().map(function(d){ return [d, state.weights[d]]; });
@@ -6850,9 +7067,21 @@ function renderWeightGoalsSection() {
   const currentGoalType = set.goalType || "cut";
   html += '<div style="margin-top:16px"><label class="label">Goal Phase</label><div class="rowWrap">' +
     '<button class="chip' + (currentGoalType === 'cut' ? ' active' : '') + '" data-action="setGoalType" data-arg="cut">Cut</button>' +
+    // Reverse Diet is only a phase when the experimental Phases & Coach toggle is on
+    // (Preferences); with it off this row is exactly the pre-feature three chips.
+    (set.phasesEnabled ? '<button class="chip' + (currentGoalType === 'reverse' ? ' active' : '') + '" data-action="setGoalType" data-arg="reverse">Reverse Diet</button>' : '') +
     '<button class="chip' + (currentGoalType === 'maintain' ? ' active' : '') + '" data-action="setGoalType" data-arg="maintain">Maintenance</button>' +
     '<button class="chip' + (currentGoalType === 'bulk' ? ' active' : '') + '" data-action="setGoalType" data-arg="bulk">Bulk</button>' +
   '</div></div>';
+  if (set.phasesEnabled && currentGoalType === 'maintain') {
+    html += '<div class="row" style="margin-top:12px">' +
+      '<div style="flex:1"><label class="label">Anchor Weight (' + set.weightUnit + ')</label>' + textInput({ value: set.maintainAnchor != null ? set.maintainAnchor : "", type: "number", placeholder: "7d trend at switch", bind: "maintainAnchor" }) + '</div>' +
+      '<div style="flex:1"><label class="label">Band (± ' + set.weightUnit + ')</label>' + textInput({ value: set.maintainBand != null ? set.maintainBand : 2, type: "number", bind: "maintainBand" }) + '</div>' +
+    '</div>';
+  }
+  if (set.phasesEnabled && currentGoalType === 'bulk') {
+    html += '<div style="margin-top:12px"><label class="label">Target Gain Per Week (' + set.weightUnit + ')</label>' + textInput({ value: set.bulkRate != null ? set.bulkRate : 0.75, type: "number", bind: "bulkRate" }) + '</div>';
+  }
   html += '<div style="margin-top:12px"><label class="label">Goal Weight (' + set.weightUnit + ')</label>' + textInput({ value: set.goalWeight, type: "number", bind: "goalWeight" }) + '</div>';
   html += '<div style="margin-top:12px"><label class="label">Target Date</label>' + textInput({ value: set.goalDate, type: "date", bind: "goalDate" }) + '</div>';
   html += '<div style="margin-top:12px"><label class="label">Desired Change Per Week (' + set.weightUnit + ', optional)</label>' + textInput({ value: set.goalRatePerWeek, type: "number", placeholder: "e.g. 1", bind: "goalRatePerWeek" }) + '</div>';
@@ -6870,6 +7099,8 @@ function renderWeightGoalsSection() {
   html += '<div class="label" style="margin-bottom:4px;text-transform:uppercase;font-weight:600;letter-spacing:0.5px">Recommended Calories</div>';
   html += '<div id="goalPlanBlock">' + renderGoalPlanBlock() + '</div>';
 
+  html += renderPhaseCoachCard();
+
   html += '<div style="border-top:1px solid ' + C.border + ';margin:20px 0 16px"></div>';
   html += '<div class="label" style="margin-bottom:12px;text-transform:uppercase;font-weight:600;letter-spacing:0.5px">Starting Point</div>';
   html += '<div><label class="label">Starting Date</label>' + textInput({ value: set.startDate || "", type: "date", bind: "goalsStartDate" }) + '</div>';
@@ -6882,7 +7113,29 @@ function renderWeightGoalsSection() {
   return card(html);
 }
 
-actions.setGoalType = function(t) { state.settings.goalType = t; saveSettings(); patchGoalPlanBlock(); rerender(); };
+actions.setGoalType = function(t) {
+  const set = state.settings;
+  const changed = t !== set.goalType;
+  set.goalType = t;
+  // Entering a phase stamps when it started and from where -- the coach's arithmetic (the
+  // reverse refill window, stage advancement, the maintenance hold count) is all relative to
+  // these. Re-tapping the already-active chip deliberately does NOT re-stamp.
+  if (set.phasesEnabled && changed) {
+    const tp = phaseTrendReadout();
+    set.phaseStartedAt = todayStr();
+    set.phaseStartCalories = set.calorieTarget;
+    set.phaseStartTrendAvg = tp && tp.readout ? tp.readout.avg : null;
+    set.reverseStage = 1;
+    set.reverseStage2At = null;
+    if (t === "maintain" && !(parseFloat(set.maintainAnchor) > 0)) {
+      set.maintainAnchor = tp && tp.readout ? tp.readout.avg : null; // seeded from the trend; editable in the field above
+    }
+  }
+  saveSettings(); patchGoalPlanBlock(); rerender();
+};
+inputActions.maintainAnchor = function(v) { state.settings.maintainAnchor = v === "" ? null : parseFloat(v); saveSettings(); };
+inputActions.maintainBand = function(v) { const n = parseFloat(v); state.settings.maintainBand = n > 0 ? n : 2; saveSettings(); };
+inputActions.bulkRate = function(v) { const n = parseFloat(v); state.settings.bulkRate = n > 0 ? n : 0.75; saveSettings(); };
 inputActions.goalWeight = function(v) { state.settings.goalWeight = v; saveSettings(); patchGoalPlanBlock(); };
 inputActions.goalDate = function(v) { state.settings.goalDate = v; saveSettings(); patchGoalPlanBlock(); };
 inputActions.goalRatePerWeek = function(v) { state.settings.goalRatePerWeek = v; saveSettings(); patchGoalPlanBlock(); };
@@ -7203,8 +7456,27 @@ function renderDisplaySection() {
     '<div><div style="font-size:14px">Show Plant Protein</div><div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">Show the "(Xg plant-based)" estimate under Protein on the dashboard</div></div>' +
     toggleSwitch(set.showPlantProtein, "toggleShowPlantProtein") +
   '</div>';
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:' + C.inputBg + ';border-radius:10px;border:1px solid ' + C.border + ';margin-top:16px">' +
+    '<div style="min-width:0;padding-right:8px"><div style="font-size:14px">Phases &amp; Coach <span style="color:' + C.warning + ';font-size:11px">experimental</span></div>' +
+    '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">Adds a Reverse Diet phase and a coach card under Weight Goals that suggests calorie changes (never applies them itself). Turn off to restore the app exactly as before.</div></div>' +
+    toggleSwitch(set.phasesEnabled === true, "togglePhasesEnabled") +
+  '</div>';
   return card(html);
 }
+actions.togglePhasesEnabled = function() {
+  const set = state.settings;
+  set.phasesEnabled = set.phasesEnabled !== true;
+  // First enable: stamp the current phase's starting point so the coach has its reference
+  // (without this, "day N of the phase" would be unanswerable for the phase already underway).
+  if (set.phasesEnabled && !set.phaseStartedAt) {
+    const tp = phaseTrendReadout();
+    set.phaseStartedAt = todayStr();
+    set.phaseStartCalories = set.calorieTarget;
+    set.phaseStartTrendAvg = tp && tp.readout ? tp.readout.avg : null;
+  }
+  saveSettings();
+  rerender();
+};
 actions.setWeightUnit = function(u) { state.settings.weightUnit = u; saveSettings(); rerender(); };
 actions.setCarbsDisplay = function(v) { state.settings.carbsDisplay = v; saveSettings(); rerender(); };
 actions.toggleShowPlantProtein = function() { state.settings.showPlantProtein = !state.settings.showPlantProtein; saveSettings(); rerender(); };
