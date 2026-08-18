@@ -149,6 +149,7 @@ const exportLine =
   "BARCODE_CONFIRM_STALE_MS: BARCODE_CONFIRM_STALE_MS, " +
   "weightChartHitBands: weightChartHitBands, renderSelectedWeightSlot: renderSelectedWeightSlot, " +
   "weightRangeDays: weightRangeDays, weightChartWindowBounds: weightChartWindowBounds, " +
+  "weightTrendSeries: weightTrendSeries, WEIGHT_TREND_DAYS: WEIGHT_TREND_DAYS, " +
   "clampWeightPanOffset: clampWeightPanOffset, renderWeightTab: renderWeightTab, " +
   "waistEntryIsEmpty: waistEntryIsEmpty, mergeWaistEntriesFromCloud: mergeWaistEntriesFromCloud, " +
   "waistEntriesForDisplay: waistEntriesForDisplay, waistUnitLabel: waistUnitLabel, " +
@@ -3750,6 +3751,55 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     const out = M.renderWeightTab();
     assertEqual(out.indexOf("No weigh-ins in this window") > -1, true, "empty window says so");
     assertEqual(out.indexOf('data-action="panWeightChart"') > -1, true, "and the pan controls are still there to get back");
+    M.state.weights = prevWeights; M.state.ui = prevUi; M.state.date = prevDate;
+  });
+
+  // ==== weight chart: 7-day trend line ====
+  test("weightTrendSeries: trailing 7-calendar-day average over dense daily data", function () {
+    const data = [];
+    for (let i = 1; i <= 10; i++) data.push({ date: "2026-08-" + String(i).padStart(2, "0"), weight: i });
+    const trend = M.weightTrendSeries(data, data.map(function (p) { return p.date; }));
+    assertEqual(trend[0], 1, "first day averages only itself");
+    assertEqual(trend[3], 2.5, "day 4 averages days 1-4");
+    assertEqual(trend[6], 4, "day 7 averages the full first week (1..7)");
+    assertEqual(trend[9], 7, "day 10 averages days 4-10 -- the window slides");
+  });
+  test("weightTrendSeries: a logging gap averages fewer points, never reaches further back", function () {
+    const data = [{ date: "2026-07-01", weight: 180 }, { date: "2026-07-20", weight: 170 }, { date: "2026-07-22", weight: 172 }];
+    const trend = M.weightTrendSeries(data, ["2026-07-20", "2026-07-22"]);
+    assertEqual(trend[0], 170, "Jul 20's window holds only itself -- Jul 1 is 19 days out, not 'the previous point'");
+    assertEqual(trend[1], 171, "Jul 22 averages Jul 20 + Jul 22");
+  });
+  test("weightTrendSeries: history outside the charted window still feeds the trend", function () {
+    // A 7d chart window showing only Aug 8-10 must not pretend Aug 4-7 weigh-ins don't exist.
+    const all = [];
+    ["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07", "2026-08-08", "2026-08-09", "2026-08-10"].forEach(function (d, i) {
+      all.push({ date: d, weight: 160 - i }); // 160..154
+    });
+    const trend = M.weightTrendSeries(all, ["2026-08-08", "2026-08-09", "2026-08-10"]);
+    assertEqual(trend[0], 158, "Aug 8 averages Aug 4-8 (160+159+158+157+156)/5, using pre-window history");
+    assertEqual(trend[2], 157, "Aug 10 averages the full week");
+  });
+  test("renderWeightChart: draws the trend line and its label when trend values are passed", function () {
+    const data = [{ date: "2026-08-01", weight: 180 }, { date: "2026-08-05", weight: 179 }, { date: "2026-08-09", weight: 178 }];
+    const withTrend = M.renderWeightChart(data, null, null, [180, 179.5, 179]);
+    assertEqual(withTrend.indexOf("#A855F7") > -1, true, "the violet trend path is drawn");
+    assertEqual(withTrend.indexOf("7d trend") > -1, true, "and labelled");
+    const withoutTrend = M.renderWeightChart(data, null, null);
+    assertEqual(withoutTrend.indexOf("#A855F7"), -1, "omitting trend values draws no trend");
+    const lonePoint = M.renderWeightChart([data[0]], null, null, [180]);
+    assertEqual(lonePoint.indexOf("7d trend"), -1, "a single point gets no trend line or label");
+  });
+  test("renderWeightTab: the chart carries the 7-day trend", function () {
+    const prevWeights = M.state.weights, prevUi = M.state.ui, prevDate = M.state.date;
+    M.state.date = "2026-08-13";
+    M.state.weights = {
+      "2026-08-01": { weight: 181, unit: "lbs", timestamp: "2026-08-01T08:00:00.000Z" },
+      "2026-08-10": { weight: 180, unit: "lbs", timestamp: "2026-08-10T08:00:00.000Z" },
+      "2026-08-12": { weight: 179.5, unit: "lbs", timestamp: "2026-08-12T08:00:00.000Z" },
+    };
+    M.state.ui = {};
+    assertEqual(M.renderWeightTab().indexOf("7d trend") > -1, true, "trend line rendered from the tab");
     M.state.weights = prevWeights; M.state.ui = prevUi; M.state.date = prevDate;
   });
 

@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.24";
+const APP_VERSION = "1.25";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -5774,7 +5774,9 @@ function renderWeightTab() {
       renderWeightPanRow(wu, rangeDays, maxPan, windowLabel) +
       renderSelectedWeightSlot(selPoint, wu, unit) +
       (chartData.length > 0
-        ? renderWeightChart(chartData, set.goalWeight, wu.selectedPoint)
+        ? renderWeightChart(chartData, set.goalWeight, wu.selectedPoint,
+            // Trend from ALL weigh-ins, charted at the visible dates (see weightTrendSeries).
+            weightTrendSeries(allWeights.map(function(w){ return { date: w[0], weight: w[1].weight }; }), chartData.map(function(d){ return d.date; })))
         : '<div data-panzone="weight" style="height:220px;display:flex;align-items:center;justify-content:center;color:' + C.textMut + ';font-size:13px">No weigh-ins in this window</div>');
     html += card(histInner);
   } else {
@@ -5889,6 +5891,33 @@ function renderWeightPanRow(wu, rangeDays, maxPan, windowLabel) {
   '</div>';
 }
 
+// The 7-day trend line: for each charted date, the average of every weigh-in in the 7
+// calendar days ending on it. This exists because day-to-day scale moves are dominated by
+// water/glycogen/gut-content waves (the weekend cycle, in Colin's data) that are 3-5x larger
+// than the underlying fat change -- the smoothed line is what separates the trend from the
+// waves. Two things are deliberate: it averages by CALENDAR window, not by point count, so a
+// sparse logging week averages fewer points instead of reaching further back in time
+// (parseDateStr/setDate stepping, the standard rule); and callers hand it the FULL weigh-in
+// history while charting only the visible dates, so a narrow or panned window doesn't bend
+// the trend near its left edge by pretending earlier weigh-ins don't exist. Two-pointer over
+// the ascending dates, so it's linear, not quadratic, on the all-time range. Pure, tested.
+const WEIGHT_TREND_DAYS = 7;
+function weightTrendSeries(allData, dates) {
+  const times = allData.map(function(p){ return parseDateStr(p.date).getTime(); });
+  let lo = 0, hi = 0, sum = 0; // running window over allData: [lo, hi)
+  const out = [];
+  dates.forEach(function(dateStr) {
+    const d = parseDateStr(dateStr);
+    const end = d.getTime();
+    d.setDate(d.getDate() - (WEIGHT_TREND_DAYS - 1));
+    const start = d.getTime();
+    while (hi < allData.length && times[hi] <= end) { sum += allData[hi].weight; hi++; }
+    while (lo < hi && times[lo] < start) { sum -= allData[lo].weight; lo++; }
+    out.push(hi > lo ? sum / (hi - lo) : null);
+  });
+  return out;
+}
+
 // Tap targets for the weight chart: one full-plot-height vertical band per point, each running
 // from the midpoint to its left neighbour to the midpoint to its right (clamped to the plot).
 //
@@ -5989,7 +6018,7 @@ function weightStatsRangeLabel(timeRange, manualDays) {
   return { "7d": "last 7 days", "30d": "last 30 days", "90d": "last 90 days", "6m": "last 6 months", "all": "all time" }[timeRange] || "selected range";
 }
 
-function renderWeightChart(data, goalWeight, selectedDate) {
+function renderWeightChart(data, goalWeight, selectedDate, trendValues) {
   const w = 460, h = 200, padL = 36, padR = 10, padT = 10, padB = 24;
   const weights = data.map(function(d){ return d.weight; });
   let minW = Math.min.apply(null, weights), maxW = Math.max.apply(null, weights);
@@ -6055,6 +6084,28 @@ function renderWeightChart(data, goalWeight, selectedDate) {
     yLabels += '<text x="4" y="' + (y+3).toFixed(1) + '" font-size="10" fill="' + C.textMut + '">' + Math.round(val) + '</text>';
   }
 
+  // The 7-day trend (see weightTrendSeries): violet -- distinct from the blue daily line, the
+  // green goal line, and the amber selection marker -- painted BEFORE the daily line so the
+  // dots and the day-to-day wiggles stay crisp on top of it. Trend values are averages of the
+  // data, so they can never extend the min/max scale. Label only when the line is actually a
+  // line (2+ points); a lone charted point's "trend" is just itself.
+  const TREND_COLOR = "#A855F7";
+  let trendPath = "", trendLabel = "";
+  if (trendValues && trendValues.length === data.length) {
+    let pts = 0, lastX = 0, lastY = 0;
+    data.forEach(function(d, i) {
+      if (trendValues[i] == null) return;
+      const x = xs[i], y = yScale(trendValues[i]);
+      trendPath += (pts === 0 ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1) + " ";
+      lastX = x; lastY = y; pts++;
+    });
+    if (pts < 2) trendPath = "";
+    else trendLabel = '<text x="' + lastX.toFixed(1) + '" y="' + (lastY - 6).toFixed(1) + '" font-size="9" fill="' + TREND_COLOR + '" text-anchor="end" style="pointer-events:none">7d trend</text>';
+  }
+  const trendLine = trendPath
+    ? '<path d="' + trendPath + '" fill="none" stroke="' + TREND_COLOR + '" stroke-width="2.5" opacity="0.7" stroke-linecap="round" style="pointer-events:none"></path>' + trendLabel
+    : '';
+
   let goalLine = "";
   if (goalWeight && goalWeight >= minW && goalWeight <= maxW) {
     const gy = yScale(goalWeight);
@@ -6063,7 +6114,7 @@ function renderWeightChart(data, goalWeight, selectedDate) {
   }
 
   return '<div style="width:100%;overflow-x:auto" data-panzone="weight"><svg viewBox="0 0 ' + w + ' ' + h + '" style="width:100%;height:220px" preserveAspectRatio="xMidYMid meet">' +
-    gridLines + yLabels + xLabels + goalLine +
+    gridLines + yLabels + xLabels + goalLine + trendLine +
     '<path d="' + path + '" fill="none" stroke="' + C.primary + '" stroke-width="2"></path>' +
     dots + hitAreas +
   '</svg></div>';
