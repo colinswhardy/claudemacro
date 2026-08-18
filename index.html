@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.26";
+const APP_VERSION = "1.27";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -368,6 +368,9 @@ const NON_BACKED_UP_KEYS = [
   // The Fitness Dashboard's rows. Another app owns them and republishes them; MacroLog holds a
   // read-only cache and has no write path to that table (see pullDashboardFeedFromCloud).
   "dashboardFeed",
+  // The last AI-generated Insights text (Strategy > Insights). Derived output, regenerable
+  // with one tap from data that IS backed up -- not Colin's data.
+  "lastInsights",
 ];
 
 function cleanExpiredPhotos() {
@@ -562,6 +565,9 @@ function flattenFoodLogsForSync() {
         // column set, so these must always be present (never omitted via undefined) even when
         // there's no value -- explicit null, not a missing key.
         brand: e.brand || null, animal_override: e.animalOverride == null ? null : e.animalOverride,
+        // A quick-logged meal's component items (see logQuickMeal) -- explicit null, never an
+        // omitted key, same bulk-upsert shared-column-set rule as brand/animal_override.
+        meal_items: e.mealItems || null,
         source: e.source || null, logged_at: e.timestamp || new Date().toISOString(),
         updated_at: e.updatedAt || e.timestamp || new Date().toISOString(),
       });
@@ -579,7 +585,7 @@ async function pushFoodLogsToCloud() {
 }
 async function pullFoodLogsFromCloud() {
   if (!state.session) return { error: "Not signed in" };
-  return pullAllRows("food_log_entries?user_id=eq." + state.session.userId + "&select=id,log_date,food_id,name,weight,calories,protein,carbs,fat,fiber,brand,animal_override,source,logged_at,updated_at&order=id");
+  return pullAllRows("food_log_entries?user_id=eq." + state.session.userId + "&select=id,log_date,food_id,name,weight,calories,protein,carbs,fat,fiber,brand,animal_override,meal_items,source,logged_at,updated_at&order=id");
 }
 
 function flattenWeightsForSync() {
@@ -737,6 +743,7 @@ function mergeFoodLogsFromCloud(cloudRows) {
       id: row.id, foodId: row.food_id, name: row.name, weight: row.weight,
       macros: { calories: row.calories, protein: row.protein, carbs: row.carbs, fat: row.fat, fiber: row.fiber || 0 },
       brand: row.brand || null, animalOverride: row.animal_override == null ? null : row.animal_override,
+      mealItems: row.meal_items || null,
       timestamp: row.logged_at, source: row.source || "Synced", updatedAt: row.updated_at || row.logged_at,
     };
     if (existing) {
@@ -1240,6 +1247,7 @@ function flattenRecipesForSync() {
   return state.recipes.map(function(r) {
     return {
       id: r.id, user_id: state.session.userId, name: r.name, ingredients: r.ingredients,
+      quick_log: r.quickLog === true, // one-tap meal chip on the Food tab
       created_at: r.createdAt || new Date().toISOString(),
       // Sent so the merge on the other device can tell a newer recipe from an older one. Every
       // local write path (saveRecipe, and the ingredient rescale in propagateCustomFoodEdit)
@@ -1256,7 +1264,7 @@ async function pushRecipesToCloud() {
 }
 async function pullRecipesFromCloud() {
   if (!state.session) return { error: "Not signed in" };
-  return supabaseTable("recipes?user_id=eq." + state.session.userId + "&select=id,name,ingredients,created_at,updated_at");
+  return supabaseTable("recipes?user_id=eq." + state.session.userId + "&select=id,name,ingredients,quick_log,created_at,updated_at");
 }
 // Newer-wins by updated_at, the same rule food_log_entries and weight_entries use (fixed
 // 2026-08-10). This was additive-only by id, which cost real edits: renaming a recipe or
@@ -1279,7 +1287,7 @@ function mergeRecipesFromCloud(cloudRows) {
   let changed = 0;
   (cloudRows || []).forEach(function(row) {
     if (wasRecentlyDeleted("recipes", row.id)) return;
-    const recipe = { id: row.id, name: row.name, ingredients: row.ingredients, createdAt: row.created_at, updatedAt: row.updated_at || row.created_at };
+    const recipe = { id: row.id, name: row.name, ingredients: row.ingredients, quickLog: row.quick_log === true, createdAt: row.created_at, updatedAt: row.updated_at || row.created_at };
     if (!indexById.has(row.id)) {
       indexById.set(row.id, state.recipes.length);
       state.recipes.push(recipe);
@@ -2370,6 +2378,11 @@ function addFoodToLog(food) {
     timestamp: food.timestamp || new Date().toISOString(),
     source: food.source || "Manual",
     animalOverride: food.animalOverride != null ? food.animalOverride : null,
+    // A meal's component items travel on the entry so each amount stays adjustable later
+    // (entry editor > Items). Scaled to the entry's weight: re-adding a meal from History at
+    // half the weight must halve the items too, or the entry totals and its own components
+    // would disagree. The quick-tap path logs at exactly the items' total, so this is a no-op there.
+    mealItems: food.mealItems ? scaleMealItemsToWeight(food.mealItems, food.loggedWeight || sumRecipeIngredients(food.mealItems).weight) : null,
     photo: food.photo || null,
     photoExpires: food.photo ? new Date(Date.now() + 2*24*60*60*1000).toISOString() : null,
     updatedAt: new Date().toISOString(),
@@ -2437,6 +2450,42 @@ function pruneFoodCache() {
     if (!referenced.has(id)) { delete state.foodCache[id]; dropped++; }
   });
   return dropped;
+}
+
+// ---- Meals: one logged entry with individually-adjustable component items ----
+// A recipe flagged quickLog gets a ⚡ chip on the Food tab; tapping it logs the whole recipe
+// as ONE entry (one dashboard card, one row in the log) that carries its components in
+// entry.mealItems. The entry editor's Items tab then lets each component's amount be changed
+// -- "same breakfast, but only 80g of sourdough today" -- with the entry's totals recomputed
+// from the items. Items are leaf foods, so rescaling one is proportional to its own stored
+// weight; the same rounding rules as calcMacrosForWeight.
+function scaleMealItem(item, newWeight) {
+  const base = positiveGramsOr(item.weight, 100);
+  const w = positiveGramsOr(newWeight, base);
+  const mult = w / base;
+  return Object.assign({}, item, {
+    weight: w,
+    calories: Math.round((item.calories || 0) * mult),
+    protein: round1((item.protein || 0) * mult),
+    carbs: round1((item.carbs || 0) * mult),
+    fat: round1((item.fat || 0) * mult),
+    fiber: round1((item.fiber || 0) * mult),
+  });
+}
+// Scale a whole item list so its total weight matches targetWeight (used when a meal is
+// re-added from History at a different portion). Exact-total case returns clean copies.
+function scaleMealItemsToWeight(items, targetWeight) {
+  const total = sumRecipeIngredients(items).weight;
+  const target = positiveGramsOr(targetWeight, total);
+  if (!(total > 0) || Math.abs(target - total) < 0.01) {
+    return items.map(function(it){ return Object.assign({}, it); });
+  }
+  const mult = target / total;
+  return items.map(function(it){ return scaleMealItem(it, round1((it.weight || 0) * mult)); });
+}
+function mealTotalsMacros(items) {
+  const t = sumRecipeIngredients(items);
+  return { calories: Math.round(t.calories), protein: round1(t.protein), carbs: round1(t.carbs), fat: round1(t.fat), fiber: round1(t.fiber) };
 }
 
 function removeFoodFromLog(entryId) {
@@ -2778,9 +2827,11 @@ function renderFoodEntry(entry) {
 }
 
 function renderEntryEditor(entry) {
-  const section = state.ui.entrySection || "portion";
+  const isMeal = !!(entry.mealItems && entry.mealItems.length);
+  const section = state.ui.entrySection || (isMeal ? "items" : "portion");
   let html = '<div style="margin-top:10px;padding:10px;background:' + C.bg + ';border-radius:10px">' +
     '<div class="row" style="margin-bottom:10px;flex-wrap:wrap">' +
+      (isMeal ? '<button class="sectionBtn' + (section === "items" ? " active" : "") + '" data-action="setEntrySection" data-arg="items">Items</button>' : '') +
       '<button class="sectionBtn' + (section === "portion" ? " active" : "") + '" data-action="setEntrySection" data-arg="portion">Portion</button>' +
       '<button class="sectionBtn' + (section === "macros" ? " active" : "") + '" data-action="setEntrySection" data-arg="macros">Macros</button>' +
       '<button class="sectionBtn' + (section === "details" ? " active" : "") + '" data-action="setEntrySection" data-arg="details">Details</button>' +
@@ -2789,7 +2840,23 @@ function renderEntryEditor(entry) {
       '<button class="sectionBtn' + (section === "copy" ? " active" : "") + '" data-action="setEntrySection" data-arg="copy">Copy</button>' +
     '</div>';
 
-  if (section === "portion") {
+  if (section === "items" && isMeal) {
+    html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:10px">This meal was logged as one entry. Adjust how much of each item you actually had — the entry’s totals recompute from these.</div>';
+    entry.mealItems.forEach(function(it, i) {
+      const inputs = state.ui.mealItemInputs || {};
+      const val = inputs[i] != null ? inputs[i] : String(it.weight);
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">' +
+        '<div style="flex:1;min-width:0">' +
+          '<div style="font-size:13px;color:' + C.text + ';overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(it.name) + '</div>' +
+          '<div id="mealItemInfo_' + i + '" style="font-size:11px;color:' + C.textMut + '">' + mealItemPreviewText(it, parseFloat(val)) + '</div>' +
+        '</div>' +
+        '<input class="input" type="number" value="' + esc_attr(val) + '" data-bind="mealItemWeight" data-idx="' + i + '" data-enter="saveMealItems" style="width:76px;padding:6px;font-size:13px;text-align:right">' +
+        '<span style="color:' + C.textMut + ';font-size:12px">g</span>' +
+      '</div>';
+    });
+    html += '<div id="mealItemsTotal" style="color:' + C.textSec + ';font-size:12px;margin:8px 0 10px;font-weight:600">' + mealItemsTotalText(entry) + '</div>';
+    html += btn({ label: "Save Items", action: "saveMealItems", small: true });
+  } else if (section === "portion") {
     const cachedFood = state.foodCache[entry.foodId];
     const weightVal = state.ui.entryWeightInput != null ? state.ui.entryWeightInput : String(entry.weight);
     const sizes = (cachedFood && cachedFood.servingSizes) || [];
@@ -2950,9 +3017,50 @@ actions.saveEntryTime = function() {
   rerender();
 };
 
+// Live previews for the meal Items tab: per-item line and the running total, DOM-patched on
+// keystroke (the no-rerender rule) through the same scaleMealItem the save uses, so the
+// preview is exactly what gets stored.
+function mealItemPreviewText(item, newWeight) {
+  const scaled = scaleMealItem(item, newWeight);
+  return scaled.weight + "g · " + scaled.calories + " kcal";
+}
+function mealItemsTotalText(entry) {
+  const inputs = state.ui.mealItemInputs || {};
+  const items = (entry.mealItems || []).map(function(it, i) {
+    return inputs[i] != null ? scaleMealItem(it, parseFloat(inputs[i])) : it;
+  });
+  const m = mealTotalsMacros(items);
+  return "Total: " + m.calories + " kcal · P " + m.protein + "g · C " + m.carbs + "g · F " + m.fat + "g";
+}
+inputActions.mealItemWeight = function(val, el) {
+  const i = parseInt(el.getAttribute("data-idx"), 10);
+  if (!state.ui.mealItemInputs) state.ui.mealItemInputs = {};
+  state.ui.mealItemInputs[i] = val;
+  const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === state.ui.editingEntryId; });
+  if (!entry || !entry.mealItems || !entry.mealItems[i]) return;
+  const info = document.getElementById("mealItemInfo_" + i);
+  if (info) info.textContent = mealItemPreviewText(entry.mealItems[i], parseFloat(val));
+  const total = document.getElementById("mealItemsTotal");
+  if (total) total.textContent = mealItemsTotalText(entry);
+};
+actions.saveMealItems = function() {
+  const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === state.ui.editingEntryId; });
+  if (!entry || !entry.mealItems) return;
+  const inputs = state.ui.mealItemInputs || {};
+  const newItems = entry.mealItems.map(function(it, i) {
+    return inputs[i] != null ? scaleMealItem(it, parseFloat(inputs[i])) : Object.assign({}, it);
+  });
+  const totals = sumRecipeIngredients(newItems);
+  // updateFoodEntry bumps updatedAt -- mandatory, or the merge can't carry this to another device.
+  updateFoodEntry(entry.id, { mealItems: newItems, weight: round1(totals.weight), macros: mealTotalsMacros(newItems) });
+  state.ui.mealItemInputs = null;
+  showToast("Meal updated");
+};
+
 function closeEntryEditor() {
   state.ui.editingEntryId = null;
   state.ui.entrySection = "portion";
+  state.ui.mealItemInputs = null;
   state.ui.entryWeightInput = null;
   state.ui.entryTimeInput = null;
   state.ui.entryMoveDate = null;
@@ -2968,7 +3076,9 @@ actions.toggleEntryEditor = function(entryId) {
   } else {
     const entry = (state.foodLogs[state.date] || []).find(function(e){ return e.id === entryId; });
     state.ui.editingEntryId = entryId;
-    state.ui.entrySection = "portion";
+    // Meals open on their Items tab -- adjusting component amounts is the edit they exist for.
+    state.ui.entrySection = entry && entry.mealItems && entry.mealItems.length ? "items" : "portion";
+    state.ui.mealItemInputs = null;
     state.ui.entryWeightInput = entry ? String(entry.weight) : "100";
     // Seeded here as well as reset in closeEntryEditor: opening a different entry directly from
     // an already-open one skips the close, and a leftover time from the previous entry would
@@ -3357,6 +3467,7 @@ function renderFoodTab() {
     '</div>';
 
   if (fu.subTab === "search") {
+    html += renderQuickMealChips();
     const dayTotals = getDayTotals(state.date);
     const dailySet = getDayTargets(state.date); // boosted targets, same as the dashboard shows
     html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:' + C.inputBg + ';border-radius:10px;margin-bottom:12px;font-size:12px">' +
@@ -4291,14 +4402,59 @@ function sumRecipeIngredients(ingredients) {
 }
 
 actions.newRecipe = function() {
-  foodUi().recipeBuilder = { editingId: null, name: "", ingredients: [], picker: null };
+  foodUi().recipeBuilder = { editingId: null, name: "", ingredients: [], picker: null, quickLog: false };
   rerender();
 };
 actions.editRecipe = function(id) {
   const recipe = state.recipes.find(function(r){ return r.id === id; });
   if (!recipe) return;
-  foodUi().recipeBuilder = { editingId: id, name: recipe.name, ingredients: recipe.ingredients.map(function(i){ return Object.assign({}, i); }), picker: null };
+  foodUi().recipeBuilder = { editingId: id, name: recipe.name, ingredients: recipe.ingredients.map(function(i){ return Object.assign({}, i); }), picker: null, quickLog: recipe.quickLog === true };
   rerender();
+};
+actions.toggleRecipeQuickLog = function() {
+  const rb = foodUi().recipeBuilder;
+  if (!rb) return;
+  rb.quickLog = !rb.quickLog;
+  rerender();
+};
+
+// The ⚡ one-tap meal chips (recipes flagged quickLog), shown at the top of the Food tab's
+// Search sub-tab. One tap logs the whole recipe as a single entry carrying its component
+// items -- see the meals block by scaleMealItem for the full model.
+function renderQuickMealChips() {
+  const quick = state.recipes.filter(function(r){ return r.quickLog === true && (r.ingredients || []).length > 0; });
+  if (quick.length === 0) return '';
+  return '<div class="rowWrap" style="margin-bottom:12px">' +
+    quick.map(function(r) {
+      return '<button class="chip" data-action="logQuickMeal" data-arg="' + esc_attr(r.id) + '" style="border:1px solid ' + C.warning + '55">⚡ ' + esc(r.name) + '</button>';
+    }).join('') +
+  '</div>';
+}
+
+actions.logQuickMeal = function(recipeId) {
+  const recipe = state.recipes.find(function(r){ return r.id === recipeId; });
+  if (!recipe || (recipe.ingredients || []).length === 0) return;
+  const fu = foodUi();
+  const now = Date.now();
+  if (fu._quickMealLock && now - fu._quickMealLock < 600) return; // standard double-tap guard
+  fu._quickMealLock = now;
+  const items = recipe.ingredients.map(function(ing) {
+    return { name: ing.name, weight: ing.weight, calories: ing.calories, protein: ing.protein, carbs: ing.carbs, fat: ing.fat, fiber: ing.fiber || 0 };
+  });
+  const totals = sumRecipeIngredients(items);
+  const macros = mealTotalsMacros(items);
+  addFoodToLog({
+    // Stable per recipe, so History keeps ONE re-addable record per meal rather than one per tap.
+    id: "meal_" + recipe.id,
+    name: recipe.name,
+    source: "Meal",
+    per100g: false,
+    calories: macros.calories, protein: macros.protein, carbs: macros.carbs, fat: macros.fat, fiber: macros.fiber,
+    baseGrams: positiveGramsOr(totals.weight, 100),
+    loggedWeight: totals.weight,
+    loggedMacros: macros,
+    mealItems: items,
+  });
 };
 actions.cancelRecipeBuilder = function() { stepBackOneLevel(); };
 actions.askDeleteRecipe = function(id) { foodUi().confirmDeleteRecipeId = id; rerender(); };
@@ -4336,10 +4492,10 @@ actions.saveRecipe = function() {
   rb._confirmLock = now;
   if (rb.editingId) {
     state.recipes = state.recipes.map(function(r) {
-      return r.id === rb.editingId ? Object.assign({}, r, { name: rb.name.trim(), ingredients: rb.ingredients, updatedAt: new Date().toISOString() }) : r;
+      return r.id === rb.editingId ? Object.assign({}, r, { name: rb.name.trim(), ingredients: rb.ingredients, quickLog: rb.quickLog === true, updatedAt: new Date().toISOString() }) : r;
     });
   } else {
-    state.recipes.push({ id: "recipe_" + Date.now(), name: rb.name.trim(), ingredients: rb.ingredients, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    state.recipes.push({ id: "recipe_" + Date.now(), name: rb.name.trim(), ingredients: rb.ingredients, quickLog: rb.quickLog === true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
   }
   saveRecipes();
   stepBackOneLevel();
@@ -4358,6 +4514,10 @@ function renderRecipeBuilderScreen(fu) {
   let html = '<button class="backBtn" data-action="cancelRecipeBuilder">← Back</button>';
   let inner = '<h3 class="cardTitle" style="margin-bottom:12px">' + (rb.editingId ? "Edit Recipe" : "New Recipe") + '</h3>';
   inner += '<div style="margin-bottom:16px"><label class="label">Recipe Name</label>' + textInput({ value: rb.name, placeholder: "e.g. Daily Shake", bind: "recipeName", enter: "openIngredientPicker" }) + '</div>';
+  inner += '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:' + C.inputBg + ';border-radius:10px;border:1px solid ' + C.border + ';margin-bottom:16px">' +
+    '<div style="min-width:0;padding-right:8px"><div style="font-size:13px">⚡ One-tap meal</div><div style="color:' + C.textMut + ';font-size:11px;margin-top:2px">Shows a chip on the Food tab that logs all of this as one entry — item amounts stay adjustable on the logged entry.</div></div>' +
+    toggleSwitch(rb.quickLog === true, "toggleRecipeQuickLog") +
+  '</div>';
 
   if (rb.ingredients.length === 0) {
     inner += '<div style="text-align:center;padding:20px;color:' + C.textMut + ';font-size:13px">No ingredients yet. Add some below.</div>';
@@ -5780,6 +5940,17 @@ function renderWeightTab() {
             // Trend from ALL weigh-ins, charted at the visible dates (see weightTrendSeries).
             weightTrendSeries(allWeightsData, chartData.map(function(d){ return d.date; })))
         : '<div data-panzone="weight" style="height:220px;display:flex;align-items:center;justify-content:center;color:' + C.textMut + ';font-size:13px">No weigh-ins in this window</div>');
+    // Where the trend lands, anchored to the LATEST weigh-in (not the viewed day -- projecting
+    // from a panned-into past would backdate the ETA). Renders nothing rather than a bad guess
+    // when the rate is flat, wrong-direction, or absurd (see weightGoalProjection).
+    const proj = latestDateStr ? weightGoalProjection(allWeightsData, latestDateStr, set.goalWeight) : null;
+    if (proj) {
+      histInner += '<div style="color:' + WEIGHT_TREND_COLOR + ';font-size:12px;margin-top:8px;text-align:center">' +
+        (proj.reached
+          ? '🎉 At your goal — 7d trend ' + proj.avg + ' vs goal ' + set.goalWeight + ' ' + esc(unit)
+          : 'At your trend pace (' + (proj.rate > 0 ? '+' : '−') + Math.abs(proj.rate) + ' ' + esc(unit) + '/wk): <span style="font-weight:700">' + set.goalWeight + ' ' + esc(unit) + ' around ' + esc(dayLabel(proj.date)) + '</span>') +
+      '</div>';
+    }
     html += card(histInner);
   } else {
     html += card('<div style="text-align:center;padding:30px"><div style="font-size:28px;margin-bottom:8px">\u{1F4C8}</div><div style="color:' + C.textMut + ';font-size:14px">Log at least 2 days of weight to see your chart</div></div>');
@@ -5950,6 +6121,27 @@ function weightTrendReadout(allData, dateStr) {
   d.setDate(d.getDate() - 7);
   const prev = weightTrendSeries(allData, [fmtDate(d)])[0];
   return { avg: round1(now), change: prev == null ? null : round1(now - prev) };
+}
+
+// Where the trend lands: project the 7-day trend's current weekly rate forward to the goal
+// weight. Deliberately conservative about when it speaks: null (renders nothing) when there's
+// no goal, no usable rate (under 0.05/wk is flat -- noise, not a pace), the trend is moving
+// AWAY from the goal (an ETA in the past is not information), or the horizon is over 2 years
+// (a rate that small extrapolated that far is fiction). Within 0.25 of goal it declares
+// arrival instead of projecting -- direction-agnostic, so it works for a bulk too.
+function weightGoalProjection(allData, refDateStr, goalWeight) {
+  const goal = parseFloat(goalWeight);
+  if (!(goal > 0)) return null;
+  const r = weightTrendReadout(allData, refDateStr);
+  if (!r) return null;
+  const remaining = r.avg - goal; // positive when cutting toward a lower goal
+  if (Math.abs(remaining) <= 0.25) return { reached: true, avg: r.avg };
+  if (r.change == null || Math.abs(r.change) < 0.05) return null;
+  const weeks = remaining / -r.change; // change is negative when losing, so cutting => positive weeks
+  if (weeks <= 0 || weeks > 104) return null;
+  const d = parseDateStr(refDateStr);
+  d.setDate(d.getDate() + Math.round(weeks * 7));
+  return { date: fmtDate(d), weeks: round1(weeks), rate: r.change, avg: r.avg };
 }
 
 // Tap targets for the weight chart: one full-plot-height vertical band per point, each running
@@ -6334,14 +6526,16 @@ function strategyUi() {
     // Waist & Photos section: the in-progress form (waistDate null = "today"), which entry an
     // edit is loading from, the armed two-step delete, the open lightbox photo, and whether a
     // save's photo uploads are in flight (doubles as the double-tap guard).
-    waistDate: null, waistInput: "", waistNotes: "", waistPhotos: [], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null, waistSaving: false };
+    waistDate: null, waistInput: "", waistNotes: "", waistPhotos: [], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null, waistSaving: false,
+    // Data Health results (Data section) and the Insights section's in-flight state.
+    dataHealth: null, insightsLoading: false, insightsError: null };
   return state.ui.strategy;
 }
 
 function renderStrategyTab() {
   const su = strategyUi();
   const sections = [
-    ["targets","Daily Targets"], ["weight","Weight Goals"], ["waist","Waist & Photos"], ["display","Preferences"], ["ai","AI Settings"], ["data","Data"]
+    ["targets","Daily Targets"], ["weight","Weight Goals"], ["waist","Waist & Photos"], ["insights","Insights"], ["display","Preferences"], ["ai","AI Settings"], ["data","Data"]
   ];
   let html = '<div class="rowWrap" style="margin-bottom:16px">';
   sections.forEach(function(s) {
@@ -6352,6 +6546,7 @@ function renderStrategyTab() {
   if (su.section === "targets") html += renderTargetsSection();
   if (su.section === "weight") html += renderWeightGoalsSection();
   if (su.section === "waist") html += renderWaistSection();
+  if (su.section === "insights") html += renderInsightsSection();
   if (su.section === "display") html += renderDisplaySection();
   if (su.section === "ai") html += renderAISection();
   if (su.section === "data") html += renderDataSection();
@@ -7057,6 +7252,213 @@ actions.setAiProvider = function(p) { state.settings.aiProvider = p; saveSetting
 inputActions.claudeApiKey = function(v) { state.settings.claudeApiKey = v; saveSettings(); };
 inputActions.geminiApiKey = function(v) { state.settings.geminiApiKey = v; saveSettings(); };
 
+// ---- Insights (Claude-powered) ----
+// One button: build a compact structured summary of the last 4 weeks CLIENT-SIDE, send it to
+// Claude with the user's own API key (the same key/plumbing the AI food estimator uses), and
+// render the reply. Nothing runs automatically and nothing is sent until the button is
+// tapped; the summary is aggregates only -- day totals, weigh-ins, top foods -- never keys,
+// never the raw entry list. The reply is display text, NOT data: it never writes into the
+// log, targets, or any collection ("what Colin logs is the truth" stays intact).
+function buildInsightsSummary() {
+  const set = state.settings;
+  const days = [];
+  const weights = [];
+  const foodTotals = {};
+  const d = parseDateStr(state.date);
+  d.setDate(d.getDate() - 27);
+  for (let i = 0; i < 28; i++) {
+    const ds = fmtDate(d);
+    const entries = state.foodLogs[ds] || [];
+    if (entries.length > 0) {
+      let kc = 0, p = 0, c = 0, f = 0, fib = 0;
+      entries.forEach(function(e) {
+        kc += e.macros.calories || 0; p += e.macros.protein || 0; c += e.macros.carbs || 0; f += e.macros.fat || 0; fib += e.macros.fiber || 0;
+        const key = e.name;
+        if (!foodTotals[key]) foodTotals[key] = { kcal: 0, count: 0 };
+        foodTotals[key].kcal += e.macros.calories || 0;
+        foodTotals[key].count++;
+      });
+      days.push({ date: ds, dow: parseDateStr(ds).toLocaleDateString("en-US", { weekday: "short" }), kcal: Math.round(kc), protein: Math.round(p), carbs: Math.round(c), fat: Math.round(f), fiber: Math.round(fib), targetKcal: getDayTargets(ds).calorieTarget });
+    }
+    if (state.weights[ds]) weights.push({ date: ds, weight: state.weights[ds].weight });
+    d.setDate(d.getDate() + 1);
+  }
+  const topFoods = Object.keys(foodTotals)
+    .map(function(name){ return { name: name, kcalTotal: Math.round(foodTotals[name].kcal), timesLogged: foodTotals[name].count }; })
+    .sort(function(a, b){ return b.kcalTotal - a.kcalTotal; })
+    .slice(0, 12);
+  const allWeightsData = Object.keys(state.weights).sort().map(function(k){ return { date: k, weight: state.weights[k].weight }; });
+  const trend = allWeightsData.length > 0 ? weightTrendReadout(allWeightsData, state.date) : null;
+  const today = getDayTotals(state.date);
+  const tt = getDayTargets(state.date);
+  return {
+    date: state.date,
+    units: set.weightUnit || "lbs",
+    goal: { type: set.goalType, weight: set.goalWeight, date: set.goalDate, dailyTargets: targetSnapshotOf(set) },
+    trend7d: trend, // {avg, change} or null
+    days: days,
+    weighIns: weights,
+    mostLoggedFoods: topFoods,
+    today: {
+      eaten: { kcal: Math.round(today.calories), protein: Math.round(today.protein), carbs: Math.round(today.carbs), fat: Math.round(today.fat), fiber: Math.round(today.fiber) },
+      targets: { kcal: tt.calorieTarget, protein: tt.proteinTarget, carbs: tt.carbsTarget, fat: tt.fatTarget },
+      remaining: { kcal: Math.round(tt.calorieTarget - today.calories), protein: Math.round(tt.proteinTarget - today.protein), carbs: Math.round(tt.carbsTarget - today.carbs), fat: Math.round(tt.fatTarget - today.fat) },
+    },
+  };
+}
+
+const INSIGHTS_PROMPT = 'You are analyzing one person’s real, self-logged nutrition and body-weight data from their macro-tracking app. Their logged intake is ground truth — never suggest their logging is inaccurate. Analyze the attached JSON and reply in plain text (no markdown symbols) with exactly these four short sections, each under ~90 words, titled on its own line:\n\nWEIGHT MOVEMENT\nExplain the recent scale movements using the actual dates and numbers — separate real trend from water/glycogen effects (carb intake shifts, weekend patterns, big food-mass days). Be specific, cite days.\n\nPATTERNS\nThe most useful adherence or behavior pattern you can see (weekday vs weekend, timing, macro mix). One insight, evidenced.\n\nTO HIT TODAY’S TARGETS\nUsing today.remaining macros and their mostLoggedFoods list, suggest 2-3 concrete portions (with gram amounts and estimated macros) of foods they demonstrably already eat that would close today’s gaps, protein first.\n\nWATCH\nOne forward-looking, non-moralizing thing worth keeping an eye on given their goal and pace.\n\nBe direct and numerate. No praise padding, no disclaimers.';
+
+function renderInsightsSection() {
+  const su = strategyUi();
+  const hasKey = !!(state.settings.claudeApiKey || "").trim();
+  const last = db.get("lastInsights", null);
+  let html = '<h3 class="cardTitle" style="margin-bottom:4px">✨ Insights</h3>' +
+    '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:12px">Sends a compact summary of your last 4 weeks — day totals, weigh-ins, trend, goal, most-logged foods — to Claude with your own API key, and asks what it sees: what moved your weight, your patterns, and what to eat today to hit your targets. Nothing is sent until you tap.</div>' +
+    (hasKey ? '' : '<div style="color:' + C.warning + ';font-size:12px;margin-bottom:12px">Add your Claude API key under AI Settings to use this.</div>') +
+    btn({ label: su.insightsLoading ? "Thinking…" : "✨ Generate Insights", action: "generateInsights", full: true, disabled: su.insightsLoading || !hasKey }) +
+    (su.insightsError ? '<div style="margin-top:10px;padding:10px 12px;background:' + C.danger + '15;border-radius:8px;color:' + C.danger + ';font-size:12px">' + esc(su.insightsError) + '</div>' : '');
+  if (last && last.text) {
+    html += '<div style="margin-top:14px;padding-top:12px;border-top:1px solid ' + C.border + '">' +
+      '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Generated ' + esc(dayLabel(last.date)) + '</div>' +
+      '<div style="font-size:13px;color:' + C.textSec + ';white-space:pre-wrap;line-height:1.55">' + esc(last.text) + '</div>' +
+    '</div>';
+  }
+  return card(html);
+}
+
+actions.generateInsights = async function() {
+  const su = strategyUi();
+  if (su.insightsLoading) return;
+  const apiKey = (state.settings.claudeApiKey || "").trim();
+  if (!apiKey) { su.insightsError = "Add your Claude API key under AI Settings first."; rerender(); return; }
+  su.insightsLoading = true;
+  su.insightsError = null;
+  rerender();
+  try {
+    // Same model choice and headers as the AI food estimator.
+    const modelId = state.settings.aiProvider === "claude-sonnet" ? "claude-sonnet-5" : "claude-haiku-4-5-20251001";
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify({
+        model: modelId, max_tokens: 1500,
+        messages: [{ role: "user", content: INSIGHTS_PROMPT + "\n\nDATA:\n" + JSON.stringify(buildInsightsSummary()) }],
+      }),
+    });
+    const dd = await r.json();
+    if (dd.error) throw new Error(dd.error.message || "API error");
+    const text = (dd.content || []).map(function(i){ return i.text || ""; }).join("").trim();
+    if (!text) throw new Error("Empty response from the API");
+    db.set("lastInsights", { text: text, date: todayStr(), at: new Date().toISOString() });
+  } catch (e) {
+    su.insightsError = e && e.message ? e.message : String(e);
+  }
+  su.insightsLoading = false;
+  rerender();
+};
+
+// ---- Data Health ----
+// The audit that found the rice bug, as a button. Three signals, all computed locally over
+// state (no network, instant, works offline):
+//  1. Basis spread -- the rice signature: one food logged at meaningfully different implied
+//     kcal-per-100g rates across its entries. Some are deliberate portion corrections; a wide
+//     spread on a often-logged food is worth a look.
+//  2. Atwater mismatch -- entries whose calories disagree with their own macros by >25%.
+//     Legitimate for alcohol (its ~7 kcal/g isn't in P/C/F), suspicious for everything else.
+//  3. Record drift -- the baseGrams bug class: a stored food whose loggedMacros snapshot no
+//     longer matches what its own base macros predict at its loggedWeight.
+function dataHealthBasisFindings() {
+  const byFood = {};
+  Object.keys(state.foodLogs).forEach(function(date) {
+    (state.foodLogs[date] || []).forEach(function(e) {
+      const w = parseFloat(e.weight), cal = e.macros && e.macros.calories;
+      if (!(w > 0) || !(cal > 0)) return;
+      const key = e.foodId || e.name;
+      if (!byFood[key]) byFood[key] = { name: e.name, count: 0, min: Infinity, max: -Infinity };
+      const basis = cal * 100 / w;
+      const f = byFood[key];
+      f.count++; if (basis < f.min) f.min = basis; if (basis > f.max) f.max = basis;
+    });
+  });
+  return Object.keys(byFood).map(function(k){ return byFood[k]; })
+    .filter(function(f){ return f.count >= 2 && f.max > f.min * 1.15; })
+    .map(function(f){ return { name: f.name, count: f.count, minBasis: Math.round(f.min), maxBasis: Math.round(f.max) }; })
+    .sort(function(a, b){ return (b.maxBasis / b.minBasis) - (a.maxBasis / a.minBasis); });
+}
+function dataHealthAtwaterFindings() {
+  const out = [];
+  Object.keys(state.foodLogs).forEach(function(date) {
+    (state.foodLogs[date] || []).forEach(function(e) {
+      const m = e.macros || {};
+      const atwater = (m.protein || 0) * 4 + (m.carbs || 0) * 4 + (m.fat || 0) * 9;
+      if (Math.abs((m.calories || 0) - atwater) > Math.max(30, atwater * 0.25)) {
+        out.push({ date: date, name: e.name, calories: Math.round(m.calories || 0), atwater: Math.round(atwater) });
+      }
+    });
+  });
+  return out.sort(function(a, b){ return Math.abs(b.calories - b.atwater) - Math.abs(a.calories - a.atwater); }).slice(0, 12);
+}
+function dataHealthRecordFindings() {
+  const seen = new Set(); const out = [];
+  const check = function(f) {
+    if (!f || !f.id || seen.has(f.id)) return;
+    seen.add(f.id);
+    const lw = parseFloat(f.loggedWeight);
+    const lm = f.loggedMacros && parseFloat(f.loggedMacros.calories);
+    if (!(lw > 0) || !(lm > 0) || !(f.calories > 0)) return;
+    const predicted = f.calories * lw / foodBaseGrams(f);
+    if (Math.abs(lm - predicted) > Math.max(15, predicted * 0.12)) {
+      out.push({ name: f.name, recordSays: Math.round(predicted), snapshotSays: Math.round(lm) });
+    }
+  };
+  state.recentFoods.forEach(check);
+  state.favorites.forEach(check);
+  Object.keys(state.foodCache).forEach(function(id){ check(state.foodCache[id]); });
+  return out;
+}
+function runDataHealthCheck() {
+  let entryCount = 0;
+  Object.keys(state.foodLogs).forEach(function(d){ entryCount += (state.foodLogs[d] || []).length; });
+  return { entries: entryCount, basis: dataHealthBasisFindings(), atwater: dataHealthAtwaterFindings(), records: dataHealthRecordFindings() };
+}
+actions.runDataHealth = function() {
+  strategyUi().dataHealth = runDataHealthCheck();
+  rerender();
+};
+function renderDataHealthResults(dh) {
+  const clean = dh.basis.length === 0 && dh.atwater.length === 0 && dh.records.length === 0;
+  let html = '<div style="padding:12px;background:' + C.inputBg + ';border-radius:10px;border:1px solid ' + C.border + '">';
+  if (clean) {
+    return html + '<div style="color:' + C.success + ';font-size:13px">✓ Checked ' + dh.entries + ' logged entries and every stored food — no inconsistencies found.</div></div>';
+  }
+  html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:10px">Checked ' + dh.entries + ' entries. Findings aren’t necessarily errors — they’re where to look.</div>';
+  if (dh.basis.length > 0) {
+    html += '<div style="font-size:12px;font-weight:700;margin-bottom:4px">Same food, different kcal/100g <span style="color:' + C.textMut + ';font-weight:400">(the rice-bug signature)</span></div>';
+    dh.basis.forEach(function(f) {
+      html += '<div style="font-size:12px;color:' + C.textSec + ';padding:2px 0">' + esc(f.name) + ' <span style="color:' + C.textMut + '">— ' + f.count + ' logs, ' + f.minBasis + '–' + f.maxBasis + ' kcal/100g</span></div>';
+    });
+  }
+  if (dh.atwater.length > 0) {
+    html += '<div style="font-size:12px;font-weight:700;margin:10px 0 4px">Calories don’t match macros <span style="color:' + C.textMut + ';font-weight:400">(normal for alcohol)</span></div>';
+    dh.atwater.forEach(function(f) {
+      html += '<div style="font-size:12px;color:' + C.textSec + ';padding:2px 0">' + esc(dayLabel(f.date)) + ' · ' + esc(f.name) + ' <span style="color:' + C.textMut + '">— says ' + f.calories + ', macros imply ' + f.atwater + '</span></div>';
+    });
+  }
+  if (dh.records.length > 0) {
+    html += '<div style="font-size:12px;font-weight:700;margin:10px 0 4px">Stored foods with drifted portions <span style="color:' + C.textMut + ';font-weight:400">(fix via History → ✎ Edit)</span></div>';
+    dh.records.forEach(function(f) {
+      html += '<div style="font-size:12px;color:' + C.textSec + ';padding:2px 0">' + esc(f.name) + ' <span style="color:' + C.textMut + '">— base predicts ' + f.recordSays + ' kcal at its logged weight, snapshot says ' + f.snapshotSays + '</span></div>';
+    });
+  }
+  return html + '</div>';
+}
+
 function renderDataSection() {
   const su = strategyUi();
   let html = '<h3 class="cardTitle">Data Management</h3>';
@@ -7083,6 +7485,8 @@ function renderDataSection() {
   html += btn({ label: "\u{1F4E4} Export All Data (JSON)", action: "exportData", outline: true, full: true });
   html += '<input type="file" accept=".json" id="importFileInput" data-change="importData" style="display:none">';
   html += btn({ label: "\u{1F4E5} Import Data (JSON)", action: "clickImportData", outline: true, full: true });
+  html += btn({ label: "\u{1FA7A} Run Data Health Check", action: "runDataHealth", outline: true, full: true });
+  if (su.dataHealth) html += renderDataHealthResults(su.dataHealth);
   html += '<div style="border-top:1px solid ' + C.border + ';margin:8px 0"></div>';
   if (!su.confirmClear) {
     html += btn({ label: "\u{1F5D1} Clear All Data", action: "askConfirmClear", outline: true, full: true, color: "danger" });

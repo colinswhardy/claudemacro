@@ -59,3 +59,11 @@ phone — see the note in `schema.sql`).
 **Already applied to the live project** (via the `progress_photos_bucket` migration),
 so there is nothing to run — this entry exists for the record, and the SQL lives at the
 bottom of `schema.sql` for a from-scratch rebuild.
+
+### 2026-08-18 — one-tap meals (meal_items + quick_log)
+
+Needed for: the ⚡ one-tap meal chips (a recipe logged as a single entry whose component
+amounts stay adjustable afterwards).
+
+**Already applied to the live project** (migration `meals_quick_log`) — nothing to run;
+the SQL is at the bottom of `schema.sql` for a from-scratch rebuild.

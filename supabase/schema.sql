@@ -179,3 +179,12 @@ create policy "progress photos update own" on storage.objects
 create policy "progress photos delete own" on storage.objects
   for delete to authenticated
   using (bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- ============================================================
+-- One-tap meals (added 2026-08-18, migration `meals_quick_log` -- already applied live)
+-- ============================================================
+-- A recipe flagged quick_log gets a one-tap chip on the Food tab; logging it writes ONE
+-- food_log_entries row whose meal_items jsonb carries the component foods, so each
+-- component's amount stays individually adjustable from the entry editor afterwards.
+alter table food_log_entries add column if not exists meal_items jsonb;
+alter table recipes add column if not exists quick_log boolean not null default false;

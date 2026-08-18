@@ -150,7 +150,12 @@ const exportLine =
   "weightChartHitBands: weightChartHitBands, renderSelectedWeightSlot: renderSelectedWeightSlot, " +
   "weightRangeDays: weightRangeDays, weightChartWindowBounds: weightChartWindowBounds, " +
   "weightTrendSeries: weightTrendSeries, WEIGHT_TREND_DAYS: WEIGHT_TREND_DAYS, " +
-  "weightTrendReadout: weightTrendReadout, " +
+  "weightTrendReadout: weightTrendReadout, weightGoalProjection: weightGoalProjection, " +
+  "scaleMealItem: scaleMealItem, scaleMealItemsToWeight: scaleMealItemsToWeight, " +
+  "mealTotalsMacros: mealTotalsMacros, renderQuickMealChips: renderQuickMealChips, " +
+  "dataHealthBasisFindings: dataHealthBasisFindings, dataHealthAtwaterFindings: dataHealthAtwaterFindings, " +
+  "dataHealthRecordFindings: dataHealthRecordFindings, runDataHealthCheck: runDataHealthCheck, " +
+  "buildInsightsSummary: buildInsightsSummary, renderInsightsSection: renderInsightsSection, " +
   "clampWeightPanOffset: clampWeightPanOffset, renderWeightTab: renderWeightTab, " +
   "waistEntryIsEmpty: waistEntryIsEmpty, mergeWaistEntriesFromCloud: mergeWaistEntriesFromCloud, " +
   "waistEntriesForDisplay: waistEntriesForDisplay, waistUnitLabel: waistUnitLabel, " +
@@ -2202,6 +2207,21 @@ const FOOD_CREATION_PATHS = [
     },
   },
   {
+    name: "One-tap meal chip (logQuickMeal)",
+    covers: ["logQuickMeal"],
+    run: function (fu) {
+      M.state.recipes = [{
+        id: "r_meal", name: "Usual Breakfast", quickLog: true,
+        ingredients: [
+          { id: "i1", name: "Kirstens Sourdough", weight: 100, calories: 262, protein: 10, carbs: 52, fat: 1.5, fiber: 2 },
+          { id: "i2", name: "High Protein Shake", weight: 325, calories: 159, protein: 30, carbs: 2.9, fat: 2.5, fiber: 0 },
+        ],
+        createdAt: "2026-07-22T00:00:00.000Z", updatedAt: "2026-07-22T00:00:00.000Z",
+      }];
+      M.actions.logQuickMeal("r_meal");
+    },
+  },
+  {
     name: "Custom barcode entry (saveCustomBarcode then confirmAddFood)",
     covers: [],
     run: function (fu) {
@@ -4064,6 +4084,197 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     assertEqual(out.indexOf('data-action="editWaistEntry"') > -1, true, "entries can be edited");
     assertEqual(out.indexOf('data-action="askDeleteWaistEntry"') > -1, true, "delete is two-step armed");
     M.state.waistEntries = prevWaist; M.state.ui = prevUi; M.state.settings.weightUnit = prevUnit;
+  });
+
+  // ==== one-tap meals: adjustable components on a single entry ====
+  test("scaleMealItem: proportional rescale with the app's rounding", function () {
+    const scaled = M.scaleMealItem({ name: "Sourdough", weight: 100, calories: 262, protein: 10, carbs: 52, fat: 1.5, fiber: 2 }, 50);
+    assertEqual([scaled.weight, scaled.calories, scaled.protein, scaled.carbs, scaled.fat, scaled.fiber], [50, 131, 5, 26, 0.8, 1], "halved cleanly");
+  });
+  test("scaleMealItemsToWeight: exact total is a no-op, other targets scale every item", function () {
+    const items = [{ name: "A", weight: 100, calories: 200, protein: 10, carbs: 20, fat: 5, fiber: 1 }, { name: "B", weight: 300, calories: 150, protein: 30, carbs: 3, fat: 2, fiber: 0 }];
+    const same = M.scaleMealItemsToWeight(items, 400);
+    assertEqual([same[0].calories, same[1].calories], [200, 150], "logging at the items' own total keeps them verbatim");
+    const half = M.scaleMealItemsToWeight(items, 200);
+    assertEqual([half[0].weight, half[1].weight], [50, 150], "half the meal halves each item");
+    assertEqual([half[0].calories, half[1].calories], [100, 75], "and their macros");
+  });
+  test("logQuickMeal: one entry, carrying its components, totalling their macros", function () {
+    const prevRecipes = M.state.recipes, prevLogs = M.state.foodLogs, prevUi = M.state.ui, prevDate = M.state.date;
+    M.state.date = "2026-08-18"; M.state.foodLogs = {}; M.state.ui = {};
+    M.state.recipes = [{ id: "r1", name: "Usual Breakfast", quickLog: true, ingredients: [
+      { id: "i1", name: "Sourdough", weight: 100, calories: 262, protein: 10, carbs: 52, fat: 1.5, fiber: 2 },
+      { id: "i2", name: "Shake", weight: 325, calories: 159, protein: 30, carbs: 2.9, fat: 2.5, fiber: 0 },
+    ], createdAt: "2026-08-01T00:00:00.000Z", updatedAt: "2026-08-01T00:00:00.000Z" }];
+    M.actions.logQuickMeal("r1");
+    const entries = M.state.foodLogs["2026-08-18"] || [];
+    assertEqual(entries.length, 1, "logged as ONE thing");
+    assertEqual(entries[0].macros.calories, 421, "totals summed from the items");
+    assertEqual(entries[0].mealItems.length, 2, "components travel on the entry");
+    assertEqual(entries[0].source, "Meal", "labelled as a meal");
+    M.state.recipes = prevRecipes; M.state.foodLogs = prevLogs; M.state.ui = prevUi; M.state.date = prevDate;
+  });
+  test("saveMealItems: changing one component's amount recomputes the entry from its items", function () {
+    const prevLogs = M.state.foodLogs, prevUi = M.state.ui, prevDate = M.state.date;
+    M.state.date = "2026-08-18";
+    M.state.foodLogs = { "2026-08-18": [{ id: "m1", name: "Usual Breakfast", weight: 425, source: "Meal",
+      macros: { calories: 421, protein: 40, carbs: 54.9, fat: 4, fiber: 2 },
+      mealItems: [
+        { name: "Sourdough", weight: 100, calories: 262, protein: 10, carbs: 52, fat: 1.5, fiber: 2 },
+        { name: "Shake", weight: 325, calories: 159, protein: 30, carbs: 2.9, fat: 2.5, fiber: 0 },
+      ],
+      timestamp: "2026-08-01T12:00:00.000Z", updatedAt: "2026-08-01T12:00:00.000Z" }] };
+    M.state.ui = { editingEntryId: "m1", mealItemInputs: { 0: "50" } };
+    M.actions.saveMealItems();
+    const e = M.state.foodLogs["2026-08-18"][0];
+    assertEqual(e.mealItems[0].weight, 50, "the sourdough came down to 50g");
+    assertEqual(e.mealItems[1].weight, 325, "the untouched shake stayed");
+    assertEqual(e.macros.calories, 290, "entry totals recomputed (131 + 159)");
+    assertEqual(e.weight, 375, "entry weight follows the items");
+    assertEqual(Date.parse(e.updatedAt) > Date.parse("2026-08-01T12:00:00.000Z"), true, "stamped, so the edit syncs");
+    M.state.foodLogs = prevLogs; M.state.ui = prevUi; M.state.date = prevDate;
+  });
+  test("renderEntryEditor: a meal entry opens on an Items tab; a plain entry has no such tab", function () {
+    const prevUi = M.state.ui;
+    M.state.ui = {};
+    const meal = { id: "m1", name: "B", weight: 425, macros: { calories: 421, protein: 40, carbs: 55, fat: 4, fiber: 2 },
+      mealItems: [{ name: "Sourdough", weight: 100, calories: 262, protein: 10, carbs: 52, fat: 1.5, fiber: 2 }] };
+    const html = M.renderEntryEditor(meal);
+    assertEqual(html.indexOf('data-arg="items"') > -1, true, "Items tab offered");
+    assertEqual(html.indexOf('data-bind="mealItemWeight"') > -1, true, "per-item amount inputs render (default section)");
+    const plain = M.renderEntryEditor({ id: "p1", name: "Rice", weight: 100, macros: { calories: 126, protein: 2.8, carbs: 28, fat: 0.3, fiber: 0.3 } });
+    assertEqual(plain.indexOf('data-arg="items"'), -1, "no Items tab on a non-meal entry");
+    M.state.ui = prevUi;
+  });
+  test("renderQuickMealChips: only quick-flagged recipes with ingredients get a chip", function () {
+    const prev = M.state.recipes;
+    M.state.recipes = [
+      { id: "r1", name: "Usual Breakfast", quickLog: true, ingredients: [{ name: "X", weight: 100, calories: 100, protein: 1, carbs: 1, fat: 1, fiber: 0 }] },
+      { id: "r2", name: "Chili Batch", ingredients: [{ name: "Y", weight: 100, calories: 100, protein: 1, carbs: 1, fat: 1, fiber: 0 }] },
+    ];
+    const html = M.renderQuickMealChips();
+    assertEqual(html.indexOf("Usual Breakfast") > -1, true, "flagged recipe is a chip");
+    assertEqual(html.indexOf("Chili Batch"), -1, "unflagged recipe is not");
+    M.state.recipes = [];
+    assertEqual(M.renderQuickMealChips(), "", "no flagged recipes, no row");
+    M.state.recipes = prev;
+  });
+  test("meal sync wiring: meal_items and quick_log ride the payloads as explicit values", function () {
+    const prevSession = M.state.session, prevLogs = M.state.foodLogs, prevRecipes = M.state.recipes;
+    M.state.session = { userId: "u1" };
+    M.state.foodLogs = { "2026-08-18": [{ id: "a", name: "Rice", weight: 100, macros: { calories: 126, protein: 2.8, carbs: 28, fat: 0.3, fiber: 0.3 }, timestamp: "2026-08-18T12:00:00.000Z", updatedAt: "2026-08-18T12:00:00.000Z" }] };
+    const row = M.flattenFoodLogsForSync()[0];
+    assertEqual("meal_items" in row, true, "column always present in the shared upsert column set");
+    assertEqual(row.meal_items, null, "explicit null for a non-meal, never undefined");
+    M.state.recipes = [{ id: "r1", name: "X", ingredients: [], createdAt: "2026-08-01T00:00:00.000Z", updatedAt: "2026-08-01T00:00:00.000Z" }];
+    assertEqual(M.flattenRecipesForSync()[0].quick_log, false, "unflagged recipe sends explicit false");
+    M.state.session = prevSession; M.state.foodLogs = prevLogs; M.state.recipes = prevRecipes;
+  });
+
+  // ==== data health check ====
+  test("dataHealthBasisFindings: flags the rice signature, leaves consistent foods alone", function () {
+    const prev = M.state.foodLogs;
+    M.state.foodLogs = {
+      "2026-08-01": [{ id: "a", foodId: "rice", name: "Rice", weight: 100, macros: { calories: 87 } },
+                     { id: "b", foodId: "oats", name: "Oats", weight: 80, macros: { calories: 300 } }],
+      "2026-08-02": [{ id: "c", foodId: "rice", name: "Rice", weight: 100, macros: { calories: 130 } },
+                     { id: "d", foodId: "oats", name: "Oats", weight: 40, macros: { calories: 150 } }],
+    };
+    const findings = M.dataHealthBasisFindings();
+    assertEqual(findings.length, 1, "one food flagged");
+    assertEqual([findings[0].name, findings[0].minBasis, findings[0].maxBasis], ["Rice", 87, 130], "the inconsistent one, with its spread");
+    M.state.foodLogs = prev;
+  });
+  test("dataHealthAtwaterFindings: flags calorie/macro disagreement, tolerates rounding", function () {
+    const prev = M.state.foodLogs;
+    M.state.foodLogs = { "2026-08-01": [
+      { id: "a", name: "Beer", weight: 473, macros: { calories: 128, protein: 0.9, carbs: 4.3, fat: 0 } },
+      { id: "b", name: "Chicken", weight: 100, macros: { calories: 165, protein: 31, carbs: 0, fat: 3.6 } },
+    ] };
+    const findings = M.dataHealthAtwaterFindings();
+    assertEqual(findings.length, 1, "only the alcohol-style gap is flagged");
+    assertEqual(findings[0].name, "Beer", "beer's 128 vs ~21 from macros");
+    M.state.foodLogs = prev;
+  });
+  test("dataHealthRecordFindings: flags the baseGrams drift class", function () {
+    const prevRecent = M.state.recentFoods, prevFav = M.state.favorites, prevCache = M.state.foodCache;
+    M.state.favorites = []; M.state.foodCache = {};
+    M.state.recentFoods = [
+      // The stale-snapshot drift class (bug 1 in the baseGrams saga): base macros corrected to
+      // 126/100g, but the loggedMacros snapshot still holds the old wrong 89 kcal at 102.5g --
+      // which addFoodToLog would prefer on the next re-add. (The OTHER drift class, a moved
+      // base with a consistent snapshot, is what the basis-spread check catches instead.)
+      { id: "r1", name: "White rice, cooked", calories: 126, baseGrams: 100, loggedWeight: 102.5, loggedMacros: { calories: 89 } },
+      { id: "r2", name: "Clean food", calories: 200, baseGrams: 100, loggedWeight: 50, loggedMacros: { calories: 100 } },
+    ];
+    const findings = M.dataHealthRecordFindings();
+    assertEqual(findings.length, 1, "the drifted record only");
+    assertEqual(findings[0].name, "White rice, cooked", "by name");
+    M.state.recentFoods = prevRecent; M.state.favorites = prevFav; M.state.foodCache = prevCache;
+  });
+
+  // ==== goal projection ====
+  test("weightGoalProjection: projects the trend's weekly rate to the goal date", function () {
+    const data = [];
+    for (let i = 1; i <= 14; i++) data.push({ date: "2026-08-" + String(i).padStart(2, "0"), weight: 168 - i });
+    const p = M.weightGoalProjection(data, "2026-08-14", 150);
+    assertEqual(p.reached, undefined, "not there yet");
+    assertEqual(p.date, "2026-08-21", "avg 157 at -7/wk reaches 150 in one week");
+    assertEqual(p.weeks, 1, "one week out");
+  });
+  test("weightGoalProjection: declares arrival, and stays silent when it can't know", function () {
+    const data = [];
+    for (let i = 1; i <= 14; i++) data.push({ date: "2026-08-" + String(i).padStart(2, "0"), weight: 168 - i });
+    assertEqual(M.weightGoalProjection(data, "2026-08-14", 157.1).reached, true, "within 0.25 of goal = arrived");
+    assertEqual(M.weightGoalProjection(data, "2026-08-14", 160), null, "trend moving AWAY from the goal says nothing");
+    assertEqual(M.weightGoalProjection(data, "2026-08-14", null), null, "no goal, no projection");
+    const flat = [{ date: "2026-08-01", weight: 160 }, { date: "2026-08-07", weight: 160 }, { date: "2026-08-14", weight: 160 }];
+    assertEqual(M.weightGoalProjection(flat, "2026-08-14", 150), null, "a flat trend has no pace to project");
+  });
+
+  // ==== insights ====
+  test("buildInsightsSummary: compact aggregates, never raw entries or keys", function () {
+    const prevLogs = M.state.foodLogs, prevWeights = M.state.weights, prevDate = M.state.date, prevTargets = M.state.targetHistory;
+    M.state.date = "2026-08-18"; M.state.targetHistory = {};
+    M.state.settings.calorieTarget = 1876; M.state.settings.claudeApiKey = "sk-test-should-never-appear";
+    M.state.foodLogs = {
+      "2026-08-17": [{ id: "a", name: "Rice", weight: 100, macros: { calories: 126, protein: 2.8, carbs: 28, fat: 0.3, fiber: 0.3 } }],
+      "2026-08-18": [{ id: "b", name: "Shake", weight: 325, macros: { calories: 159, protein: 30, carbs: 2.9, fat: 2.5, fiber: 0 } }],
+    };
+    M.state.weights = { "2026-08-17": { weight: 152.4, unit: "lbs" } };
+    const s = M.buildInsightsSummary();
+    assertEqual(s.days.length, 2, "both logged days aggregated");
+    assertEqual(s.days[1].kcal, 159, "day totals, not entry lists");
+    assertEqual(s.today.remaining.kcal, 1876 - 159, "today's remaining math");
+    assertEqual(s.mostLoggedFoods.length, 2, "top foods present");
+    assertEqual(JSON.stringify(s).indexOf("sk-test") === -1, true, "the API key is never in the payload");
+    M.state.foodLogs = prevLogs; M.state.weights = prevWeights; M.state.date = prevDate; M.state.targetHistory = prevTargets;
+    M.state.settings.claudeApiKey = "";
+  });
+  await atest("generateInsights: refuses without an API key, sets the error state, sends nothing", async function () {
+    const prevUi = M.state.ui;
+    let fetched = false;
+    sandbox.fetch = function () { fetched = true; return Promise.reject(new Error("should not be called")); };
+    M.state.ui = {};
+    M.state.settings.claudeApiKey = "";
+    await M.actions.generateInsights();
+    assertEqual(typeof M.state.ui.strategy.insightsError, "string", "a visible error, not a silent no-op");
+    assertEqual(fetched, false, "and no network request went out");
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+    M.state.ui = prevUi;
+  });
+  test("renderInsightsSection: renders, and gates the button on having a key", function () {
+    const prevUi = M.state.ui;
+    M.state.ui = {};
+    M.state.settings.claudeApiKey = "";
+    const noKey = M.renderInsightsSection();
+    assertEqual(noKey.indexOf('data-action="generateInsights"') > -1, true, "the button exists");
+    assertEqual(noKey.indexOf("disabled") > -1, true, "but is disabled without a key");
+    M.state.settings.claudeApiKey = "sk-x";
+    const withKey = M.renderInsightsSection();
+    assertEqual(withKey.indexOf("AI Settings to use this"), -1, "no key warning once a key exists");
+    M.state.settings.claudeApiKey = "";
+    M.state.ui = prevUi;
   });
 
   console.log("\n" + pass + " passed, " + fail + " failed");
