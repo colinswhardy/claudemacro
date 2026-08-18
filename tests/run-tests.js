@@ -157,6 +157,7 @@ const exportLine =
   "dataHealthRecordFindings: dataHealthRecordFindings, runDataHealthCheck: runDataHealthCheck, " +
   "buildInsightsSummary: buildInsightsSummary, renderInsightsSection: renderInsightsSection, " +
   "phaseCoach: phaseCoach, renderPhaseCoachCard: renderPhaseCoachCard, " +
+  "phaseDeltaColor: phaseDeltaColor, phaseRateColor: phaseRateColor, " +
   "applyCalorieTargetWithLocks: applyCalorieTargetWithLocks, renderWeightGoalsSection: renderWeightGoalsSection, " +
   "renderDisplaySection: renderDisplaySection, " +
   "clampWeightPanOffset: clampWeightPanOffset, renderWeightTab: renderWeightTab, " +
@@ -4301,12 +4302,33 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
       reverseStage: 1, reverseStage2At: null, maintainAnchor: null, maintainBand: 2, bulkRate: 0.75,
     }, settingsOverrides || {});
   }
-  test("phaseCoach: disabled means null, and the UI renders exactly as before", function () {
-    coachFixture({ phasesEnabled: false });
-    assertEqual(M.phaseCoach(), null, "no coach when the toggle is off");
+  test("phases are permanent: the Reverse chip and coach card always render in Weight Goals", function () {
+    coachFixture({});
     const goals = M.renderWeightGoalsSection();
-    assertEqual(goals.indexOf("Reverse Diet"), -1, "no Reverse chip when off");
-    assertEqual(goals.indexOf("applyCoachSuggestion"), -1, "no coach card when off");
+    assertEqual(goals.indexOf("Reverse Diet") > -1, true, "the fourth phase chip");
+    assertEqual(goals.indexOf("applyCoachSuggestion") > -1 || goals.indexOf("Coach") > -1, true, "the coach card");
+    assertEqual(M.renderDisplaySection().indexOf("togglePhasesEnabled"), -1, "the experimental toggle is gone -- the feature graduated");
+  });
+  test("phaseDeltaColor / phaseRateColor: the good direction follows the phase", function () {
+    coachFixture({ goalType: "cut" });
+    const cutUnder = M.phaseDeltaColor(-200), cutOver = M.phaseDeltaColor(200);
+    coachFixture({ goalType: "bulk" });
+    assertEqual(M.phaseDeltaColor(200), cutUnder, "a surplus in a bulk is the same green a deficit is in a cut");
+    assertEqual(M.phaseDeltaColor(-200), cutOver, "and a deficit in a bulk is the failure color");
+    assertEqual(M.phaseRateColor(0.7), cutUnder, "gaining while bulking is green");
+    coachFixture({ goalType: "maintain" });
+    assertEqual(M.phaseDeltaColor(100), M.phaseDeltaColor(-100), "at maintenance, small misses either way read the same (green)");
+    assertEqual(M.phaseDeltaColor(100), cutUnder, "and that color is the success color");
+    assertEqual(M.phaseDeltaColor(500) !== cutUnder && M.phaseDeltaColor(500) !== cutOver, true, "big maintenance drift is amber, not red -- drift, not failure");
+  });
+  test("renderWeeklyDeltaCard: the verdict sentence follows the phase", function () {
+    coachFixture({ goalType: "bulk" });
+    M.state.date = daysAgoStr(0);
+    M.state.targetHistory = {};
+    M.state.settings.calorieTarget = 2000;
+    M.state.foodLogs[daysAgoStr(0)] = [{ id: "s1", name: "Big day", weight: 100, macros: { calories: 2400, protein: 100, carbs: 100, fat: 100, fiber: 0 } }];
+    const html = M.renderWeeklyDeltaCard();
+    assertEqual(html.indexOf("surplus your bulk plans for") > -1, true, "a surplus during a bulk is the plan working, not a slip");
   });
   test("phaseCoach cut: goal reached suggests starting the reverse diet", function () {
     coachFixture({ goalWeight: 155 }); // trend avg is exactly 155
@@ -4346,10 +4368,12 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     coachFixture({ goalType: "maintain", maintainAnchor: 155, maintainBand: 2, calorieTarget: 2000 });
     assertEqual(M.phaseCoach().apply, null, "inside the band, nothing to change");
   });
-  test("phaseCoach maintain: consolidated after the RP hold, opens the door to the bulk", function () {
-    coachFixture({ goalType: "maintain", maintainAnchor: 155, maintainBand: 2, calorieTarget: 2000, phaseStartedAt: daysAgoStr(49) });
+  test("phaseCoach maintain: NO hold timelines -- the bulk door is open from day one in band", function () {
+    // Colin's call (2026-08-18): he won't maintain for long, so no week-counting gate.
+    coachFixture({ goalType: "maintain", maintainAnchor: 155, maintainBand: 2, calorieTarget: 2000, phaseStartedAt: daysAgoStr(1) });
     const s = M.phaseCoach();
-    assertEqual(s.switchTo, "bulk", "7 weeks in-band = consolidated");
+    assertEqual(s.switchTo, "bulk", "one day in and the switch is already offered");
+    assertEqual(s.lines.join(" ").indexOf("Consolidating"), -1, "no consolidation week-counting in the copy");
   });
   test("phaseCoach bulk: below maintenance suggests the +0.75/wk surplus target", function () {
     coachFixture({ goalType: "bulk", calorieTarget: 2000 });
@@ -4370,12 +4394,11 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     M.actions.setGoalType("reverse"); // re-tap the active chip
     assertEqual(M.state.settings.phaseStartedAt, daysAgoStr(0), "re-tapping does not re-stamp");
   });
-  test("phases UI: enabled shows the Reverse chip and the coach card; Preferences carries the toggle", function () {
+  test("phases UI: the reverse phase renders its coach card in Weight Goals", function () {
     coachFixture({ goalType: "reverse" });
     const goals = M.renderWeightGoalsSection();
     assertEqual(goals.indexOf("Reverse Diet") > -1, true, "the fourth chip");
     assertEqual(goals.indexOf("Coach") > -1, true, "the coach card renders in Weight Goals");
-    assertEqual(M.renderDisplaySection().indexOf("togglePhasesEnabled") > -1, true, "the experimental toggle lives in Preferences");
   });
   // Leave no residue for anything after us.
   M.state.foodLogs = {}; M.state.weights = {}; M.state.targetHistory = {};

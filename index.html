@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.28";
+const APP_VERSION = "1.29";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -206,10 +206,9 @@ const DEFAULT_SETTINGS = {
   aiProvider: "claude-sonnet", aiEnabled: true, geminiApiKey: "", claudeApiKey: "", compareWithGemini: false,
   macroPreset: "Custom",
   macroLocks: { protein: false, carbs: false, fat: false },
-  // Phases & Coach (EXPERIMENTAL, default OFF -- with this false the app renders exactly as
-  // it did before the feature existed). goalType doubles as the active phase; these fields
-  // are the coach's reference points, all living in the settings blob (no migration).
-  phasesEnabled: false,
+  // Phases & Coach (graduated from its experimental toggle 2026-08-18 -- Colin approved).
+  // goalType doubles as the active phase (cut | reverse | maintain | bulk); these fields are
+  // the coach's reference points, all living in the settings blob (no migration).
   phaseStartedAt: null,      // date the current phase began (stamped by setGoalType)
   phaseStartCalories: null,  // calorie target when it began (reverse step 1 = midpoint math)
   phaseStartTrendAvg: null,  // 7d-trend average when it began (the refill-window baseline)
@@ -2342,8 +2341,9 @@ function renderWeeklyDeltaCard() {
   rows.forEach(function(r) {
     const isViewed = r.date === state.date;
     // Colored by the day's own set target: a boosted day that stayed under its raised goal
-    // reads green here, matching what the progress bar told him that day.
-    const deltaColor = !r.logged ? C.textMut : (r.dayDelta <= 0 ? C.success : C.danger);
+    // reads green here, matching what the progress bar told him that day. Which DIRECTION is
+    // good comes from the phase (see phaseDeltaColor) -- surplus is the success in a bulk.
+    const deltaColor = !r.logged ? C.textMut : phaseDeltaColor(r.dayDelta);
     inner += '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0' + (isViewed ? ';background:' + C.primary + '11;border-radius:6px;padding-left:6px;padding-right:6px;margin:0 -6px' : '') + '">' +
       '<span style="color:' + (isViewed ? C.text : C.textSec) + ';font-size:13px;white-space:nowrap">' + esc(dayLabel(r.date)) + (r.date === todayStr() ? ' <span style="color:' + C.textMut + ';font-size:11px">today</span>' : '') + '</span>' +
       (r.logged
@@ -2366,13 +2366,20 @@ function renderWeeklyDeltaCard() {
     // against the base goal alone before ⚡ targets were surfaced here at all).
     inner += '<div style="display:flex;justify-content:space-between;border-top:1px solid ' + C.border + ';margin-top:8px;padding-top:10px">' +
       '<span style="color:' + C.textSec + ';font-size:13px;font-weight:600">' + (loggedBoost ? 'Net vs day targets (' : 'Net (') + loggedRows.length + ' logged day' + (loggedRows.length === 1 ? '' : 's') + ')</span>' +
-      '<span style="color:' + (netDay <= 0 ? C.success : C.danger) + ';font-size:14px;font-weight:800">' + signedKcal(netDay) + ' kcal</span></div>';
+      '<span style="color:' + phaseDeltaColor(netDay) + ';font-size:14px;font-weight:800">' + signedKcal(netDay) + ' kcal</span></div>';
     if (loggedBoost) {
       inner += '<div style="display:flex;justify-content:space-between;margin-top:4px">' +
         '<span style="color:' + C.textMut + ';font-size:12px">Net vs standing goal (no ⚡)</span>' +
-        '<span style="color:' + (netBase <= 0 ? C.success : C.danger) + ';font-size:12px;font-weight:700">' + signedKcal(netBase) + ' kcal</span></div>';
+        '<span style="color:' + phaseDeltaColor(netBase) + ';font-size:12px;font-weight:700">' + signedKcal(netBase) + ' kcal</span></div>';
     }
-    inner += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px">' + (netDay <= 0 ? "Running a deficit" : "Running a surplus") + (loggedBoost ? ' vs your day targets' : ' vs your goal') + '. ~3,500 kcal ≈ 1 lb.</div>';
+    // The verdict sentence follows the phase too -- "Running a surplus" is the plan working
+    // during a bulk, not a slip.
+    const phase = state.settings.goalType || "cut";
+    let verdict;
+    if (phase === "bulk") verdict = netDay >= 0 ? "Running the surplus your bulk plans for" : "Running a deficit — under your bulk targets";
+    else if (phase === "maintain" || phase === "reverse") verdict = Math.abs(netDay) <= 150 * loggedRows.length ? "Holding close to maintenance" : (netDay > 0 ? "Trending over maintenance" : "Trending under maintenance");
+    else verdict = (netDay <= 0 ? "Running a deficit" : "Running a surplus") + (loggedBoost ? ' vs your day targets' : ' vs your goal');
+    inner += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px">' + verdict + '. ~3,500 kcal ≈ 1 lb.</div>';
   } else {
     inner += '<div style="color:' + C.textMut + ';font-size:12px;text-align:center;padding:8px 0">Nothing logged this week yet.</div>';
   }
@@ -5918,8 +5925,8 @@ function renderWeightTab() {
 
   if (statsAvgDaily != null || statsWeekly != null || wu.statsFollowsRange) {
     html += '<div class="row" style="margin-bottom:4px">' +
-      statCard("Avg Daily", statsAvgDaily != null ? (statsAvgDaily > 0 ? "+" : "") + statsAvgDaily + " " + unit + "/day" : "\u2014", statsAvgDaily != null ? (statsAvgDaily <= 0 ? C.success : C.danger) : C.text) +
-      statCard("Weekly Change", statsWeekly != null ? (statsWeekly > 0 ? "+" : "") + statsWeekly + " " + unit : "\u2014", statsWeekly != null ? (statsWeekly <= 0 ? C.success : C.danger) : C.text) +
+      statCard("Avg Daily", statsAvgDaily != null ? (statsAvgDaily > 0 ? "+" : "") + statsAvgDaily + " " + unit + "/day" : "\u2014", statsAvgDaily != null ? phaseRateColor(statsAvgDaily * 7) : C.text) +
+      statCard("Weekly Change", statsWeekly != null ? (statsWeekly > 0 ? "+" : "") + statsWeekly + " " + unit : "\u2014", statsWeekly != null ? phaseRateColor(statsWeekly) : C.text) +
     '</div>';
     if (statsCaption) html += '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:16px;text-align:center">' + esc(statsCaption) + '</div>';
   }
@@ -6040,7 +6047,7 @@ function renderSelectedWeightSlot(selPoint, wu, unit, trendInfo) {
       (trendInfo
         ? '<div style="overflow:hidden;text-overflow:ellipsis;font-size:11px;color:' + WEIGHT_TREND_COLOR + '">7d avg ' + trendInfo.avg + ' ' + esc(unit) +
           (trendInfo.change != null
-            ? ' · <span style="color:' + (trendInfo.change <= 0 ? C.success : C.danger) + ';font-weight:700">' + (trendInfo.change > 0 ? '+' : '') + trendInfo.change + ' in 7d</span>'
+            ? ' · <span style="color:' + phaseRateColor(trendInfo.change) + ';font-weight:700">' + (trendInfo.change > 0 ? '+' : '') + trendInfo.change + ' in 7d</span>'
             : '') +
           '</div>'
         : '') +
@@ -6867,9 +6874,29 @@ function coachDaysSince(dateStr) {
 function coachRateText(rate, unit) {
   return rate == null ? "not yet measurable" : (rate > 0 ? "+" : "−") + Math.abs(rate) + " " + unit + "/week";
 }
+
+// Which direction "over" points depends on the phase. The app was cut-coded everywhere
+// (deficit = green) until phases graduated: in a bulk, a 300-kcal deficit is the failure and
+// the planned surplus is the success; at maintenance (and during a reverse, which is walking
+// up to maintenance on purpose), NEAR ZERO is the green state and big misses in either
+// direction are amber, not red -- overshooting maintenance by 400 isn't a moral failing, it's
+// drift worth noticing. In cut phase these return exactly the pre-phases colors.
+function phaseDeltaColor(deltaKcal) {
+  const phase = state.settings.goalType || "cut";
+  if (phase === "bulk") return deltaKcal >= 0 ? C.success : C.danger;
+  if (phase === "maintain" || phase === "reverse") return Math.abs(deltaKcal) <= 150 ? C.success : C.warning;
+  return deltaKcal <= 0 ? C.success : C.danger;
+}
+// Same idea for weight-change rates (per week). Maintenance/reverse call ±0.5/wk "steady".
+function phaseRateColor(perWeekRate) {
+  if (perWeekRate == null) return C.text;
+  const phase = state.settings.goalType || "cut";
+  if (phase === "bulk") return perWeekRate >= 0 ? C.success : C.danger;
+  if (phase === "maintain" || phase === "reverse") return Math.abs(perWeekRate) <= 0.5 ? C.success : C.warning;
+  return perWeekRate <= 0 ? C.success : C.danger;
+}
 function phaseCoach() {
   const set = state.settings;
-  if (!set.phasesEnabled) return null;
   const unit = set.weightUnit || "lbs";
   const t = phaseTrendReadout();
   const S = { title: "Coach", lines: [], apply: null, applyLabel: null, switchTo: null, switchLabel: null };
@@ -6960,16 +6987,13 @@ function phaseCoach() {
     const anchor = parseFloat(set.maintainAnchor) > 0 ? parseFloat(set.maintainAnchor) : (tr ? tr.avg : null);
     if (anchor == null || !tr) { S.title = "Maintenance"; S.lines.push("Log a few weigh-ins to establish the anchor."); return S; }
     const drift = round1(tr.avg - anchor);
-    const weeksIn = days != null ? Math.floor(days / 7) : null;
     S.title = "Maintenance";
     if (Math.abs(drift) <= band) {
+      // No hold timelines here, deliberately (Colin's call, 2026-08-18): maintenance lasts as
+      // long as he wants it to, and the bulk door is simply always open while in band.
       S.lines.push("Trend " + tr.avg + " " + unit + " — inside your " + anchor + " ± " + band + " " + unit + " band. Nothing to change.");
-      if (weeksIn != null && weeksIn < 6) {
-        S.lines.push("Consolidating: week " + (weeksIn + 1) + " of ~6–8. (RP: hold maintenance roughly as long as the cut lasted before growing.)");
-      } else {
-        S.lines.push("Consolidated. A lean bulk is on the table whenever you’re ready — at your +" + (parseFloat(set.bulkRate) || 0.75) + " " + unit + "/week target that means roughly maintenance + " + Math.round((parseFloat(set.bulkRate) || 0.75) * (KCAL_PER_WEIGHT_UNIT[unit] || 3500) / 7) + " kcal.");
-        S.switchTo = "bulk"; S.switchLabel = "Start Bulk";
-      }
+      S.lines.push("A lean bulk is on the table whenever you’re ready — at your +" + (parseFloat(set.bulkRate) || 0.75) + " " + unit + "/week target that means roughly maintenance + " + Math.round((parseFloat(set.bulkRate) || 0.75) * (KCAL_PER_WEIGHT_UNIT[unit] || 3500) / 7) + " kcal.");
+      S.switchTo = "bulk"; S.switchLabel = "Start Bulk";
     } else if (drift > band) {
       S.lines.push("Trend " + tr.avg + " " + unit + " is " + drift + " above your " + anchor + " anchor (band ±" + band + "). Sustained, not a spike — trim ~125.");
       S.apply = { calories: Math.max(1200, set.calorieTarget - 125) };
@@ -7023,8 +7047,6 @@ actions.applyCoachSuggestion = function() {
 };
 
 function renderPhaseCoachCard() {
-  const set = state.settings;
-  if (!set.phasesEnabled) return '';
   const s = phaseCoach();
   if (!s) return '';
   let html = '<div style="border-top:1px solid ' + C.border + ';margin:20px 0 16px"></div>' +
@@ -7067,19 +7089,17 @@ function renderWeightGoalsSection() {
   const currentGoalType = set.goalType || "cut";
   html += '<div style="margin-top:16px"><label class="label">Goal Phase</label><div class="rowWrap">' +
     '<button class="chip' + (currentGoalType === 'cut' ? ' active' : '') + '" data-action="setGoalType" data-arg="cut">Cut</button>' +
-    // Reverse Diet is only a phase when the experimental Phases & Coach toggle is on
-    // (Preferences); with it off this row is exactly the pre-feature three chips.
-    (set.phasesEnabled ? '<button class="chip' + (currentGoalType === 'reverse' ? ' active' : '') + '" data-action="setGoalType" data-arg="reverse">Reverse Diet</button>' : '') +
+    '<button class="chip' + (currentGoalType === 'reverse' ? ' active' : '') + '" data-action="setGoalType" data-arg="reverse">Reverse Diet</button>' +
     '<button class="chip' + (currentGoalType === 'maintain' ? ' active' : '') + '" data-action="setGoalType" data-arg="maintain">Maintenance</button>' +
     '<button class="chip' + (currentGoalType === 'bulk' ? ' active' : '') + '" data-action="setGoalType" data-arg="bulk">Bulk</button>' +
   '</div></div>';
-  if (set.phasesEnabled && currentGoalType === 'maintain') {
+  if (currentGoalType === 'maintain') {
     html += '<div class="row" style="margin-top:12px">' +
       '<div style="flex:1"><label class="label">Anchor Weight (' + set.weightUnit + ')</label>' + textInput({ value: set.maintainAnchor != null ? set.maintainAnchor : "", type: "number", placeholder: "7d trend at switch", bind: "maintainAnchor" }) + '</div>' +
       '<div style="flex:1"><label class="label">Band (± ' + set.weightUnit + ')</label>' + textInput({ value: set.maintainBand != null ? set.maintainBand : 2, type: "number", bind: "maintainBand" }) + '</div>' +
     '</div>';
   }
-  if (set.phasesEnabled && currentGoalType === 'bulk') {
+  if (currentGoalType === 'bulk') {
     html += '<div style="margin-top:12px"><label class="label">Target Gain Per Week (' + set.weightUnit + ')</label>' + textInput({ value: set.bulkRate != null ? set.bulkRate : 0.75, type: "number", bind: "bulkRate" }) + '</div>';
   }
   html += '<div style="margin-top:12px"><label class="label">Goal Weight (' + set.weightUnit + ')</label>' + textInput({ value: set.goalWeight, type: "number", bind: "goalWeight" }) + '</div>';
@@ -7118,9 +7138,9 @@ actions.setGoalType = function(t) {
   const changed = t !== set.goalType;
   set.goalType = t;
   // Entering a phase stamps when it started and from where -- the coach's arithmetic (the
-  // reverse refill window, stage advancement, the maintenance hold count) is all relative to
-  // these. Re-tapping the already-active chip deliberately does NOT re-stamp.
-  if (set.phasesEnabled && changed) {
+  // reverse refill window and stage advancement) is relative to these. Re-tapping the
+  // already-active chip deliberately does NOT re-stamp.
+  if (changed) {
     const tp = phaseTrendReadout();
     set.phaseStartedAt = todayStr();
     set.phaseStartCalories = set.calorieTarget;
@@ -7456,27 +7476,8 @@ function renderDisplaySection() {
     '<div><div style="font-size:14px">Show Plant Protein</div><div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">Show the "(Xg plant-based)" estimate under Protein on the dashboard</div></div>' +
     toggleSwitch(set.showPlantProtein, "toggleShowPlantProtein") +
   '</div>';
-  html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:' + C.inputBg + ';border-radius:10px;border:1px solid ' + C.border + ';margin-top:16px">' +
-    '<div style="min-width:0;padding-right:8px"><div style="font-size:14px">Phases &amp; Coach <span style="color:' + C.warning + ';font-size:11px">experimental</span></div>' +
-    '<div style="color:' + C.textMut + ';font-size:12px;margin-top:2px">Adds a Reverse Diet phase and a coach card under Weight Goals that suggests calorie changes (never applies them itself). Turn off to restore the app exactly as before.</div></div>' +
-    toggleSwitch(set.phasesEnabled === true, "togglePhasesEnabled") +
-  '</div>';
   return card(html);
 }
-actions.togglePhasesEnabled = function() {
-  const set = state.settings;
-  set.phasesEnabled = set.phasesEnabled !== true;
-  // First enable: stamp the current phase's starting point so the coach has its reference
-  // (without this, "day N of the phase" would be unanswerable for the phase already underway).
-  if (set.phasesEnabled && !set.phaseStartedAt) {
-    const tp = phaseTrendReadout();
-    set.phaseStartedAt = todayStr();
-    set.phaseStartCalories = set.calorieTarget;
-    set.phaseStartTrendAvg = tp && tp.readout ? tp.readout.avg : null;
-  }
-  saveSettings();
-  rerender();
-};
 actions.setWeightUnit = function(u) { state.settings.weightUnit = u; saveSettings(); rerender(); };
 actions.setCarbsDisplay = function(v) { state.settings.carbsDisplay = v; saveSettings(); rerender(); };
 actions.toggleShowPlantProtein = function() { state.settings.showPlantProtein = !state.settings.showPlantProtein; saveSettings(); rerender(); };
