@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.25";
+const APP_VERSION = "1.26";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -5759,6 +5759,8 @@ function renderWeightTab() {
   // range chips and pan controls vanish with no way back.
   if (allWeights.length > 1) {
     const selPoint = wu.selectedPoint ? chartData.find(function(d){ return d.date === wu.selectedPoint; }) : null;
+    const allWeightsData = allWeights.map(function(w){ return { date: w[0], weight: w[1].weight }; });
+    const selTrend = selPoint ? weightTrendReadout(allWeightsData, selPoint.date) : null;
     // Six chips on one line: tighter padding/font/gap than the .chip default so Manual fits.
     const chipStyle = 'flex:1;text-align:center;padding:6px 0;font-size:11px;min-width:0;white-space:nowrap';
     let histInner = '<h3 class="cardTitle" style="margin-bottom:4px">Weight History</h3>' +
@@ -5772,11 +5774,11 @@ function renderWeightTab() {
       '</div>' +
       renderManualRangePanel(wu) +
       renderWeightPanRow(wu, rangeDays, maxPan, windowLabel) +
-      renderSelectedWeightSlot(selPoint, wu, unit) +
+      renderSelectedWeightSlot(selPoint, wu, unit, selTrend) +
       (chartData.length > 0
         ? renderWeightChart(chartData, set.goalWeight, wu.selectedPoint,
             // Trend from ALL weigh-ins, charted at the visible dates (see weightTrendSeries).
-            weightTrendSeries(allWeights.map(function(w){ return { date: w[0], weight: w[1].weight }; }), chartData.map(function(d){ return d.date; })))
+            weightTrendSeries(allWeightsData, chartData.map(function(d){ return d.date; })))
         : '<div data-panzone="weight" style="height:220px;display:flex;align-items:center;justify-content:center;color:' + C.textMut + ';font-size:13px">No weigh-ins in this window</div>');
     html += card(histInner);
   } else {
@@ -5821,7 +5823,7 @@ function weightChartXPositions(dates, x0, plotWidth) {
 // the same height for the same reason -- the delete confirmation replaces the readout in place
 // rather than expanding underneath it.
 const SELECTED_WEIGHT_SLOT_H = 44;
-function renderSelectedWeightSlot(selPoint, wu, unit) {
+function renderSelectedWeightSlot(selPoint, wu, unit, trendInfo) {
   const wrap = function(content) {
     return '<div style="height:' + SELECTED_WEIGHT_SLOT_H + 'px;display:flex;align-items:center;justify-content:space-between;gap:8px;overflow:hidden">' + content + '</div>';
   };
@@ -5843,10 +5845,24 @@ function renderSelectedWeightSlot(selPoint, wu, unit) {
       '</div>'
     );
   }
+  // One tap on a day answers both questions at once: what did the scale say (top line), and
+  // what does the trend say (violet line -- the 7-day average passing through that day, plus
+  // how much that average moved over the last 7 days). Still one fixed-height row: the two
+  // stacked lines fit inside SELECTED_WEIGHT_SLOT_H, so the chart never shifts (the whole
+  // reason this slot exists).
   return wrap(
-    '<div style="min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">' +
-      '<span style="color:' + C.textMut + ';font-size:12px">' + esc(selDateLabel) + '</span> ' +
-      '<span style="font-size:17px;font-weight:700;color:' + C.text + '">' + selPoint.weight + ' ' + esc(unit) + '</span>' +
+    '<div style="min-width:0;overflow:hidden;white-space:nowrap">' +
+      '<div style="overflow:hidden;text-overflow:ellipsis">' +
+        '<span style="color:' + C.textMut + ';font-size:12px">' + esc(selDateLabel) + '</span> ' +
+        '<span style="font-size:16px;font-weight:700;color:' + C.text + '">' + selPoint.weight + ' ' + esc(unit) + '</span>' +
+      '</div>' +
+      (trendInfo
+        ? '<div style="overflow:hidden;text-overflow:ellipsis;font-size:11px;color:' + WEIGHT_TREND_COLOR + '">7d avg ' + trendInfo.avg + ' ' + esc(unit) +
+          (trendInfo.change != null
+            ? ' · <span style="color:' + (trendInfo.change <= 0 ? C.success : C.danger) + ';font-weight:700">' + (trendInfo.change > 0 ? '+' : '') + trendInfo.change + ' in 7d</span>'
+            : '') +
+          '</div>'
+        : '') +
     '</div>' +
     '<div style="display:flex;align-items:center;gap:2px;flex:none">' +
       '<button data-action="askDeleteWeight" data-arg="' + selPoint.date + '" style="background:none;border:none;color:' + C.textMut + ';font-size:16px;cursor:pointer;padding:4px">\u{1F5D1}</button>' +
@@ -5902,6 +5918,9 @@ function renderWeightPanRow(wu, rangeDays, maxPan, windowLabel) {
 // the trend near its left edge by pretending earlier weigh-ins don't exist. Two-pointer over
 // the ascending dates, so it's linear, not quadratic, on the all-time range. Pure, tested.
 const WEIGHT_TREND_DAYS = 7;
+// Violet: distinct from the blue daily line, the green goal line, and the amber selection
+// marker. Shared by the chart's trend path and the selected-day readout's trend line.
+const WEIGHT_TREND_COLOR = "#A855F7";
 function weightTrendSeries(allData, dates) {
   const times = allData.map(function(p){ return parseDateStr(p.date).getTime(); });
   let lo = 0, hi = 0, sum = 0; // running window over allData: [lo, hi)
@@ -5916,6 +5935,21 @@ function weightTrendSeries(allData, dates) {
     out.push(hi > lo ? sum / (hi - lo) : null);
   });
   return out;
+}
+
+// The tapped day's smoothed context, shown in the selected-weight slot: the 7-day trailing
+// average at that date, and how much that average moved vs 7 days earlier -- "how much have I
+// actually lost this week", immune to a water spike sitting on either endpoint (comparing two
+// RAW weigh-ins a week apart would inherit both days' noise; comparing the two averages is
+// the same read the trend line gives visually). change is null in the first week of history,
+// where there is no earlier average to compare against.
+function weightTrendReadout(allData, dateStr) {
+  const now = weightTrendSeries(allData, [dateStr])[0];
+  if (now == null) return null;
+  const d = parseDateStr(dateStr);
+  d.setDate(d.getDate() - 7);
+  const prev = weightTrendSeries(allData, [fmtDate(d)])[0];
+  return { avg: round1(now), change: prev == null ? null : round1(now - prev) };
 }
 
 // Tap targets for the weight chart: one full-plot-height vertical band per point, each running
@@ -6084,26 +6118,24 @@ function renderWeightChart(data, goalWeight, selectedDate, trendValues) {
     yLabels += '<text x="4" y="' + (y+3).toFixed(1) + '" font-size="10" fill="' + C.textMut + '">' + Math.round(val) + '</text>';
   }
 
-  // The 7-day trend (see weightTrendSeries): violet -- distinct from the blue daily line, the
-  // green goal line, and the amber selection marker -- painted BEFORE the daily line so the
-  // dots and the day-to-day wiggles stay crisp on top of it. Trend values are averages of the
-  // data, so they can never extend the min/max scale. Label only when the line is actually a
-  // line (2+ points); a lone charted point's "trend" is just itself.
-  const TREND_COLOR = "#A855F7";
-  let trendPath = "", trendLabel = "";
+  // The 7-day trend (see weightTrendSeries): painted BEFORE the daily line so the dots and
+  // the day-to-day wiggles stay crisp on top of it. Trend values are averages of the data, so
+  // they can never extend the min/max scale. Deliberately NO text label on the line -- it
+  // overlapped the line itself (the trend hugs the data, so there is no reliably clear spot
+  // to put text); the line is identified by the violet readout in the selected-weight slot
+  // instead. Only drawn when it's actually a line (2+ points).
+  let trendPath = "";
   if (trendValues && trendValues.length === data.length) {
-    let pts = 0, lastX = 0, lastY = 0;
+    let pts = 0;
     data.forEach(function(d, i) {
       if (trendValues[i] == null) return;
-      const x = xs[i], y = yScale(trendValues[i]);
-      trendPath += (pts === 0 ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1) + " ";
-      lastX = x; lastY = y; pts++;
+      trendPath += (pts === 0 ? "M" : "L") + xs[i].toFixed(1) + "," + yScale(trendValues[i]).toFixed(1) + " ";
+      pts++;
     });
     if (pts < 2) trendPath = "";
-    else trendLabel = '<text x="' + lastX.toFixed(1) + '" y="' + (lastY - 6).toFixed(1) + '" font-size="9" fill="' + TREND_COLOR + '" text-anchor="end" style="pointer-events:none">7d trend</text>';
   }
   const trendLine = trendPath
-    ? '<path d="' + trendPath + '" fill="none" stroke="' + TREND_COLOR + '" stroke-width="2.5" opacity="0.7" stroke-linecap="round" style="pointer-events:none"></path>' + trendLabel
+    ? '<path d="' + trendPath + '" fill="none" stroke="' + WEIGHT_TREND_COLOR + '" stroke-width="2.5" opacity="0.7" stroke-linecap="round" style="pointer-events:none"></path>'
     : '';
 
   let goalLine = "";

@@ -150,6 +150,7 @@ const exportLine =
   "weightChartHitBands: weightChartHitBands, renderSelectedWeightSlot: renderSelectedWeightSlot, " +
   "weightRangeDays: weightRangeDays, weightChartWindowBounds: weightChartWindowBounds, " +
   "weightTrendSeries: weightTrendSeries, WEIGHT_TREND_DAYS: WEIGHT_TREND_DAYS, " +
+  "weightTrendReadout: weightTrendReadout, " +
   "clampWeightPanOffset: clampWeightPanOffset, renderWeightTab: renderWeightTab, " +
   "waistEntryIsEmpty: waistEntryIsEmpty, mergeWaistEntriesFromCloud: mergeWaistEntriesFromCloud, " +
   "waistEntriesForDisplay: waistEntriesForDisplay, waistUnitLabel: waistUnitLabel, " +
@@ -3780,15 +3781,15 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     assertEqual(trend[0], 158, "Aug 8 averages Aug 4-8 (160+159+158+157+156)/5, using pre-window history");
     assertEqual(trend[2], 157, "Aug 10 averages the full week");
   });
-  test("renderWeightChart: draws the trend line and its label when trend values are passed", function () {
+  test("renderWeightChart: draws the trend path, with NO text label on the line", function () {
     const data = [{ date: "2026-08-01", weight: 180 }, { date: "2026-08-05", weight: 179 }, { date: "2026-08-09", weight: 178 }];
     const withTrend = M.renderWeightChart(data, null, null, [180, 179.5, 179]);
     assertEqual(withTrend.indexOf("#A855F7") > -1, true, "the violet trend path is drawn");
-    assertEqual(withTrend.indexOf("7d trend") > -1, true, "and labelled");
+    assertEqual(withTrend.indexOf("7d trend"), -1, "no label -- it overlapped the line (the slot readout identifies it instead)");
     const withoutTrend = M.renderWeightChart(data, null, null);
     assertEqual(withoutTrend.indexOf("#A855F7"), -1, "omitting trend values draws no trend");
     const lonePoint = M.renderWeightChart([data[0]], null, null, [180]);
-    assertEqual(lonePoint.indexOf("7d trend"), -1, "a single point gets no trend line or label");
+    assertEqual(lonePoint.indexOf("#A855F7"), -1, "a single point gets no trend line");
   });
   test("renderWeightTab: the chart carries the 7-day trend", function () {
     const prevWeights = M.state.weights, prevUi = M.state.ui, prevDate = M.state.date;
@@ -3799,8 +3800,31 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
       "2026-08-12": { weight: 179.5, unit: "lbs", timestamp: "2026-08-12T08:00:00.000Z" },
     };
     M.state.ui = {};
-    assertEqual(M.renderWeightTab().indexOf("7d trend") > -1, true, "trend line rendered from the tab");
+    assertEqual(M.renderWeightTab().indexOf("#A855F7") > -1, true, "trend line rendered from the tab");
     M.state.weights = prevWeights; M.state.ui = prevUi; M.state.date = prevDate;
+  });
+  test("weightTrendReadout: the tapped day's 7-day average, and its change vs a week earlier", function () {
+    const data = [];
+    for (let i = 1; i <= 14; i++) data.push({ date: "2026-08-" + String(i).padStart(2, "0"), weight: 168 - i }); // 167 down to 154
+    const r = M.weightTrendReadout(data, "2026-08-14");
+    assertEqual(r.avg, 157, "average of Aug 8-14 (160..154)");
+    assertEqual(r.change, -7, "vs the Aug 1-7 average (164..160) -- steady 1lb/day shows as -7/week");
+    const early = M.weightTrendReadout(data, "2026-08-03");
+    assertEqual(early.avg, 166, "first-week average still reads (Aug 1-3: 167,166,165)");
+    assertEqual(early.change, null, "but has no earlier week to compare against");
+    assertEqual(M.weightTrendReadout(data, "2027-01-01"), null, "a date with no weigh-ins within 7 days has no readout");
+  });
+  test("renderSelectedWeightSlot: the tap readout shows day weight AND the 7d trend, same height as ever", function () {
+    const wu = { timeRange: "30d", confirmDeleteDate: null };
+    const sel = { date: "2026-08-14", weight: 154 };
+    const withTrend = M.renderSelectedWeightSlot(sel, wu, "lbs", { avg: 157, change: -1.6 });
+    assertEqual(withTrend.indexOf("154 lbs") > -1, true, "the day's own weight");
+    assertEqual(withTrend.indexOf("7d avg 157") > -1, true, "the trend average through that day");
+    assertEqual(withTrend.indexOf("−1.6 in 7d") > -1 || withTrend.indexOf("-1.6 in 7d") > -1, true, "and the week's smoothed change");
+    const firstWeek = M.renderSelectedWeightSlot(sel, wu, "lbs", { avg: 157, change: null });
+    assertEqual(firstWeek.indexOf("in 7d"), -1, "no change shown when history has no prior week");
+    const heightOf = function (h) { const m = h.match(/height:(\d+)px/); return m ? m[1] : null; };
+    assertEqual(heightOf(withTrend), heightOf(M.renderSelectedWeightSlot(null, wu, "lbs")), "the slot stays fixed-height -- the chart must not shift");
   });
 
   // ==== waist measurements (Strategy > Waist & Photos) ====
