@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.30";
+const APP_VERSION = "1.31";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -204,6 +204,7 @@ const DEFAULT_SETTINGS = {
   goalWeight: 150, goalDate: "2026-09-14", goalRatePerWeek: "",
   startWeight: null, startDate: null,
   aiProvider: "claude-sonnet", aiEnabled: true, geminiApiKey: "", claudeApiKey: "", compareWithGemini: false,
+  usdaApiKey: "", // personal api.data.gov key; blank = the shared, rate-limited DEMO_KEY
   macroPreset: "Custom",
   macroLocks: { protein: false, carbs: false, fat: false },
   // Phases & Coach (graduated from its experimental toggle 2026-08-18 -- Colin approved).
@@ -1480,7 +1481,11 @@ function offServingSizes(p) {
 
 async function searchUSDA(query) {
   try {
-    const r = await fetch("https://api.nal.usda.gov/fdc/v1/foods/search?query=" + encodeURIComponent(query) + "&pageSize=15&api_key=DEMO_KEY");
+    // Personal key from settings when present (free at api.data.gov -- 1,000 requests/hour);
+    // blank falls back to the shared DEMO_KEY (30/hour across everyone on this IP) so search
+    // keeps working either way. The key syncs in the settings blob like the AI keys do.
+    const key = encodeURIComponent((state.settings.usdaApiKey || "").trim() || "DEMO_KEY");
+    const r = await fetch("https://api.nal.usda.gov/fdc/v1/foods/search?query=" + encodeURIComponent(query) + "&pageSize=15&api_key=" + key);
     const d = await r.json();
     return (d.foods || []).map(function(f) {
       const get = function(name) {
@@ -7569,6 +7574,11 @@ function renderAISection() {
         '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">Get a free key at ai.google.dev' + (isClaudePrimary && set.compareWithGemini ? " — needed for the Gemini comparison" : "") + '</div></div>';
     }
   }
+  // Not an AI key, but this is the screen where keys live. USDA powers the "Food databases"
+  // search group and the wizard's lookups.
+  html += '<div style="border-top:1px solid ' + C.border + ';margin:20px 0 16px"></div>';
+  html += '<div><label class="label">USDA API Key (food search)</label>' + textInput({ value: set.usdaApiKey || "", type: "password", bind: "usdaApiKey", placeholder: "blank = shared demo key" }) +
+    '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">Free at api.data.gov/signup — raises food-database search from 30 requests/hour (shared demo key) to 1,000/hour (yours). Syncs to your account like the keys above.</div></div>';
   return card(html);
 }
 actions.toggleAiEnabled = function() { state.settings.aiEnabled = !state.settings.aiEnabled; saveSettings(); rerender(); };
@@ -7576,6 +7586,7 @@ actions.toggleCompareGemini = function() { state.settings.compareWithGemini = !s
 actions.setAiProvider = function(p) { state.settings.aiProvider = p; saveSettings(); rerender(); };
 inputActions.claudeApiKey = function(v) { state.settings.claudeApiKey = v; saveSettings(); };
 inputActions.geminiApiKey = function(v) { state.settings.geminiApiKey = v; saveSettings(); };
+inputActions.usdaApiKey = function(v) { state.settings.usdaApiKey = v.trim(); saveSettings(); };
 
 // ---- Insights (Claude-powered) ----
 // One button: build a compact structured summary of the last 4 weeks CLIENT-SIDE, send it to

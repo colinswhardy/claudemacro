@@ -159,6 +159,7 @@ const exportLine =
   "phaseCoach: phaseCoach, renderPhaseCoachCard: renderPhaseCoachCard, " +
   "phaseDeltaColor: phaseDeltaColor, phaseRateColor: phaseRateColor, " +
   "wizardSearchTerm: wizardSearchTerm, wizardSearchQuery: wizardSearchQuery, " +
+  "searchUSDA: searchUSDA, " +
   "WIZARD_CONFIGS: WIZARD_CONFIGS, renderWizardScreen: renderWizardScreen, " +
   "applyCalorieTargetWithLocks: applyCalorieTargetWithLocks, renderWeightGoalsSection: renderWeightGoalsSection, " +
   "renderDisplaySection: renderDisplaySection, " +
@@ -4335,6 +4336,22 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     fu.wizardType = "eggs";
     fu.wizard = { step: 1, selections: { prep: "Fried" }, searching: true, searchResults: [], selectedFood: null, showAI: false, weight: "", qty: "1", servingBasis: null, aiDesc: "", aiLoading: false, aiError: null, searchFailedQuery: null };
     assertEqual(M.renderWizardScreen(fu).indexOf("Searching food databases") > -1, true, "the final tap visibly does something");
+  });
+
+  await atest("searchUSDA: uses the personal key from settings, falls back to DEMO_KEY when blank", async function () {
+    const urls = [];
+    sandbox.fetch = function (url) {
+      urls.push(String(url));
+      return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ foods: [] }); } });
+    };
+    M.state.settings.usdaApiKey = "MY-PERSONAL-KEY";
+    await M.searchUSDA("chicken");
+    assertEqual(urls[0].indexOf("api_key=MY-PERSONAL-KEY") > -1, true, "personal key on the request");
+    M.state.settings.usdaApiKey = "";
+    await M.searchUSDA("chicken");
+    assertEqual(urls[1].indexOf("api_key=DEMO_KEY") > -1, true, "blank falls back to the shared demo key");
+    M.state.settings.usdaApiKey = "";
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
   });
 
   // ==== phases & coach (experimental, default OFF) ====
