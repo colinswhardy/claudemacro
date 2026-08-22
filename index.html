@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.29";
+const APP_VERSION = "1.30";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -4111,7 +4111,7 @@ actions.doFoodSearch = async function() {
   rerender();
 };
 
-actions.openWizard = function(type) { foodUi().wizardType = type; foodUi().wizard = { step: 0, selections: {}, weight: "", servingBasis: null, qty: "1", showAI: false, aiDesc: "", aiLoading: false, aiError: null, searchResults: [], searching: false, selectedFood: null }; rerender(); };
+actions.openWizard = function(type) { foodUi().wizardType = type; foodUi().wizard = { step: 0, selections: {}, weight: "", servingBasis: null, qty: "1", showAI: false, aiDesc: "", aiLoading: false, aiError: null, searchResults: [], searching: false, selectedFood: null, searchFailedQuery: null }; rerender(); };
 actions.closeWizard = function() { stepBackOneLevel(); };
 
 actions.openAIScreen = function() {
@@ -5564,7 +5564,12 @@ function renderWizardScreen(fu) {
     '<h3 class="cardTitle" style="margin:0">' + esc(config.label) + ' Selection</h3></div>';
 
   let inner;
-  if (wiz.searchResults.length > 0 || wiz.selectedFood) {
+  if (wiz.searching) {
+    // Without this, the final tap looked ignored while the two database searches ran -- and a
+    // second tap re-fired them (against a rate-limited shared USDA key, no less).
+    inner = '<div style="text-align:center;padding:30px"><div style="font-size:24px;margin-bottom:8px">🔍</div>' +
+      '<div style="color:' + C.textMut + ';font-size:14px">Searching food databases…</div></div>';
+  } else if (wiz.searchResults.length > 0 || wiz.selectedFood) {
     inner = renderWizardResults(config, wiz);
   } else if (wiz.showAI) {
     inner = renderWizardAI(config, wiz);
@@ -5595,7 +5600,11 @@ function renderWizardSteps(config, wiz) {
 }
 
 function renderWizardAI(config, wiz) {
-  let html = '<div style="color:' + C.textSec + ';margin-bottom:16px">Describe your ' + esc(config.label.toLowerCase()) + ' for an AI macro estimate:</div>';
+  let html = '';
+  if (wiz.searchFailedQuery) {
+    html += '<div style="padding:10px 12px;background:' + C.warning + '15;border-radius:8px;color:' + C.warning + ';font-size:12px;margin-bottom:12px">No database match for “' + esc(wiz.searchFailedQuery) + '” — get an AI estimate instead. Your selections are already included; the description below just adds portion detail.</div>';
+  }
+  html += '<div style="color:' + C.textSec + ';margin-bottom:16px">Describe your ' + esc(config.label.toLowerCase()) + ' for an AI macro estimate:</div>';
   html += textInput({ value: wiz.aiDesc, placeholder: 'e.g. "thick cut, about palm-sized"', bind: "wizardAiDesc", enter: "wizardAiEstimate", style: "margin-bottom:12px" });
   if (wiz.aiError) html += '<div style="padding:10px;background:' + C.danger + '15;border-radius:8px;color:' + C.danger + ';font-size:13px;margin-bottom:12px">' + esc(wiz.aiError) + '</div>';
   html += '<div class="row">' +
@@ -5651,6 +5660,29 @@ function renderWizardResults(config, wiz) {
   return html;
 }
 
+// What one selected option contributes to the DATABASE query. The option strings are written
+// for humans ("Medium (some visible fat)", "None / Plain") and used verbatim they made
+// queries so over-specified that USDA/OFF frequently returned nothing at all -- and before
+// the empty-result fallback below existed, zero results silently looped the wizard back to
+// its own last step with no message (the reported "can't get to the end of the steps" bug).
+// Rules: parenthetical qualifiers are stripped, slashed alternatives keep their first half,
+// and the non-food words vanish entirely ("Other", "As-Served", the "None" family -- "Eggs
+// Fried None" is a strictly worse query than "Eggs Fried"). Pure, tested.
+function wizardSearchTerm(value) {
+  if (value === "Other" || value === "As-Served") return null;
+  let v = String(value).replace(/\s*\(.*\)\s*$/, "").split("/")[0].trim();
+  if (!v || v.toLowerCase() === "none") return null;
+  return v;
+}
+function wizardSearchQuery(config, selections) {
+  const parts = [config.label];
+  Object.keys(selections).forEach(function(k) {
+    const t = wizardSearchTerm(selections[k]);
+    if (t) parts.push(t);
+  });
+  return parts.join(" ");
+}
+
 actions.wizardSelect = async function(option) {
   const fu = foodUi();
   const wiz = fu.wizard;
@@ -5665,20 +5697,35 @@ actions.wizardSelect = async function(option) {
     return;
   }
   if (isLastStep) {
+    if (wiz.searching) return; // a tap while the previous search is in flight
     wiz.searching = true;
     rerender();
-    const parts = [config.label];
-    Object.keys(wiz.selections).forEach(function(k) {
-      const v = wiz.selections[k];
-      if (v !== "Other" && v !== "As-Served") parts.push(v);
-    });
-    const query = parts.join(" ");
-    const usda = await searchUSDA(query);
-    const off = await searchOpenFoodFacts(query);
-    const merged = deduplicateFoods(usda.concat(off));
+    const query = wizardSearchQuery(config, wiz.selections);
+    let merged = deduplicateFoods((await searchUSDA(query)).concat(await searchOpenFoodFacts(query)));
+    // Still nothing? One broadened retry with just the food + first qualifier ("Steak Cooked")
+    // -- generic enough that USDA nearly always has it, so a hyper-specific cut/fat combo
+    // degrades to a usable generic record instead of a dead end.
+    if (merged.length === 0) {
+      const broadQuery = query.split(" ").slice(0, 2).join(" ");
+      if (broadQuery && broadQuery !== query) {
+        merged = deduplicateFoods((await searchUSDA(broadQuery)).concat(await searchOpenFoodFacts(broadQuery)));
+      }
+    }
+    // The user may have backed out of the wizard while the network was in flight.
+    if (!fu.wizardType || fu.wizard !== wiz) return;
     wiz.searchResults = merged;
     wiz.searching = false;
-    if (merged.length > 0) { wiz.selectedFood = merged[0]; wiz.weight = ""; wiz.servingBasis = null; wiz.qty = "1"; pendingFocusId = "wizardWeightInput"; }
+    if (merged.length > 0) {
+      wiz.selectedFood = merged[0]; wiz.weight = ""; wiz.servingBasis = null; wiz.qty = "1";
+      pendingFocusId = "wizardWeightInput";
+    } else {
+      // The guaranteed way OUT of the steps: fall through to the wizard's own AI screen with
+      // the reason shown and a seed description filled in, so Estimate is one tap away (the
+      // estimate request already carries all the step selections).
+      wiz.searchFailedQuery = query;
+      wiz.showAI = true;
+      if (!wiz.aiDesc.trim()) wiz.aiDesc = "typical portion";
+    }
     rerender();
   } else {
     wiz.step += 1;
@@ -5687,7 +5734,12 @@ actions.wizardSelect = async function(option) {
 };
 
 actions.wizardBack = function() { foodUi().wizard.step -= 1; rerender(); };
-actions.wizardAiBack = function() { foodUi().wizard.showAI = false; rerender(); };
+actions.wizardAiBack = function() {
+  const wiz = foodUi().wizard;
+  wiz.showAI = false;
+  wiz.searchFailedQuery = null; // returning to the steps; a fresh search sets it again if needed
+  rerender();
+};
 inputActions.wizardAiDesc = function(val) {
   const wiz = foodUi().wizard;
   wiz.aiDesc = val;

@@ -158,6 +158,8 @@ const exportLine =
   "buildInsightsSummary: buildInsightsSummary, renderInsightsSection: renderInsightsSection, " +
   "phaseCoach: phaseCoach, renderPhaseCoachCard: renderPhaseCoachCard, " +
   "phaseDeltaColor: phaseDeltaColor, phaseRateColor: phaseRateColor, " +
+  "wizardSearchTerm: wizardSearchTerm, wizardSearchQuery: wizardSearchQuery, " +
+  "WIZARD_CONFIGS: WIZARD_CONFIGS, renderWizardScreen: renderWizardScreen, " +
   "applyCalorieTargetWithLocks: applyCalorieTargetWithLocks, renderWeightGoalsSection: renderWeightGoalsSection, " +
   "renderDisplaySection: renderDisplaySection, " +
   "clampWeightPanOffset: clampWeightPanOffset, renderWeightTab: renderWeightTab, " +
@@ -4279,6 +4281,60 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     assertEqual(withKey.indexOf("AI Settings to use this"), -1, "no key warning once a key exists");
     M.state.settings.claudeApiKey = "";
     M.state.ui = prevUi;
+  });
+
+  // ==== food wizard: query building and the no-dead-end guarantee ====
+  test("wizardSearchQuery: human option text is trimmed into database-friendly queries", function () {
+    assertEqual(M.wizardSearchQuery(M.WIZARD_CONFIGS.steak, { prep: "Cooked", cut: "Ribeye", fat: "Medium (some visible fat)" }),
+      "Steak Cooked Ribeye Medium", "parenthetical qualifiers stripped");
+    assertEqual(M.wizardSearchQuery(M.WIZARD_CONFIGS.eggs, { prep: "Fried", addedFat: "None" }),
+      "Eggs Fried", "'None' never reaches the query -- 'Eggs Fried None' was a real query this built");
+    assertEqual(M.wizardSearchQuery(M.WIZARD_CONFIGS.pasta, { type: "White / Regular", state: "Dry Weight", sauce: "None / Plain" }),
+      "Pasta White Dry Weight", "slashed alternatives keep their first half; 'None / Plain' vanishes");
+    assertEqual(M.wizardSearchTerm("Other"), null, "Other is a UI escape, not a search term");
+    assertEqual(M.wizardSearchTerm("As-Served"), null, "As-Served likewise");
+  });
+  await atest("wizardSelect: zero database results falls through to the AI screen, never a silent loop", async function () {
+    sandbox.fetch = function () { return Promise.reject(new Error("network down")); }; // both searches catch to []
+    M.state.ui = {};
+    const fu = M.foodUi();
+    fu.wizardType = "eggs";
+    fu.wizard = { step: 1, selections: { prep: "Fried" }, weight: "", servingBasis: null, qty: "1", showAI: false, aiDesc: "", aiLoading: false, aiError: null, searchResults: [], searching: false, selectedFood: null, searchFailedQuery: null };
+    await M.actions.wizardSelect("Butter");
+    assertEqual(fu.wizard.showAI, true, "lands on the AI screen instead of looping the last step");
+    assertEqual(fu.wizard.searching, false, "spinner released");
+    assertEqual(fu.wizard.searchFailedQuery, "Eggs Fried Butter", "the failed query is named in the notice");
+    assertEqual(fu.wizard.aiDesc, "typical portion", "seeded so Estimate is enabled with one tap");
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+  });
+  await atest("wizardSelect: a too-specific query broadens once before giving up", async function () {
+    const queries = [];
+    sandbox.fetch = function (url) {
+      const u = String(url);
+      const q = decodeURIComponent((u.match(/[?&](?:query|search_terms)=([^&]*)/) || [])[1] || "");
+      queries.push(q);
+      if (u.indexOf("api.nal.usda.gov") > -1 && q === "Steak Cooked") {
+        return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ foods: [{ fdcId: 1, description: "Beef steak, cooked", foodNutrients: [{ nutrientName: "Energy", value: 250 }, { nutrientName: "Protein", value: 26 }] }] }); } });
+      }
+      return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ foods: [], products: [] }); } });
+    };
+    M.state.ui = {};
+    const fu = M.foodUi();
+    fu.wizardType = "steak";
+    fu.wizard = { step: 2, selections: { prep: "Cooked", cut: "Ribeye" }, weight: "", servingBasis: null, qty: "1", showAI: false, aiDesc: "", aiLoading: false, aiError: null, searchResults: [], searching: false, selectedFood: null, searchFailedQuery: null };
+    await M.actions.wizardSelect("Well-Marbled (visible fat)");
+    assertEqual(queries.some(function (q) { return q === "Steak Cooked Ribeye Well-Marbled"; }), true, "tried the specific (cleaned) query first");
+    assertEqual(fu.wizard.selectedFood != null, true, "the broadened 'Steak Cooked' retry found a generic record");
+    assertEqual(fu.wizard.selectedFood.name, "Beef steak, cooked", "and auto-selected it");
+    assertEqual(fu.wizard.showAI, false, "no AI fallback needed");
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+  });
+  test("renderWizardScreen: shows a searching state while the lookups run", function () {
+    M.state.ui = {};
+    const fu = M.foodUi();
+    fu.wizardType = "eggs";
+    fu.wizard = { step: 1, selections: { prep: "Fried" }, searching: true, searchResults: [], selectedFood: null, showAI: false, weight: "", qty: "1", servingBasis: null, aiDesc: "", aiLoading: false, aiError: null, searchFailedQuery: null };
+    assertEqual(M.renderWizardScreen(fu).indexOf("Searching food databases") > -1, true, "the final tap visibly does something");
   });
 
   // ==== phases & coach (experimental, default OFF) ====
