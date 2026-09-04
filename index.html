@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.32";
+const APP_VERSION = "1.33";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -6796,11 +6796,16 @@ const KCAL_PER_WEIGHT_UNIT = { lbs: 3500, kg: 7700 };
 // The intake average (complete food days only) and the weight trend (first/last weigh-in in
 // the window) cover slightly different day sets -- inherent to the heuristic, fine at this
 // precision.
-function estimateMaintenanceCalories() {
+// Optional endDateStr re-anchors the 28-day window to end on that day instead of today --
+// the Insights section's maintenance trend measures "now" vs "8 weeks ago" with it. No-arg
+// callers behave exactly as before.
+function estimateMaintenanceCalories(endDateStr) {
   const unit = state.settings.weightUnit || "lbs";
   const kcalPerUnit = KCAL_PER_WEIGHT_UNIT[unit] || 3500;
-  const today = todayStr();
-  const cutoff = fmtDate(new Date(Date.now() - 28 * 86400000));
+  const today = endDateStr || todayStr();
+  const cd = parseDateStr(today);
+  cd.setDate(cd.getDate() - 28); // calendar-day stepping, not raw ms (the weightChartCutoff rule)
+  const cutoff = fmtDate(cd);
   const calDays = [];
   Object.keys(state.foodLogs).forEach(function(d) {
     if (d >= cutoff && d < today) { // exclude today: it's usually mid-logging
@@ -7619,6 +7624,10 @@ function signedWeight(n) {
 function shortDate(ds) {
   return parseDateStr(ds).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
+// With the year -- for dates that can sit outside the current year (ETAs, "lowest since").
+function fullDate(ds) {
+  return parseDateStr(ds).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
 
 // Trailing 7-day blocks ending on endDateStr, OLDEST FIRST: {start, end, avg, count, sum}.
 // A week with no weigh-ins keeps avg null -- missing data, never zero. Calendar-day stepping
@@ -7816,6 +7825,245 @@ function weekendIntakeSplit(endDateStr, days) {
   return { weekdayAvg: wdAvg, weekendAvg: weAvg, weekdayDays: wd.n, weekendDays: we.n, delta: weAvg - wdAvg };
 }
 
+// Actual 4-week pace vs the pace chosen in Weight Goals, and where the actual pace lands.
+// Null without a goal weight, a chosen weekly rate, a weigh-in, and a usable 4-week rate.
+// The planned rate's direction is inferred from goal vs current (computeGoalPlan's rule);
+// the ETA mirrors weightGoalProjection's conservatism -- none when the actual pace is flat
+// (<0.05/wk), moving away from the goal, or over 2 years out -- and anchors to the LATEST
+// weigh-in, not state.date, so viewing a past day can't backdate it. Within 0.25 of goal
+// there's no pace story to tell (the projection line declares arrival); null.
+function paceVsPlan(endDateStr) {
+  const set = state.settings;
+  const goal = parseFloat(set.goalWeight);
+  const rate = Math.abs(parseFloat(set.goalRatePerWeek));
+  if (!(goal > 0) || !(rate > 0)) return null;
+  const dates = Object.keys(state.weights).sort();
+  if (dates.length === 0) return null;
+  const latestDate = dates[dates.length - 1];
+  const remaining = goal - state.weights[latestDate].weight;
+  if (Math.abs(remaining) <= 0.25) return null;
+  const fourWeek = weeklyWeightSummary(weeklyWeightBlocks(endDateStr, INSIGHT_WEEKS));
+  if (!fourWeek || fourWeek.perWeek == null) return null;
+  const out = { planned: remaining < 0 ? -rate : rate, actual: fourWeek.perWeek,
+    remaining: round1(remaining), goalDate: set.goalDate || null, etaActual: null, awayFromGoal: false };
+  if ((out.actual > 0) !== (remaining > 0) && Math.abs(out.actual) >= 0.05) { out.awayFromGoal = true; return out; }
+  if (Math.abs(out.actual) < 0.05) return out; // flat: the comparison still renders, no ETA
+  const weeks = remaining / out.actual;
+  if (weeks > 104) return out;
+  const d = parseDateStr(latestDate);
+  d.setDate(d.getDate() + Math.round(weeks * 7));
+  out.etaActual = fmtDate(d);
+  return out;
+}
+
+// Milestones over the weight history up to endDateStr: how the latest weigh-in ranks, the
+// distance from the peak (trough in a bulk -- every read here flips with the phase), progress
+// from starting point to goal, and the best week on record. sinceDays is how far back the
+// last at-or-beyond weigh-in sits (null = an earlier one beats it... within a week or two,
+// nothing worth saying; the renderer only speaks at 28+ days) and isAllTimeRecord means
+// nothing in the history beats it. bestWeek compares ADJACENT weighed weeks only, on the same
+// alignment as the 4-week table, capped at 104 weeks back.
+function weightMilestones(endDateStr) {
+  const dates = Object.keys(state.weights).sort().filter(function(d) { return d <= endDateStr; });
+  if (dates.length === 0) return null;
+  const latestDate = dates[dates.length - 1];
+  const current = state.weights[latestDate].weight;
+  const bulk = (state.settings.goalType || "cut") === "bulk";
+  let beatDate = null;
+  for (let i = dates.length - 2; i >= 0; i--) {
+    const w = state.weights[dates[i]].weight;
+    if (bulk ? w >= current : w <= current) { beatDate = dates[i]; break; }
+  }
+  const sinceDays = beatDate == null ? null : Math.round((parseDateStr(latestDate) - parseDateStr(beatDate)) / 86400000);
+  let extreme = null, extremeDate = null;
+  dates.forEach(function(d) {
+    const w = state.weights[d].weight;
+    if (extreme == null || (bulk ? w < extreme : w > extreme)) { extreme = w; extremeDate = d; }
+  });
+  const set = state.settings;
+  const goal = parseFloat(set.goalWeight);
+  const effStart = (set.startWeight != null && set.startWeight !== "" && !isNaN(parseFloat(set.startWeight)))
+    ? parseFloat(set.startWeight) : state.weights[dates[0]].weight;
+  let pctToGoal = null;
+  if (goal > 0 && Math.abs(effStart - goal) > 0.5) {
+    pctToGoal = Math.round(((effStart - current) / (effStart - goal)) * 100);
+  }
+  const totalDays = Math.round((parseDateStr(endDateStr) - parseDateStr(dates[0])) / 86400000) + 1;
+  const blocks = weeklyWeightBlocks(endDateStr, Math.min(104, Math.max(1, Math.ceil(totalDays / 7))));
+  let bestWeek = null;
+  for (let i = 1; i < blocks.length; i++) {
+    if (blocks[i].avg == null || blocks[i - 1].avg == null) continue;
+    const ch = round1(blocks[i].avg - blocks[i - 1].avg);
+    if ((bulk ? ch > 0 : ch < 0) && (bestWeek == null || (bulk ? ch > bestWeek.change : ch < bestWeek.change))) {
+      bestWeek = { start: blocks[i].start, end: blocks[i].end, change: ch };
+    }
+  }
+  return { current: current, latestDate: latestDate, bulk: bulk, isAllTimeRecord: beatDate == null && dates.length >= 10,
+    sinceDays: sinceDays, beatDate: beatDate, extreme: extreme, extremeDate: extremeDate,
+    fromExtreme: round1(current - extreme), pctToGoal: pctToGoal, start: effStart, goal: goal > 0 ? goal : null, bestWeek: bestWeek };
+}
+
+// This calendar month (through the anchor day) vs last calendar month: average weight over
+// weigh-ins, average intake and protein over logged days. Partial-vs-full is fine for
+// averages, and calendar months (not trailing 28-day blocks) because "August vs July" is how
+// the question is actually asked. Null unless both months have something to compare.
+function monthlyComparison(endDateStr) {
+  const anchor = parseDateStr(endDateStr);
+  function monthStats(year, month, lastDay) {
+    let wSum = 0, wN = 0, kSum = 0, pSum = 0, fN = 0;
+    for (let day = 1; day <= lastDay; day++) {
+      const ds = fmtDate(new Date(year, month, day));
+      if (state.weights[ds]) { wSum += state.weights[ds].weight; wN++; }
+      if ((state.foodLogs[ds] || []).length > 0) {
+        const t = getDayTotals(ds);
+        kSum += t.calories; pSum += t.protein; fN++;
+      }
+    }
+    return { label: new Date(year, month, 1).toLocaleDateString("en-US", { month: "long" }),
+      avgWeight: wN ? round1(wSum / wN) : null, weighIns: wN,
+      avgKcal: fN ? Math.round(kSum / fN) : null, avgProtein: fN ? Math.round(pSum / fN) : null, loggedDays: fN };
+  }
+  const y = anchor.getFullYear(), m = anchor.getMonth();
+  const thisM = monthStats(y, m, anchor.getDate());
+  const prevY = m === 0 ? y - 1 : y, prevM = m === 0 ? 11 : m - 1;
+  const lastM = monthStats(prevY, prevM, new Date(prevY, prevM + 1, 0).getDate());
+  if ((thisM.weighIns === 0 && thisM.loggedDays === 0) || (lastM.weighIns === 0 && lastM.loggedDays === 0)) return null;
+  return { thisMonth: thisM, lastMonth: lastM };
+}
+
+// A plateau call-out for the phases where flat is NOT the goal (cut and bulk only): the
+// 7-day trend has moved under 0.25/wk in total over the last 3 weeks. Reported WITH the same
+// window's intake facts so the flat number and the eating behind it sit side by side -- the
+// copy points at measured maintenance, never at the log ("what Colin logs is the truth"
+// binds this harder than anywhere: a plateau is the one place "you must be under-counting"
+// copy writes itself, and it is banned). Null = nothing to report, including "too little
+// data to say" -- absence of evidence is not a plateau.
+function plateauStatus(endDateStr) {
+  const phase = state.settings.goalType || "cut";
+  if (phase !== "cut" && phase !== "bulk") return null;
+  const allData = Object.keys(state.weights).sort().map(function(d) { return { date: d, weight: state.weights[d].weight }; });
+  if (allData.length < 8) return null;
+  const now = weightTrendSeries(allData, [endDateStr])[0];
+  const pd = parseDateStr(endDateStr);
+  pd.setDate(pd.getDate() - 21);
+  const prev = weightTrendSeries(allData, [fmtDate(pd)])[0];
+  if (now == null || prev == null) return null;
+  const change = round1(now - prev);
+  if (Math.abs(change) >= 0.75) return null;
+  let kSum = 0, tSum = 0, n = 0;
+  const it = parseDateStr(endDateStr);
+  it.setDate(it.getDate() - 20);
+  for (let i = 0; i < 21; i++) {
+    const ds = fmtDate(it);
+    if ((state.foodLogs[ds] || []).length > 0) { kSum += getDayTotals(ds).calories; tSum += getDayTargets(ds).calorieTarget; n++; }
+    it.setDate(it.getDate() + 1);
+  }
+  return { weeks: 3, change: change, phase: phase,
+    avgKcal: n ? Math.round(kSum / n) : null, avgTarget: n ? Math.round(tSum / n) : null, loggedDays: n };
+}
+
+// Measured maintenance now vs ~8 weeks ago, each over its own 28-day window (they don't
+// overlap: now-28..now vs now-84..now-56), so a long cut's adaptation shows up as drift in
+// the number itself. Either side can be null independently; null only when both are.
+function maintenanceTrend(endDateStr) {
+  const now = estimateMaintenanceCalories(endDateStr);
+  const d = parseDateStr(endDateStr);
+  d.setDate(d.getDate() - 56);
+  const before = estimateMaintenanceCalories(fmtDate(d));
+  if (!now && !before) return null;
+  return { now: now ? now.maintenance : null, nowDays: now ? now.daysUsed : 0,
+    before: before ? before.maintenance : null, beforeDays: before ? before.daysUsed : 0,
+    change: (now && before) ? now.maintenance - before.maintenance : null };
+}
+
+// Protein consistency over the trailing window: logged days at-or-above that day's protein
+// target (getDayTargets, so a boosted day is scored against its raised bar), the average
+// grams, and grams per unit of the latest bodyweight. Null with no logged days.
+function proteinConsistency(endDateStr, days) {
+  let logged = 0, hit = 0, pSum = 0;
+  const d = parseDateStr(endDateStr);
+  d.setDate(d.getDate() - (days - 1));
+  for (let i = 0; i < days; i++) {
+    const ds = fmtDate(d);
+    if ((state.foodLogs[ds] || []).length > 0) {
+      const p = getDayTotals(ds).protein;
+      logged++; pSum += p;
+      if (p >= getDayTargets(ds).proteinTarget) hit++;
+    }
+    d.setDate(d.getDate() + 1);
+  }
+  if (logged === 0) return null;
+  const avg = Math.round(pSum / logged);
+  const wDates = Object.keys(state.weights).sort();
+  const current = wDates.length ? state.weights[wDates[wDates.length - 1]].weight : null;
+  return { loggedDays: logged, hitDays: hit, avgProtein: avg,
+    perUnit: current ? Math.round((avg / current) * 100) / 100 : null };
+}
+
+// Which macro drives the over-target days: average grams of each macro on over days vs
+// at-or-under days over the trailing window, the gaps converted to kcal via Atwater so the
+// three are comparable. Needs 3+ days on each side. driver is the biggest gap worth at least
+// 60 kcal -- null when the extra spreads evenly (that IS the finding, and the copy says so).
+// Alcohol calories aren't representable in the three macros, so the gaps need not sum to the
+// overspend; they're presented as observations, not a decomposition.
+function overDayMacroDriver(endDateStr, days) {
+  const over = { n: 0, p: 0, c: 0, f: 0, kcal: 0, target: 0 }, under = { n: 0, p: 0, c: 0, f: 0 };
+  const d = parseDateStr(endDateStr);
+  d.setDate(d.getDate() - (days - 1));
+  for (let i = 0; i < days; i++) {
+    const ds = fmtDate(d);
+    if ((state.foodLogs[ds] || []).length > 0) {
+      const t = getDayTotals(ds);
+      const target = getDayTargets(ds).calorieTarget;
+      if (t.calories > target) { over.n++; over.p += t.protein; over.c += t.carbs; over.f += t.fat; over.kcal += t.calories; over.target += target; }
+      else { under.n++; under.p += t.protein; under.c += t.carbs; under.f += t.fat; }
+    }
+    d.setDate(d.getDate() + 1);
+  }
+  if (over.n < 3 || under.n < 3) return null;
+  const deltas = {
+    protein: { g: Math.round(over.p / over.n - under.p / under.n) },
+    carbs: { g: Math.round(over.c / over.n - under.c / under.n) },
+    fat: { g: Math.round(over.f / over.n - under.f / under.n) },
+  };
+  deltas.protein.kcal = deltas.protein.g * 4; deltas.carbs.kcal = deltas.carbs.g * 4; deltas.fat.kcal = deltas.fat.g * 9;
+  let driver = null;
+  ["protein", "carbs", "fat"].forEach(function(k) {
+    if (deltas[k].kcal >= 60 && (driver === null || deltas[k].kcal > deltas[driver].kcal)) driver = k;
+  });
+  return { overDays: over.n, underDays: under.n,
+    avgOverspend: Math.round((over.kcal - over.target) / over.n), deltas: deltas, driver: driver };
+}
+
+// Average intake per weekday over the trailing window, logged days only. maxDow/minDow are
+// only named once at least 4 weekdays have 2+ logged days each -- a sparse log can't crown
+// an outlier from a single lucky sample.
+function dayOfWeekIntakeProfile(endDateStr, days) {
+  const byDow = [];
+  for (let i = 0; i < 7; i++) byDow.push({ dow: i, days: 0, sum: 0 });
+  const d = parseDateStr(endDateStr);
+  d.setDate(d.getDate() - (days - 1));
+  for (let i = 0; i < days; i++) {
+    const ds = fmtDate(d);
+    if ((state.foodLogs[ds] || []).length > 0) {
+      const b = byDow[parseDateStr(ds).getDay()];
+      b.days++; b.sum += getDayTotals(ds).calories;
+    }
+    d.setDate(d.getDate() + 1);
+  }
+  byDow.forEach(function(b) { b.avgKcal = b.days > 0 ? Math.round(b.sum / b.days) : null; delete b.sum; });
+  let maxDow = null, minDow = null, qualified = 0;
+  byDow.forEach(function(b) {
+    if (b.days >= 2) {
+      qualified++;
+      if (maxDow === null || b.avgKcal > byDow[maxDow].avgKcal) maxDow = b.dow;
+      if (minDow === null || b.avgKcal < byDow[minDow].avgKcal) minDow = b.dow;
+    }
+  });
+  if (qualified < 4) { maxDow = null; minDow = null; }
+  return { byDow: byDow, maxDow: maxDow, minDow: minDow };
+}
+
 // One bundle of every computed statistic, keyed for the Claude summary -- the narrative
 // builds on the same numbers the section displays instead of re-deriving (and disagreeing).
 function buildComputedInsightStats() {
@@ -7828,6 +8076,14 @@ function buildComputedInsightStats() {
     typicalDailySwing: typicalDailySwing(pairs),
     morningAfter: intakeScaleLink(pairs),
     weekendVsWeekday: weekendIntakeSplit(state.date, INSIGHT_PATTERN_DAYS),
+    paceVsPlan: paceVsPlan(state.date),
+    milestones: weightMilestones(state.date),
+    monthVsMonth: monthlyComparison(state.date),
+    plateau: plateauStatus(state.date),
+    maintenanceTrend: maintenanceTrend(state.date),
+    proteinConsistency: proteinConsistency(state.date, 28),
+    overDayDriver: overDayMacroDriver(state.date, 28),
+    intakeByWeekday: dayOfWeekIntakeProfile(state.date, INSIGHT_PATTERN_DAYS),
   };
 }
 
@@ -7924,6 +8180,93 @@ function renderInsightsSection() {
   }
   html += card(w);
 
+  // -- Goal progress: pace vs plan, plus milestones. Only rendered when there's a line worth
+  // saying -- an empty "Goal Progress" frame would just be noise.
+  const pace = paceVsPlan(state.date);
+  const mile = weightMilestones(state.date);
+  let gp = '';
+  if (pace) {
+    gp += '<div style="font-size:13px;color:' + C.textSec + ';margin-bottom:4px">Planned pace <b style="color:' + C.text + '">' + signedWeight(pace.planned) + ' ' + esc(unit) + '/wk</b> · actual 4-week pace <b style="color:' + phaseRateColor(pace.actual) + '">' + signedWeight(pace.actual) + ' ' + esc(unit) + '/wk</b></div>';
+    if (pace.awayFromGoal) {
+      gp += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:10px">The last 4 weeks moved away from your goal — ' + signedWeight(pace.remaining) + ' ' + esc(unit) + ' to go.</div>';
+    } else if (pace.etaActual) {
+      gp += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:10px">At this pace you reach your goal (' + signedWeight(pace.remaining) + ' ' + esc(unit) + ' to go) around <b style="color:' + C.textSec + '">' + esc(fullDate(pace.etaActual)) + '</b>' + (pace.goalDate ? ' — your target date is ' + esc(fullDate(pace.goalDate)) : '') + '.</div>';
+    } else {
+      gp += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:10px">The 4-week pace is flat, so there’s no arrival date to project yet.</div>';
+    }
+  }
+  if (mile) {
+    const lowWord = mile.bulk ? "highest" : "lowest";
+    if (mile.isAllTimeRecord) {
+      gp += '<div style="font-size:13px;color:' + C.text + ';margin-bottom:4px">🏆 ' + mile.current + ' ' + esc(unit) + ' is your ' + lowWord + ' weight on record.</div>';
+    } else if (mile.sinceDays != null && mile.sinceDays >= 28) {
+      gp += '<div style="font-size:13px;color:' + C.text + ';margin-bottom:4px">🏆 ' + mile.current + ' ' + esc(unit) + ' is your ' + lowWord + ' since ' + esc(fullDate(mile.beatDate)) + ' (' + mile.sinceDays + ' days).</div>';
+    }
+    if (Math.abs(mile.fromExtreme) >= 0.5) {
+      gp += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:4px">' + (mile.bulk ? "Up " : "Down ") + Math.abs(mile.fromExtreme) + ' ' + esc(unit) + ' from your ' + (mile.bulk ? "low" : "peak") + ' of ' + mile.extreme + ' (' + esc(fullDate(mile.extremeDate)) + ').</div>';
+    }
+    if (mile.pctToGoal != null && mile.pctToGoal >= 1) {
+      gp += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:4px">' + Math.min(100, mile.pctToGoal) + '% of the way from ' + mile.start + ' to your ' + mile.goal + ' ' + esc(unit) + ' goal' + (mile.pctToGoal > 100 ? ' — and past it' : '') + '.</div>';
+    }
+    if (mile.bestWeek) {
+      gp += '<div style="color:' + C.textMut + ';font-size:12px">Best week on record: ' + signedWeight(mile.bestWeek.change) + ' ' + esc(unit) + ' (' + esc(shortDate(mile.bestWeek.start)) + ' – ' + esc(shortDate(mile.bestWeek.end)) + ').</div>';
+    }
+  }
+  if (gp) html += card('<h3 class="cardTitle" style="margin-bottom:10px">Goal Progress</h3>' + gp);
+
+  // -- Measured maintenance, with the plateau check inside it --
+  const mt = maintenanceTrend(state.date);
+  const plateau = plateauStatus(state.date);
+  if (mt || plateau) {
+    let mm = '<h3 class="cardTitle" style="margin-bottom:10px">Measured Maintenance</h3>';
+    if (mt && mt.now != null) {
+      mm += '<div style="font-size:13px;color:' + C.textSec + ';margin-bottom:4px">Your own data says maintenance ≈ <b style="color:' + C.text + '">' + mt.now.toLocaleString() + ' kcal/day</b> right now (' + mt.nowDays + ' fully-logged days vs actual weight change — not a formula).</div>';
+      if (mt.before != null) {
+        const driftNote = mt.change <= -100
+          ? "You burn less than you did then — normal as weight drops, and worth knowing when a once-working intake stops working."
+          : (mt.change >= 100 ? "You burn more than you did then." : "Essentially unchanged.");
+        mm += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:4px">Eight weeks ago it measured ≈ ' + mt.before.toLocaleString() + ' kcal (' + signedKcal(mt.change) + '). ' + driftNote + '</div>';
+      }
+    } else if (mt && mt.before != null) {
+      mm += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:4px">Not enough recent data to measure maintenance right now (it needs 10+ fully-logged days and weigh-ins spanning 14+ of the last 28). Eight weeks ago it measured ≈ ' + mt.before.toLocaleString() + ' kcal.</div>';
+    }
+    if (plateau) {
+      mm += '<div style="margin-top:8px;padding:10px 12px;background:' + C.warning + '15;border-radius:8px;font-size:12px;color:' + C.textSec + '">📊 <b>Plateau check:</b> your 7-day trend has moved just ' + signedWeight(plateau.change) + ' ' + esc(unit) + ' in the last 3 weeks' +
+        (plateau.loggedDays > 0 ? ', while you logged an average of ' + plateau.avgKcal.toLocaleString() + ' kcal against a ' + plateau.avgTarget.toLocaleString() + ' kcal target (' + plateau.loggedDays + ' days)' : '') + '.' +
+        (mt && mt.now != null ? ' If the plan is still to ' + (plateau.phase === "bulk" ? 'gain, the measured maintenance above is the number to eat above.' : 'lose, the measured maintenance above is the number to eat below.') : '') +
+      '</div>';
+    }
+    html += card(mm);
+  }
+
+  // -- This calendar month vs last --
+  const mvm = monthlyComparison(state.date);
+  if (mvm) {
+    const tm = mvm.thisMonth, lm = mvm.lastMonth;
+    const moRow = function(label, valueStr, deltaStr, color) {
+      return '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:13px">' +
+        '<span style="color:' + C.textSec + '">' + label + '</span>' +
+        '<span style="color:' + C.textMut + '">' + valueStr + '</span>' +
+        '<span style="color:' + color + ';font-weight:700;min-width:56px;text-align:right">' + deltaStr + '</span></div>';
+    };
+    let moRows = '';
+    if (tm.avgWeight != null && lm.avgWeight != null) {
+      const dw = round1(tm.avgWeight - lm.avgWeight);
+      moRows += moRow('Avg weight', tm.avgWeight + ' vs ' + lm.avgWeight + ' ' + esc(unit), signedWeight(dw), phaseRateColor(dw));
+    }
+    if (tm.avgKcal != null && lm.avgKcal != null) {
+      const dk = tm.avgKcal - lm.avgKcal;
+      moRows += moRow('Avg intake', tm.avgKcal.toLocaleString() + ' vs ' + lm.avgKcal.toLocaleString() + ' kcal', signedKcal(dk), phaseDeltaColor(dk));
+    }
+    if (tm.avgProtein != null && lm.avgProtein != null) {
+      moRows += moRow('Avg protein', tm.avgProtein + ' vs ' + lm.avgProtein + ' g', signedWeight(tm.avgProtein - lm.avgProtein), C.text);
+    }
+    if (moRows) {
+      html += card('<h3 class="cardTitle" style="margin-bottom:4px">' + esc(tm.label) + ' vs ' + esc(lm.label) + '</h3>' +
+        '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:6px">' + esc(tm.label) + ' so far (' + tm.loggedDays + ' logged days, ' + tm.weighIns + ' weigh-ins) against all of ' + esc(lm.label) + ' (' + lm.loggedDays + ' and ' + lm.weighIns + ').</div>' + moRows);
+    }
+  }
+
   // -- Scale patterns: the day-of-week story --
   const pairs = consecutiveWeighInPairs(state.date, INSIGHT_PATTERN_DAYS);
   const pat = dayOfWeekScalePattern(pairs);
@@ -7961,6 +8304,45 @@ function renderInsightsSection() {
     p += '<div style="color:' + C.textMut + ';font-size:12px;margin-top:10px">⚖️ Typical day-to-day swing: ±' + swing + ' ' + esc(unit) + ' (median). A single morning inside that band is noise, not a trend.</div>';
   }
   html += card(p);
+
+  // -- Intake patterns: protein consistency, what drives the over days, weekday profile --
+  const prot = proteinConsistency(state.date, 28);
+  const driver = overDayMacroDriver(state.date, 28);
+  const profile = dayOfWeekIntakeProfile(state.date, INSIGHT_PATTERN_DAYS);
+  const profHasRows = profile.byDow.some(function(b) { return b.avgKcal != null; });
+  if (prot || driver || profHasRows) {
+    let ip = '<h3 class="cardTitle" style="margin-bottom:10px">Intake Patterns</h3>';
+    if (prot) {
+      const hitColor = prot.hitDays / prot.loggedDays >= 0.7 ? C.success : C.warning;
+      ip += '<div style="font-size:13px;color:' + C.textSec + ';margin-bottom:4px">🥩 Protein: hit your target on <b style="color:' + hitColor + '">' + prot.hitDays + ' of ' + prot.loggedDays + '</b> logged days in the last 4 weeks · avg ' + prot.avgProtein + 'g/day' + (prot.perUnit != null ? ' (' + prot.perUnit + ' g/' + (unit === "kg" ? "kg" : "lb") + ' of bodyweight)' : '') + '.</div>';
+    }
+    if (driver) {
+      ip += '<div style="font-size:13px;color:' + C.textSec + ';margin:6px 0 2px">On your ' + driver.overDays + ' over-target days (avg ' + signedKcal(driver.avgOverspend) + ' kcal), ' +
+        (driver.driver
+          ? 'the extra is mostly <b style="color:' + C.text + '">' + driver.driver + '</b>: +' + driver.deltas[driver.driver].g + 'g vs your at-or-under days (≈+' + driver.deltas[driver.driver].kcal + ' kcal).'
+          : 'the extra spreads about evenly across protein, carbs and fat.') + '</div>' +
+        '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:6px">vs at-or-under days: protein ' + signedWeight(driver.deltas.protein.g) + 'g · carbs ' + signedWeight(driver.deltas.carbs.g) + 'g · fat ' + signedWeight(driver.deltas.fat.g) + 'g</div>';
+    }
+    if (profHasRows) {
+      ip += '<div style="border-top:1px solid ' + C.border + ';padding-top:8px;margin-top:8px">' +
+        '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:4px">Average intake by weekday (last 12 weeks)</div>';
+      [1, 2, 3, 4, 5, 6, 0].forEach(function(dow) {
+        const b = profile.byDow[dow];
+        if (b.avgKcal == null) return;
+        const marked = dow === profile.maxDow || dow === profile.minDow;
+        const tag = dow === profile.maxDow ? ' <span style="color:' + C.textMut + ';font-size:10px">highest</span>'
+          : (dow === profile.minDow ? ' <span style="color:' + C.textMut + ';font-size:10px">lowest</span>' : '');
+        ip += '<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:12px">' +
+          '<span style="color:' + C.textSec + '">' + DOW_SHORT[dow] + tag + '</span>' +
+          '<span style="color:' + (marked ? C.text : C.textMut) + (marked ? ';font-weight:700' : '') + '">' + b.avgKcal.toLocaleString() + ' kcal <span style="color:' + C.textMut + ';font-weight:400">×' + b.days + '</span></span></div>';
+      });
+      if (profile.maxDow != null && profile.minDow != null && profile.maxDow !== profile.minDow) {
+        ip += '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">' + DOW_FULL[profile.maxDow] + 's run ' + (profile.byDow[profile.maxDow].avgKcal - profile.byDow[profile.minDow].avgKcal).toLocaleString() + ' kcal above ' + DOW_FULL[profile.minDow] + 's on average.</div>';
+      }
+      ip += '</div>';
+    }
+    html += card(ip);
+  }
 
   // -- Intake <-> scale: what the food log says about the moves --
   const link = intakeScaleLink(pairs);

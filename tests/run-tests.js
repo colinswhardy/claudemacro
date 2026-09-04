@@ -163,6 +163,9 @@ const exportLine =
   "intakeScaleLink: intakeScaleLink, weekendIntakeSplit: weekendIntakeSplit, " +
   "buildComputedInsightStats: buildComputedInsightStats, " +
   "INSIGHT_WEEKS: INSIGHT_WEEKS, INSIGHT_PATTERN_DAYS: INSIGHT_PATTERN_DAYS, " +
+  "paceVsPlan: paceVsPlan, weightMilestones: weightMilestones, monthlyComparison: monthlyComparison, " +
+  "plateauStatus: plateauStatus, maintenanceTrend: maintenanceTrend, proteinConsistency: proteinConsistency, " +
+  "overDayMacroDriver: overDayMacroDriver, dayOfWeekIntakeProfile: dayOfWeekIntakeProfile, " +
   "phaseCoach: phaseCoach, renderPhaseCoachCard: renderPhaseCoachCard, " +
   "phaseDeltaColor: phaseDeltaColor, phaseRateColor: phaseRateColor, " +
   "wizardSearchTerm: wizardSearchTerm, wizardSearchQuery: wizardSearchQuery, " +
@@ -4452,6 +4455,184 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     assertEqual(full.indexOf("Trending down") > -1, true, "and calls the direction");
     assertEqual(full.indexOf("most common up day") === -1, true, "an all-down month names no up day");
     M.state.ui = prevUi; M.state.foodLogs = prevLogs; M.state.weights = prevWeights; M.state.date = prevDate; M.state.targetHistory = prevTargets;
+  });
+  // Daily weigh-ins Aug 1-28 2026 declining 0.1/day: week averages 202.4 -> 200.3, so the
+  // 4-week rate is exactly -0.7/wk. Several tests below share it.
+  function decliningAugustWeights() {
+    const w = {};
+    for (let i = 0; i < 28; i++) w["2026-08-" + String(i + 1).padStart(2, "0")] = { weight: 202.7 - i * 0.1, unit: "lbs" };
+    return w;
+  }
+  test("paceVsPlan: planned vs actual pace, with an ETA at the actual pace", function () {
+    const prevW = M.state.weights, prevSet = JSON.parse(JSON.stringify(M.state.settings));
+    M.state.weights = decliningAugustWeights();
+    M.state.settings.goalWeight = 190; M.state.settings.goalRatePerWeek = "1"; M.state.settings.goalDate = "";
+    const p = M.paceVsPlan("2026-08-28");
+    assertEqual(p.planned, -1, "direction inferred from goal below current");
+    assertEqual(p.actual, -0.7, "the 4-week measured pace");
+    assertEqual(p.etaActual, "2026-12-06", "10 lbs at 0.7/wk = 100 days from the latest weigh-in");
+    M.state.settings.goalWeight = 210; // above current while the scale is falling
+    const away = M.paceVsPlan("2026-08-28");
+    assertEqual([away.awayFromGoal, away.etaActual], [true, null], "moving away from the goal: flagged, no ETA");
+    M.state.settings.goalRatePerWeek = "";
+    assertEqual(M.paceVsPlan("2026-08-28"), null, "no chosen pace, nothing to compare against");
+    M.state.weights = prevW; M.state.settings = prevSet;
+  });
+  test("weightMilestones: lowest-since, distance from peak, % to goal, best week on record", function () {
+    const prevW = M.state.weights, prevSet = JSON.parse(JSON.stringify(M.state.settings));
+    M.state.weights = {
+      "2026-03-01": { weight: 199, unit: "lbs" }, // the last time he was at-or-below today's 200
+      "2026-05-01": { weight: 210, unit: "lbs" }, // the peak
+      "2026-06-15": { weight: 205, unit: "lbs" },
+      "2026-07-20": { weight: 202, unit: "lbs" },
+      "2026-08-18": { weight: 201.5, unit: "lbs" },
+      "2026-08-27": { weight: 201, unit: "lbs" },
+      "2026-08-28": { weight: 200, unit: "lbs" },
+    };
+    M.state.settings.goalType = "cut"; M.state.settings.goalWeight = 190; M.state.settings.startWeight = 210;
+    const m = M.weightMilestones("2026-08-28");
+    assertEqual([m.beatDate, m.sinceDays], ["2026-03-01", 180], "lowest since the last at-or-below weigh-in, 180 days back");
+    assertEqual([m.extreme, m.fromExtreme], [210, -10], "down 10 from the peak");
+    assertEqual(m.pctToGoal, 50, "halfway from 210 to 190");
+    assertEqual(m.bestWeek, { start: "2026-08-22", end: "2026-08-28", change: -1 }, "biggest drop between ADJACENT weighed weeks");
+    M.state.settings.goalType = "bulk";
+    const b = M.weightMilestones("2026-08-28");
+    assertEqual([b.extreme, b.fromExtreme], [199, 1], "in a bulk the reference extreme is the trough");
+    M.state.weights = prevW; M.state.settings = prevSet;
+  });
+  test("monthlyComparison: calendar months, current month capped at the anchor day", function () {
+    const prevW = M.state.weights, prevLogs = M.state.foodLogs, prevTargets = M.state.targetHistory, prevBoosts = M.state.dayBoosts;
+    M.state.targetHistory = {}; M.state.dayBoosts = {};
+    const day = function (kcal, p) { return [{ id: "x", name: "Meal", macros: { calories: kcal, protein: p, carbs: 100, fat: 30, fiber: 5 } }]; };
+    M.state.weights = {
+      "2026-07-10": { weight: 204, unit: "lbs" }, "2026-07-20": { weight: 202, unit: "lbs" },
+      "2026-08-10": { weight: 200, unit: "lbs" },
+      "2026-08-30": { weight: 999, unit: "lbs" }, // after the anchor day: must not count
+    };
+    M.state.foodLogs = { "2026-07-05": day(2400, 150), "2026-07-06": day(2600, 170), "2026-08-05": day(2000, 180) };
+    const c = M.monthlyComparison("2026-08-28");
+    assertEqual([c.thisMonth.label, c.lastMonth.label], ["August", "July"], "named months, not day windows");
+    assertEqual([c.thisMonth.avgWeight, c.lastMonth.avgWeight], [200, 203], "the Aug 30 weigh-in is beyond the anchor and excluded");
+    assertEqual([c.thisMonth.avgKcal, c.lastMonth.avgKcal], [2000, 2500], "intake averaged over logged days only");
+    assertEqual([c.thisMonth.avgProtein, c.lastMonth.avgProtein], [180, 160], "protein too");
+    M.state.foodLogs = { "2026-08-05": day(2000, 180) };
+    M.state.weights = { "2026-08-10": { weight: 200, unit: "lbs" } };
+    assertEqual(M.monthlyComparison("2026-08-28"), null, "an empty previous month means no comparison");
+    M.state.weights = prevW; M.state.foodLogs = prevLogs; M.state.targetHistory = prevTargets; M.state.dayBoosts = prevBoosts;
+  });
+  test("plateauStatus: flat 3-week trend in a cut, with the same window's intake facts", function () {
+    const prevW = M.state.weights, prevLogs = M.state.foodLogs, prevSet = JSON.parse(JSON.stringify(M.state.settings)), prevTargets = M.state.targetHistory, prevBoosts = M.state.dayBoosts;
+    M.state.targetHistory = {}; M.state.dayBoosts = {};
+    M.state.settings.goalType = "cut"; M.state.settings.calorieTarget = 2100;
+    const w = {};
+    for (let i = 1; i <= 28; i++) w["2026-08-" + String(i).padStart(2, "0")] = { weight: 200, unit: "lbs" };
+    M.state.weights = w;
+    M.state.foodLogs = {};
+    for (let i = 10; i <= 19; i++) M.state.foodLogs["2026-08-" + i] = [{ id: "e" + i, name: "Meal", macros: { calories: 2000, protein: 150, carbs: 200, fat: 60, fiber: 20 } }];
+    const p = M.plateauStatus("2026-08-28");
+    assertEqual([p.change, p.weeks], [0, 3], "trend moved nothing in 3 weeks");
+    assertEqual([p.avgKcal, p.avgTarget, p.loggedDays], [2000, 2100, 10], "reported beside what was actually logged");
+    M.state.weights = decliningAugustWeights();
+    assertEqual(M.plateauStatus("2026-08-28"), null, "a moving trend is not a plateau");
+    M.state.weights = w;
+    M.state.settings.goalType = "maintain";
+    assertEqual(M.plateauStatus("2026-08-28"), null, "flat IS the goal in maintain -- never called a plateau");
+    M.state.weights = prevW; M.state.foodLogs = prevLogs; M.state.settings = prevSet; M.state.targetHistory = prevTargets; M.state.dayBoosts = prevBoosts;
+  });
+  test("estimateMaintenanceCalories(endDateStr) + maintenanceTrend: now vs 8 weeks ago, disjoint windows", function () {
+    const prevW = M.state.weights, prevLogs = M.state.foodLogs, prevSet = JSON.parse(JSON.stringify(M.state.settings));
+    M.state.settings.weightUnit = "lbs";
+    M.state.foodLogs = {}; M.state.weights = {};
+    // "Now" window (ends 2026-08-28): 14 complete 2,000-kcal days, 2 lbs lost over 20 days -> 2,350.
+    for (let i = 1; i <= 14; i++) M.state.foodLogs["2026-08-" + String(i).padStart(2, "0")] = [{ id: "a" + i, name: "Meal", macros: { calories: 2000, protein: 0, carbs: 0, fat: 0, fiber: 0 } }];
+    M.state.weights["2026-08-01"] = { weight: 182, unit: "lbs" };
+    M.state.weights["2026-08-21"] = { weight: 180, unit: "lbs" };
+    // "Before" window (ends 2026-07-03): 14 complete 2,200-kcal days, 2 lbs lost over 20 days -> 2,550.
+    for (let i = 10; i <= 23; i++) M.state.foodLogs["2026-06-" + i] = [{ id: "b" + i, name: "Meal", macros: { calories: 2200, protein: 0, carbs: 0, fat: 0, fiber: 0 } }];
+    M.state.weights["2026-06-10"] = { weight: 186, unit: "lbs" };
+    M.state.weights["2026-06-30"] = { weight: 184, unit: "lbs" };
+    assertEqual(M.estimateMaintenanceCalories("2026-08-28").maintenance, 2350, "windowed estimate, intake + measured deficit");
+    assertEqual(M.estimateMaintenanceCalories("2026-07-03").maintenance, 2550, "the June window sees only June data");
+    const t = M.maintenanceTrend("2026-08-28");
+    assertEqual([t.now, t.before, t.change], [2350, 2550, -200], "the drift between the two measurements");
+    M.state.weights = prevW; M.state.foodLogs = prevLogs; M.state.settings = prevSet;
+  });
+  test("proteinConsistency: hit-days scored against each day's SET protein target, boost included", function () {
+    const prevW = M.state.weights, prevLogs = M.state.foodLogs, prevTargets = M.state.targetHistory, prevBoosts = M.state.dayBoosts, prevSet = JSON.parse(JSON.stringify(M.state.settings));
+    M.state.targetHistory = {}; M.state.settings.proteinTarget = 160; M.state.settings.weightUnit = "lbs";
+    const day = function (p) { return [{ id: "x", name: "Meal", macros: { calories: 2000, protein: p, carbs: 100, fat: 30, fiber: 5 } }]; };
+    M.state.foodLogs = { "2026-08-05": day(170), "2026-08-06": day(150), "2026-08-07": day(165) };
+    M.state.dayBoosts = {};
+    M.state.weights = { "2026-08-28": { weight: 200, unit: "lbs" } };
+    const a = M.proteinConsistency("2026-08-28", 28);
+    assertEqual([a.loggedDays, a.hitDays, a.avgProtein], [3, 2, 162], "150 misses the 160 bar");
+    assertEqual(a.perUnit, 0.81, "grams per lb of current bodyweight");
+    // A -20g boost on the 6th lowers THAT day's bar to 140, so its 150 now counts as a hit.
+    M.state.dayBoosts = { "2026-08-06": { protein: -20, carbs: 0, fat: 0, updatedAt: "2026-08-06T10:00:00.000Z" } };
+    assertEqual(M.proteinConsistency("2026-08-28", 28).hitDays, 3, "scored against the day's set bar, not the base");
+    M.state.weights = prevW; M.state.foodLogs = prevLogs; M.state.targetHistory = prevTargets; M.state.dayBoosts = prevBoosts; M.state.settings = prevSet;
+  });
+  test("overDayMacroDriver: names the macro carrying the overshoot, in comparable kcal", function () {
+    const prevLogs = M.state.foodLogs, prevTargets = M.state.targetHistory, prevBoosts = M.state.dayBoosts, prevSet = JSON.parse(JSON.stringify(M.state.settings));
+    M.state.targetHistory = {}; M.state.dayBoosts = {}; M.state.settings.calorieTarget = 2000;
+    const day = function (kcal, p, c, f) { return [{ id: "x", name: "Meal", macros: { calories: kcal, protein: p, carbs: c, fat: f, fiber: 5 } }]; };
+    M.state.foodLogs = {
+      "2026-08-01": day(2600, 150, 250, 100), "2026-08-03": day(2600, 150, 250, 100), "2026-08-05": day(2600, 150, 250, 100),
+      "2026-08-02": day(1800, 150, 200, 60), "2026-08-04": day(1800, 150, 200, 60), "2026-08-06": day(1800, 150, 200, 60),
+    };
+    const d = M.overDayMacroDriver("2026-08-28", 28);
+    assertEqual([d.overDays, d.underDays, d.avgOverspend], [3, 3, 600], "the sides and the average overshoot");
+    assertEqual(d.deltas.fat, { g: 40, kcal: 360 }, "fat gap in grams and kcal");
+    assertEqual(d.deltas.carbs, { g: 50, kcal: 200 }, "carbs contribute less despite more grams -- Atwater makes them comparable");
+    assertEqual(d.driver, "fat", "so fat is the driver");
+    delete M.state.foodLogs["2026-08-05"];
+    assertEqual(M.overDayMacroDriver("2026-08-28", 28), null, "under 3 days on a side: no verdict");
+    M.state.foodLogs = prevLogs; M.state.targetHistory = prevTargets; M.state.dayBoosts = prevBoosts; M.state.settings = prevSet;
+  });
+  test("dayOfWeekIntakeProfile: per-weekday averages; an unrepeated day can't be crowned highest", function () {
+    const prevLogs = M.state.foodLogs, prevTargets = M.state.targetHistory, prevBoosts = M.state.dayBoosts;
+    M.state.targetHistory = {}; M.state.dayBoosts = {};
+    const day = function (kcal) { return [{ id: "x", name: "Meal", macros: { calories: kcal, protein: 100, carbs: 100, fat: 30, fiber: 5 } }]; };
+    M.state.foodLogs = {
+      "2026-08-03": day(2500), "2026-08-10": day(2500), "2026-08-17": day(2500), "2026-08-24": day(2500), // Mondays
+      "2026-08-04": day(1800), "2026-08-11": day(1800), // Tuesdays
+      "2026-08-05": day(2000), "2026-08-12": day(2000), // Wednesdays
+      "2026-08-06": day(2100), "2026-08-13": day(2100), // Thursdays
+      "2026-08-07": day(3000), // one lone Friday at 3,000
+    };
+    const prof = M.dayOfWeekIntakeProfile("2026-08-28", 84);
+    assertEqual([prof.byDow[1].avgKcal, prof.byDow[1].days], [2500, 4], "Monday average over its four samples");
+    assertEqual([prof.maxDow, prof.minDow], [1, 2], "Monday highest, Tuesday lowest");
+    assertEqual(prof.byDow[5].days, 1, "the 3,000-kcal Friday is present in the table...");
+    assertEqual(prof.maxDow, 1, "...but a single sample can't take the highest tag");
+    M.state.foodLogs = { "2026-08-03": day(2500), "2026-08-10": day(2500), "2026-08-04": day(1800), "2026-08-11": day(1800), "2026-08-05": day(2000), "2026-08-12": day(2000) };
+    const sparse = M.dayOfWeekIntakeProfile("2026-08-28", 84);
+    assertEqual([sparse.maxDow, sparse.minDow], [null, null], "under 4 qualified weekdays, no day is named");
+    M.state.foodLogs = prevLogs; M.state.targetHistory = prevTargets; M.state.dayBoosts = prevBoosts;
+  });
+  test("renderInsightsSection: the new cards appear with data and stay silent without it", function () {
+    const prevUi = M.state.ui, prevLogs = M.state.foodLogs, prevWeights = M.state.weights, prevDate = M.state.date, prevTargets = M.state.targetHistory, prevSet = JSON.parse(JSON.stringify(M.state.settings));
+    M.state.ui = {}; M.state.date = "2026-08-28"; M.state.targetHistory = {}; M.state.dayBoosts = {};
+    M.state.settings.claudeApiKey = "";
+    M.state.weights = {}; M.state.foodLogs = {};
+    M.state.settings.goalWeight = 190; M.state.settings.goalRatePerWeek = "1";
+    const empty = M.renderInsightsSection();
+    assertEqual(empty.indexOf("Goal Progress"), -1, "no weigh-ins: no Goal Progress frame");
+    assertEqual(empty.indexOf("Measured Maintenance"), -1, "and no maintenance card");
+    assertEqual(empty.indexOf("Intake Patterns"), -1, "and no intake patterns card");
+    M.state.weights = decliningAugustWeights();
+    M.state.weights["2026-07-10"] = { weight: 204, unit: "lbs" };
+    for (let i = 1; i <= 14; i++) M.state.foodLogs["2026-08-" + String(i).padStart(2, "0")] = [{ id: "e" + i, name: "Meal", macros: { calories: 2000, protein: 170, carbs: 200, fat: 60, fiber: 20 } }];
+    M.state.foodLogs["2026-07-05"] = [{ id: "jul", name: "Meal", macros: { calories: 2400, protein: 150, carbs: 220, fat: 80, fiber: 20 } }];
+    M.state.settings.goalType = "cut"; M.state.settings.calorieTarget = 2100; M.state.settings.proteinTarget = 160;
+    const full = M.renderInsightsSection();
+    assertEqual(full.indexOf("Goal Progress") > -1, true, "goal progress card renders");
+    assertEqual(full.indexOf("Planned pace") > -1, true, "with the pace comparison");
+    assertEqual(full.indexOf("Measured Maintenance") > -1, true, "maintenance card renders");
+    assertEqual(full.indexOf("August vs July") > -1, true, "month comparison names the months");
+    assertEqual(full.indexOf("Intake Patterns") > -1, true, "intake patterns card renders");
+    assertEqual(full.indexOf("Plateau check"), -1, "a falling trend triggers no plateau warning");
+    M.state.ui = prevUi; M.state.foodLogs = prevLogs; M.state.weights = prevWeights; M.state.date = prevDate; M.state.targetHistory = prevTargets; M.state.settings = prevSet;
   });
 
   // ==== food wizard: query building and the no-dead-end guarantee ====
