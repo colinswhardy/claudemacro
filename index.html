@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.33";
+const APP_VERSION = "1.34";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -203,7 +203,7 @@ const DEFAULT_SETTINGS = {
   goalType: "cut", // "cut" | "bulk" | "maintain"
   goalWeight: 150, goalDate: "2026-09-14", goalRatePerWeek: "",
   startWeight: null, startDate: null,
-  aiProvider: "claude-sonnet", aiEnabled: true, geminiApiKey: "", claudeApiKey: "", compareWithGemini: false,
+  aiProvider: "claude-sonnet", aiEnabled: true, geminiApiKey: "", claudeApiKey: "", compareWithGemini: false, batchAiProvider: "gemini",
   usdaApiKey: "", // personal api.data.gov key; blank = the shared, rate-limited DEMO_KEY
   macroPreset: "Custom",
   macroLocks: { protein: false, carbs: false, fat: false },
@@ -1710,7 +1710,7 @@ function showToast(message) {
 let navDepth = 0;
 function computeNavDepth() {
   const fu = state.ui.food;
-  if (state.tab === "food" && fu && (fu.scanningBarcode || fu.loggingRecipe || fu.recipeBuilder || fu.wizardType || fu.showAI || fu.manualEntry || fu.addingFood)) return 2;
+  if (state.tab === "food" && fu && (fu.scanningBarcode || fu.loggingRecipe || fu.recipeBuilder || fu.wizardType || fu.showAI || fu.manualEntry || fu.addingFood || fu.batchEntry)) return 2;
   if (state.tab !== "dashboard") return 1;
   return 0;
 }
@@ -1740,6 +1740,9 @@ function collapseOneNavLevel() {
     }
     if (fu.manualEntry) { fu.manualEntry = false; return true; }
     if (fu.addingFood) { fu.addingFood = null; return true; }
+    // Bump both seqs so an identify or row-search still in flight can't write into (or
+    // resurrect) a batch screen the user has left -- same drop-stale rule as the wizard.
+    if (fu.batchEntry) { fu.batchEntry = null; batchIdentifySeq++; batchSearchSeq++; return true; }
   }
   if (state.tab !== "dashboard") { stopBarcodeCamera(); state.tab = "dashboard"; state.ui = {}; return true; }
   return false;
@@ -3459,7 +3462,7 @@ actions.copyEntryCustomDate = function() {
 // FOOD TAB
 // ============================================================
 function foodUi() {
-  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], recipeResults: [], recipesQuery: "", searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanTarget: null, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null, editingFoodId: null, foodEditSection: "macros", foodEditBaseInput: null, foodEditNameInput: null, foodEditBrandInput: null, foodEditAnimalOverrideInput: undefined };
+  if (!state.ui.food) state.ui.food = { subTab: "search", query: "", results: [], historyResults: [], recipeResults: [], recipesQuery: "", searching: false, wizardType: null, wizardSuggestion: null, showAI: false, aiDesc: "", aiPhoto: null, aiLoading: false, aiResults: null, aiError: null, aiCompareResults: null, aiCompareError: null, addingFood: null, addWeight: "100", addServingBasis: null, addQty: "1", manualEntry: false, manual: { name:"", calories:"", protein:"", carbs:"", fat:"", fiber:"", weight:"100" }, wizard: null, scanningBarcode: false, scanTarget: null, scanManualCode: "", scanError: null, scanLoading: false, scanNotFoundCode: null, customBarcodeManual: { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" }, recipeBuilder: null, loggingRecipe: null, loggingWeight: "100", historyQuery: "", favoritesQuery: "", confirmDeleteRecipeId: null, editingFoodId: null, foodEditSection: "macros", foodEditBaseInput: null, foodEditNameInput: null, foodEditBrandInput: null, foodEditAnimalOverrideInput: undefined, batchEntry: null };
   return state.ui.food;
 }
 
@@ -3483,6 +3486,7 @@ function renderFoodTab() {
   if (fu.showAI) return renderAIScreen(fu);
   if (fu.manualEntry) return renderManualEntryScreen(fu);
   if (fu.addingFood) return renderAddingFoodScreen(fu);
+  if (fu.batchEntry) return renderBatchEntryScreen(fu);
 
   let html = '<div class="subTabs">' +
     subTabBtn("search", "Search") + subTabBtn("history", "History") + subTabBtn("favorites", "Favorites") + subTabBtn("recipes", "Recipes") +
@@ -3514,6 +3518,9 @@ function renderFoodTab() {
     html += btn({ label: "\u270F\uFE0F Manual", action: "openManualEntry", rowItem: true, outline: true });
     if (state.settings.aiEnabled) html += btn({ label: "\u{1F4F8} Photo", action: "clickPhotoInput", rowItem: true, outline: true });
     html += '</div>';
+    if (state.settings.aiEnabled) {
+      html += '<div style="margin:-8px 0 16px">' + btn({ label: "\u{1F4DD} Describe a meal in words", action: "openBatchEntry", full: true, outline: true }) + '</div>';
+    }
 
     html += '<div id="foodResultsBlock">' + renderFoodResultsBlock(fu) + '</div>';
   }
@@ -5151,6 +5158,556 @@ actions.toggleFavorite = function(foodId) {
   saveFavorites();
   rerender();
 };
+
+// ---- Batch entry: describe a whole meal in words (added 2026-09-04) ----
+// One paragraph -- "oikos yogurt, 250 grams, sourdough, 100 g, raspberries, 50 g" -- is sent
+// with a numbered index of Colin's OWN foods (History + Favorites + recipes) to the model
+// chosen by settings.batchAiProvider (Gemini by default; the toggle lives in AI Settings).
+// The model parses the items and picks matches BY INDEX NUMBER; everything else is local and
+// deterministic: numbers outside the index are dropped as hallucinations, candidates are
+// backfilled from the same local matcher the search box uses, macros are computed by
+// calcMacrosForWeight from the stored records (never from the model), and nothing is logged
+// until each row's own Add button is tapped -- the AI proposes, Colin confirms, exactly the
+// AI-estimator contract scaled up. Every row has an exit (switch chips, inline search, AI
+// estimate, Skip) -- the wizard's no-dead-end rule.
+
+let batchIdentifySeq = 0;      // drops an identify response that lands after exit/re-tap
+let batchSearchSeq = 0;        // same for the inline per-row database search
+let batchSearchDebounceTimer = null;
+
+function batchUi() {
+  return state.ui.food ? state.ui.food.batchEntry : null;
+}
+function batchProvider() {
+  return state.settings.batchAiProvider === "claude" ? "claude" : "gemini";
+}
+function batchProviderKey() {
+  return batchProvider() === "claude" ? (state.settings.claudeApiKey || "").trim() : (state.settings.geminiApiKey || "").trim();
+}
+
+// The numbered identity index the model matches against. Recipes come FIRST so the live
+// recipe wins the id-dedup against the frozen "recipe_food_<id>" snapshot a past log left in
+// History -- the same tiebreak historyExcludingRecipes applies, for the same staleness reason.
+function batchFoodIndex() {
+  const out = [];
+  const seen = new Set();
+  (state.recipes || []).forEach(function(r) {
+    const f = recipeAsFood(r);
+    if (seen.has(f.id)) return;
+    seen.add(f.id);
+    out.push({ kind: "recipe", name: r.name || "", brand: "", food: f });
+  });
+  function add(f) {
+    if (!f || !f.id || seen.has(f.id)) return;
+    seen.add(f.id);
+    out.push({ kind: "food", name: f.name || "", brand: f.brand || "", food: f });
+  }
+  state.recentFoods.forEach(add);
+  state.favorites.forEach(add);
+  return out;
+}
+
+const BATCH_IDENTIFY_PROMPT = 'You match one person’s food-diary text to their own saved foods. Parse TEXT into its individual food items, in order, then pick the best matches for each item from the numbered FOOD LIST. Return ONLY valid JSON (no markdown fences): {"items":[{"text":"the words from TEXT for this item, amount included","name":"just the food name words","grams":number or null,"count":number or null,"matches":[numbers from FOOD LIST, best first, up to 3]}]}. grams: the stated amount in grams (convert kg/oz; treat ml as grams); null when no gram amount was stated. count: a stated piece count like "2 eggs" or "3 slices" when grams is null, else null. matches: FOOD LIST numbers only — match on product identity, tolerating misspellings, word order and singular/plural; [] when nothing in the list plausibly is this item. Never invent numbers that are not in the list. Every food item in TEXT appears exactly once.';
+
+function buildBatchIdentifyPrompt(text, indexFoods) {
+  let list = "";
+  indexFoods.forEach(function(x, i) {
+    list += (i + 1) + ". " + x.name + (x.brand ? " — " + x.brand : "") + (x.kind === "recipe" ? " (your recipe)" : "") + "\n";
+  });
+  return BATCH_IDENTIFY_PROMPT + "\n\nFOOD LIST:\n" + (list || "(empty)\n") + "\nTEXT:\n" + text;
+}
+
+async function batchIdentifyWithGemini(promptText, apiKey) {
+  try {
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=" + apiKey, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ parts: [{ text: promptText }] }] }),
+    });
+    const d = await r.json();
+    if (d.error) return { error: d.error.message || "API error" };
+    const text = d.candidates && d.candidates[0] && d.candidates[0].content.parts[0].text || "";
+    return { data: JSON.parse(text.replace(/```json|```/g, "").trim()) };
+  } catch (e) { return { error: e.message }; }
+}
+async function batchIdentifyWithClaude(promptText, apiKey) {
+  try {
+    // Same model choice as the AI food estimator's Claude path.
+    const modelId = state.settings.aiProvider === "claude-sonnet" ? "claude-sonnet-5" : "claude-haiku-4-5-20251001";
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify({ model: modelId, max_tokens: 3000, messages: [{ role: "user", content: promptText }] }),
+    });
+    const d = await r.json();
+    if (d.error) return { error: d.error.message || "API error" };
+    const text = (d.content || []).map(function(i){ return i.text || ""; }).join("");
+    return { data: JSON.parse(text.replace(/```json|```/g, "").trim()) };
+  } catch (e) { return { error: e.message }; }
+}
+
+// Hard validation of the model's reply -- the only thing trusted is what survives this.
+// Match numbers resolve against indexFoods or are dropped (a hallucinated number must not
+// select anything); grams/count must be positive finite numbers; an item with no usable text
+// is dropped; an empty result is null so the caller shows an error instead of a blank screen.
+// Accepts a bare array as well as {items:[...]} -- small models get the envelope wrong.
+function normalizeBatchIdentifyResponse(raw, indexFoods) {
+  const items = raw && Array.isArray(raw.items) ? raw.items : (Array.isArray(raw) ? raw : null);
+  if (!items) return null;
+  const out = [];
+  items.forEach(function(it) {
+    if (!it || typeof it !== "object") return;
+    const phrase = String(it.text || it.name || "").trim();
+    const name = String(it.name || it.text || "").trim();
+    if (!phrase && !name) return;
+    const grams = parseFloat(it.grams);
+    const count = parseFloat(it.count);
+    const cands = [];
+    const seenIds = new Set();
+    (Array.isArray(it.matches) ? it.matches : []).forEach(function(n) {
+      const idx = parseInt(n, 10) - 1;
+      if (!(idx >= 0 && idx < indexFoods.length)) return;
+      const f = indexFoods[idx].food;
+      if (!f || seenIds.has(f.id)) return;
+      seenIds.add(f.id);
+      cands.push(f);
+    });
+    out.push({
+      phrase: phrase || name, name: name || phrase,
+      grams: grams > 0 && isFinite(grams) ? grams : null,
+      count: count > 0 && isFinite(count) ? count : null,
+      candidates: cands,
+    });
+  });
+  return out.length > 0 ? out : null;
+}
+
+// Local candidates for a parsed item, for backfilling the switch chips: the full name first,
+// then (only when that finds nothing) its longest word over 3 letters -- "oikos yogurt" is
+// not a substring of "Oikos Greek Yogurt", but "yogurt" is, and near-misses are exactly what
+// the chips are for.
+function batchLocalCandidates(name) {
+  const q = String(name || "").toLowerCase().trim();
+  if (!q) return { recipes: [], foods: [] };
+  let recipes = matchingRecipes(q);
+  let foods = localFoodMatches(q);
+  if (recipes.length === 0 && foods.length === 0) {
+    const words = q.split(/\s+/).filter(function(w){ return w.length > 3; }).sort(function(a, b){ return b.length - a.length; });
+    if (words.length > 0) { recipes = matchingRecipes(words[0]); foods = localFoodMatches(words[0]); }
+  }
+  return { recipes: recipes, foods: foods };
+}
+
+// Resolve the row's grams field from what was stated. A stated gram amount always wins; a
+// piece count uses the selected food's first serving size; otherwise the food's own base
+// portion is ASSUMED and the row is flagged for attention (gramsSource drives the flag).
+function applyBatchAmount(row, statedGrams) {
+  const food = row.candidates[row.selectedIdx] || null;
+  if (statedGrams > 0) { row.grams = String(round1(statedGrams)); row.gramsSource = "stated"; return; }
+  if (row.count > 0 && food && food.servingSizes && food.servingSizes[0] && food.servingSizes[0].grams > 0) {
+    row.grams = String(round1(row.count * food.servingSizes[0].grams));
+    row.gramsSource = "count";
+    return;
+  }
+  row.grams = food ? String(round1(foodBaseGrams(food))) : "100";
+  row.gramsSource = "assumed";
+}
+
+function buildBatchRows(parsed) {
+  return parsed.map(function(p) {
+    const cands = p.candidates.slice();
+    const seen = new Set(cands.map(function(f){ return f.id; }));
+    const local = batchLocalCandidates(p.name);
+    local.recipes.forEach(function(r) {
+      const f = recipeAsFood(r);
+      if (!seen.has(f.id)) { seen.add(f.id); cands.push(f); }
+    });
+    local.foods.forEach(function(f) {
+      if (!seen.has(f.id)) { seen.add(f.id); cands.push(f); }
+    });
+    const row = {
+      phrase: p.phrase, name: p.name, count: p.count,
+      grams: "", gramsSource: null,
+      candidates: cands.slice(0, 4), selectedIdx: 0,
+      status: "pending", addedEntryId: null, addedLabel: null, addedKcal: 0, ai: null,
+    };
+    applyBatchAmount(row, p.grams);
+    return row;
+  });
+}
+
+// Adopt a food (from a chip, the inline search, or an AI estimate) as the row's selection.
+// A stated or hand-typed amount survives the switch; an assumed or count-derived one is
+// re-derived from the new food, so switching yogurts doesn't drag the old default along.
+function batchAdoptCandidate(row, food) {
+  const existing = row.candidates.findIndex(function(f){ return f.id === food.id; });
+  if (existing >= 0) row.selectedIdx = existing;
+  else { row.candidates.unshift(food); row.selectedIdx = 0; }
+  if (row.gramsSource === "assumed" || row.gramsSource === "count" || !row.grams) applyBatchAmount(row, null);
+}
+
+actions.openBatchEntry = function() {
+  const fu = foodUi();
+  fu.batchEntry = { text: "", loading: false, error: null, items: null, search: null };
+  rerender();
+};
+actions.closeBatchEntry = function() { stepBackOneLevel(); };
+actions.batchStartOver = function() {
+  const be = batchUi();
+  if (!be) return;
+  // Back to the textarea with the text kept -- same nav depth, so no history juggling.
+  be.items = null; be.search = null; be.error = null;
+  batchIdentifySeq++; batchSearchSeq++;
+  rerender();
+};
+inputActions.batchText = function(v) {
+  const be = batchUi();
+  if (be) be.text = v;
+};
+
+actions.batchIdentify = async function() {
+  const fu = foodUi();
+  const be = fu.batchEntry;
+  if (!be || be.loading) return;
+  const text = (be.text || "").trim();
+  if (!text) { be.error = "Describe what you ate first — e.g. “oikos yogurt, 250 g, sourdough, 100 g”."; rerender(); return; }
+  const provider = batchProvider();
+  const key = batchProviderKey();
+  if (!key) { be.error = "Add your " + (provider === "claude" ? "Claude" : "Gemini") + " API key under Strategy → AI Settings first."; rerender(); return; }
+  const index = batchFoodIndex();
+  const mySeq = ++batchIdentifySeq;
+  be.loading = true; be.error = null;
+  rerender();
+  const prompt = buildBatchIdentifyPrompt(text, index);
+  const res = provider === "claude" ? await batchIdentifyWithClaude(prompt, key) : await batchIdentifyWithGemini(prompt, key);
+  if (mySeq !== batchIdentifySeq || batchUi() !== be) return; // exited or superseded: drop
+  be.loading = false;
+  if (res.error) { be.error = res.error; rerender(); return; }
+  const parsed = normalizeBatchIdentifyResponse(res.data, index);
+  if (!parsed) { be.error = "Couldn’t read the response — tap Identify to try again."; rerender(); return; }
+  be.items = buildBatchRows(parsed);
+  rerender();
+};
+
+actions.batchSelectCandidate = function(idxStr, candStr) {
+  const be = batchUi();
+  if (!be || !be.items) return;
+  const row = be.items[parseInt(idxStr, 10)];
+  if (!row || row.status !== "pending") return;
+  const ci = parseInt(candStr, 10);
+  if (!(ci >= 0 && ci < row.candidates.length)) return;
+  row.selectedIdx = ci;
+  if (row.gramsSource === "assumed" || row.gramsSource === "count") applyBatchAmount(row, null);
+  rerender();
+};
+
+inputActions.batchRowGrams = function(v, el) {
+  const be = batchUi();
+  if (!be || !be.items) return;
+  const idx = el.getAttribute("data-arg");
+  const row = be.items[parseInt(idx, 10)];
+  if (!row) return;
+  row.grams = v;
+  row.gramsSource = "user";
+  const food = row.candidates[row.selectedIdx];
+  if (food) patchMacroPreview("batchRow" + idx, food, parseFloat(v) || 0);
+};
+
+actions.batchAddItem = function(idxStr) {
+  const be = batchUi();
+  if (!be || !be.items) return;
+  const row = be.items[parseInt(idxStr, 10)];
+  if (!row || row.status !== "pending") return;
+  const food = row.candidates[row.selectedIdx];
+  if (!food) return;
+  const now = Date.now();
+  if (row._addLock && now - row._addLock < 600) return;
+  row._addLock = now;
+  const w = positiveGramsOr(row.grams, 0);
+  if (!w) { showToast("Enter a weight for “" + row.name + "” first"); return; }
+  const m = calcMacrosForWeight(food, w);
+  // anchorFoodBase BEFORE loggedWeight is overwritten -- the same clone-site rule as
+  // confirmAddFood, for the same compounding-rescale reason.
+  addFoodToLog(Object.assign({}, anchorFoodBase(food), { loggedWeight: w, loggedMacros: m, timestamp: new Date().toISOString() }));
+  const entries = state.foodLogs[state.date] || [];
+  const entry = entries[entries.length - 1];
+  row.status = "added";
+  row.addedEntryId = entry ? entry.id : null;
+  row.addedLabel = round1(w) + "g — " + m.calories + " kcal";
+  row.addedKcal = m.calories;
+  rerender();
+};
+
+actions.batchSkipItem = function(idxStr) {
+  const be = batchUi();
+  if (!be || !be.items) return;
+  const row = be.items[parseInt(idxStr, 10)];
+  if (!row || row.status !== "pending") return;
+  row.status = "skipped";
+  rerender();
+};
+
+actions.batchUndoItem = function(idxStr) {
+  const be = batchUi();
+  if (!be || !be.items) return;
+  const row = be.items[parseInt(idxStr, 10)];
+  if (!row || row.status === "pending") return;
+  if (row.status === "added" && row.addedEntryId) removeFoodFromLog(row.addedEntryId);
+  row.status = "pending";
+  row.addedEntryId = null; row.addedLabel = null; row.addedKcal = 0;
+  row._addLock = 0; // an undo is explicit intent -- don't make the re-Add wait out the lock
+  rerender();
+};
+
+// -- Inline per-row search (one open at a time, owned by be.search.rowIdx) --
+actions.batchRowSearch = function(idxStr) {
+  const be = batchUi();
+  if (!be || !be.items) return;
+  const idx = parseInt(idxStr, 10);
+  const row = be.items[idx];
+  if (!row || row.status !== "pending") return;
+  be.search = { rowIdx: idx, query: row.name || "", results: [], historyResults: [], recipeResults: [], searching: false };
+  rerender();
+  runBatchRowSearch(); // fire immediately with the prefilled name
+};
+actions.batchCloseSearch = function() {
+  const be = batchUi();
+  if (!be) return;
+  clearTimeout(batchSearchDebounceTimer);
+  be.search = null;
+  rerender();
+};
+async function runBatchRowSearch() {
+  const be = batchUi();
+  if (!be || !be.search) return;
+  const s = be.search;
+  const q = (s.query || "").trim();
+  const mySeq = ++batchSearchSeq;
+  const qLower = q.toLowerCase();
+  s.recipeResults = q ? matchingRecipes(qLower) : [];
+  s.historyResults = q ? historyExcludingRecipes(s.recipeResults, localFoodMatches(qLower)) : [];
+  s.results = [];
+  if (q.length < 3) { s.searching = false; patchBatchSearchBlock(); return; } // spare the USDA key, same rule as the search box
+  s.searching = true;
+  patchBatchSearchBlock();
+  const usdaP = searchUSDA(q), offP = searchOpenFoodFacts(q);
+  const usda = await usdaP, off = await offP;
+  if (mySeq !== batchSearchSeq || batchUi() !== be || be.search !== s) return; // stale or closed: drop
+  s.results = dbResultsExcludingHistory(s.historyResults, usda.concat(off));
+  s.searching = false;
+  patchBatchSearchBlock();
+}
+inputActions.batchSearchQuery = function(v) {
+  const be = batchUi();
+  if (!be || !be.search) return;
+  const s = be.search;
+  s.query = v;
+  const q = v.trim();
+  clearTimeout(batchSearchDebounceTimer);
+  const qLower = q.toLowerCase();
+  s.recipeResults = q ? matchingRecipes(qLower) : [];
+  s.historyResults = q ? historyExcludingRecipes(s.recipeResults, localFoodMatches(qLower)) : [];
+  if (q.length >= 3) {
+    batchSearchDebounceTimer = setTimeout(function(){ runBatchRowSearch(); }, 450);
+  } else {
+    s.results = []; s.searching = false;
+  }
+  patchBatchSearchBlock(); // direct patch, never rerender -- the keystroke rule
+};
+function renderBatchSearchResults(s) {
+  return renderFoodResultGroups({
+    recipes: s.recipeResults, history: s.historyResults, dbResults: s.results,
+    searching: s.searching, query: s.query,
+    action: "batchPickSearchFood", recipeAction: "batchPickSearchRecipe",
+    emptyText: "No matches — try different words, or ✨ Estimate this row instead.",
+  });
+}
+function patchBatchSearchBlock() {
+  const el = document.getElementById("batchSearchResultsBlock");
+  const be = batchUi();
+  if (el && be && be.search) el.innerHTML = renderBatchSearchResults(be.search);
+}
+actions.batchPickSearchFood = function(foodId) {
+  const be = batchUi();
+  if (!be || !be.search || !be.items) return;
+  const row = be.items[be.search.rowIdx];
+  if (!row) return;
+  const s = be.search;
+  // Same defensive resolution order as selectFoodForAdd -- the tapped row can originate from
+  // any of the lists that feed the groups.
+  const food = (s.historyResults || []).find(function(f){ return f.id === foodId; })
+    || (s.results || []).find(function(f){ return f.id === foodId; })
+    || state.recentFoods.find(function(f){ return f.id === foodId; })
+    || state.favorites.find(function(f){ return f.id === foodId; })
+    || state.foodCache[foodId] || null;
+  if (!food) return;
+  batchAdoptCandidate(row, food);
+  clearTimeout(batchSearchDebounceTimer);
+  be.search = null;
+  rerender();
+};
+actions.batchPickSearchRecipe = function(recipeId) {
+  const be = batchUi();
+  if (!be || !be.search || !be.items) return;
+  const row = be.items[be.search.rowIdx];
+  if (!row) return;
+  const recipe = (state.recipes || []).find(function(r){ return r.id === recipeId; });
+  if (!recipe) return;
+  batchAdoptCandidate(row, recipeAsFood(recipe));
+  clearTimeout(batchSearchDebounceTimer);
+  be.search = null;
+  rerender();
+};
+
+// -- Inline per-row AI estimate: for the item that matches nothing anywhere --
+actions.batchRowAi = async function(idxStr) {
+  const be = batchUi();
+  if (!be || !be.items) return;
+  const idx = parseInt(idxStr, 10);
+  const row = be.items[idx];
+  if (!row || row.status !== "pending" || (row.ai && row.ai.loading)) return;
+  const provider = batchProvider();
+  const key = batchProviderKey();
+  if (!key) { row.ai = { loading: false, error: "Add your " + (provider === "claude" ? "Claude" : "Gemini") + " API key under Strategy → AI Settings first." }; rerender(); return; }
+  row.ai = { loading: true, error: null };
+  rerender();
+  const desc = row.phrase || row.name;
+  const res = provider === "claude"
+    ? await estimateWithClaude(desc, null, state.settings.aiProvider, key)
+    : await estimateWithGemini(desc, key);
+  const beNow = batchUi();
+  if (!beNow || !beNow.items || beNow.items[idx] !== row) return; // screen left or reset: drop
+  if (res.error) { row.ai = { loading: false, error: res.error }; rerender(); return; }
+  const items = Array.isArray(res.data) ? res.data : [];
+  if (items.length === 0) { row.ai = { loading: false, error: "No estimate came back — try Search instead." }; rerender(); return; }
+  let it;
+  if (items.length === 1) it = items[0];
+  else {
+    // A phrase like "yogurt with granola" can come back as parts; log it as one combined food,
+    // the same shape addAiResultsCombined produces.
+    const totals = sumAiItems(items);
+    it = { name: row.name || desc, calories: Math.round(totals.calories), protein: round1(totals.protein),
+      carbs: round1(totals.carbs), fat: round1(totals.fat), fiber: round1(totals.fiber), quantity_grams: totals.weight };
+  }
+  const grams = aiItemGrams(it);
+  batchAdoptCandidate(row, {
+    id: "ai_" + Date.now() + "_batch" + idx, name: it.name, source: "AI Estimate", per100g: false,
+    calories: it.calories, protein: it.protein, carbs: it.carbs, fat: it.fat, fiber: it.fiber || 0,
+    state: "—", loggedWeight: grams, baseGrams: grams,
+  });
+  row.ai = null;
+  rerender();
+};
+
+function batchTruncate(s, n) {
+  s = String(s || "");
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+function renderBatchRow(row, i, be) {
+  let inner = '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:6px">“' + esc(row.phrase) + '”</div>';
+  if (row.status === "added") {
+    const food = row.candidates[row.selectedIdx];
+    return card(inner +
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px">' +
+        '<div style="min-width:0"><span style="color:' + C.success + '">✓</span> <span style="color:' + C.text + ';font-weight:600;font-size:14px">' + esc(food ? food.name : row.name) + '</span>' +
+        '<div style="color:' + C.textMut + ';font-size:12px">' + esc(row.addedLabel || "") + '</div></div>' +
+        btn({ label: "Undo", action: "batchUndoItem", arg: String(i), small: true, outline: true }) +
+      '</div>');
+  }
+  if (row.status === "skipped") {
+    return card(inner +
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px">' +
+        '<span style="color:' + C.textMut + ';font-size:13px">Skipped</span>' +
+        btn({ label: "Undo", action: "batchUndoItem", arg: String(i), small: true, outline: true }) +
+      '</div>');
+  }
+  const food = row.candidates[row.selectedIdx] || null;
+  if (food) {
+    const m = calcMacrosForWeight(food, parseFloat(row.grams) || 0);
+    inner += '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">' +
+      '<div style="flex:1;min-width:0">' +
+        '<div style="color:' + C.text + ';font-weight:600;font-size:15px">' + esc(food.name) + '</div>' +
+        (food.brand ? '<div style="color:' + C.textMut + ';font-size:12px">' + esc(food.brand) + '</div>' : '') +
+        '<div class="rowWrap" style="margin-top:4px">' + badge(food.source) + '</div>' +
+      '</div>' +
+      '<div style="text-align:right"><div id="batchRow' + i + 'Cal" style="color:' + C.calories + ';font-weight:800;font-size:20px">' + m.calories + '</div><div style="color:' + C.textMut + ';font-size:11px">kcal</div></div>' +
+    '</div>';
+    inner += '<div style="display:flex;gap:12px;font-size:12px;margin-bottom:10px">' +
+      '<span style="color:' + C.protein + '">P: <span id="batchRow' + i + 'Pro">' + m.protein + 'g</span></span>' +
+      '<span style="color:' + C.carbs + '">C: <span id="batchRow' + i + 'Carb">' + m.carbs + 'g</span></span>' +
+      '<span style="color:' + C.fat + '">F: <span id="batchRow' + i + 'Fat">' + m.fat + 'g</span></span>' +
+    '</div>';
+    inner += '<div class="row" style="align-items:center;margin-bottom:10px">' +
+      '<input class="input" type="number" id="batchRowGrams' + i + '" value="' + esc_attr(row.grams) + '" data-bind="batchRowGrams" data-arg="' + i + '" style="width:90px">' +
+      '<span style="color:' + C.textMut + ';font-size:13px;align-self:center">g' +
+        (row.gramsSource === "assumed" ? ' <span style="color:' + C.warning + '">· no amount stated — check this</span>' :
+         row.gramsSource === "count" ? ' · from “× ' + row.count + '”' : '') +
+      '</span>' +
+    '</div>';
+  } else {
+    inner += '<div style="color:' + C.warning + ';font-size:13px;margin-bottom:10px">No match found in your foods — search the databases or get an estimate.</div>';
+  }
+  inner += '<div class="rowWrap" style="margin-bottom:10px">';
+  row.candidates.forEach(function(f, ci) {
+    if (ci === row.selectedIdx) return;
+    inner += '<button class="chip" data-action="batchSelectCandidate" data-arg="' + i + '" data-arg2="' + ci + '">↷ ' + esc(batchTruncate(f.name, 24)) + '</button>';
+  });
+  inner += '<button class="chip" data-action="batchRowSearch" data-arg="' + i + '">🔍 Search</button>';
+  inner += '<button class="chip" data-action="batchRowAi" data-arg="' + i + '">✨ Estimate</button>';
+  inner += '</div>';
+  if (row.ai && row.ai.loading) inner += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:8px">Estimating…</div>';
+  if (row.ai && row.ai.error) inner += '<div style="color:' + C.danger + ';font-size:12px;margin-bottom:8px">' + esc(row.ai.error) + '</div>';
+  if (be.search && be.search.rowIdx === i) {
+    inner += '<div style="border-top:1px solid ' + C.border + ';padding-top:10px;margin-bottom:10px">' +
+      '<div class="row" style="margin-bottom:8px">' +
+        '<input class="input" id="batchSearchInput" value="' + esc_attr(be.search.query) + '" data-bind="batchSearchQuery" placeholder="Search your foods & databases…" style="flex:1">' +
+        btn({ label: "✕", action: "batchCloseSearch", small: true, outline: true }) +
+      '</div>' +
+      '<div id="batchSearchResultsBlock">' + renderBatchSearchResults(be.search) + '</div>' +
+    '</div>';
+  }
+  inner += '<div class="row">' +
+    btn({ label: "Skip", action: "batchSkipItem", arg: String(i), outline: true, small: true, extraStyle: "flex:1" }) +
+    (food ? btn({ label: "＋ Add", action: "batchAddItem", arg: String(i), small: true, extraStyle: "flex:2" }) : '') +
+  '</div>';
+  return card(inner);
+}
+
+function renderBatchEntryScreen(fu) {
+  const be = fu.batchEntry;
+  const providerName = batchProvider() === "claude" ? "Claude" : "Gemini";
+  if (!be.items) {
+    return card(
+      '<h3 class="cardTitle" style="margin-bottom:4px">\u{1F4DD} Describe a Meal</h3>' +
+      '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:12px">Type or dictate everything in one go — “oikos yogurt, 250 grams, sourdough, 100 g, raspberries, 50 g, butter, 5 g”. ' + providerName + ' matches each item against your own foods and recipes; you confirm every line before anything is logged. Your food names are sent to ' + providerName + ' using your own key.</div>' +
+      '<textarea class="input" id="batchTextInput" rows="5" data-bind="batchText" placeholder="oikos yogurt, 250 grams, sourdough, 100 grams…" style="resize:vertical;min-height:96px;width:100%">' + esc(be.text || "") + '</textarea>' +
+      (be.error ? '<div style="margin-top:10px;padding:10px 12px;background:' + C.danger + '15;border-radius:8px;color:' + C.danger + ';font-size:12px">' + esc(be.error) + '</div>' : '') +
+      '<div class="row" style="margin-top:12px">' +
+        btn({ label: "Cancel", action: "closeBatchEntry", outline: true, extraStyle: "flex:1", disabled: be.loading }) +
+        btn({ label: be.loading ? "Identifying…" : "Identify Items", action: "batchIdentify", extraStyle: "flex:2", disabled: be.loading }) +
+      '</div>'
+    );
+  }
+  const total = be.items.length;
+  const added = be.items.filter(function(r){ return r.status === "added"; });
+  const pending = be.items.filter(function(r){ return r.status === "pending"; }).length;
+  const kcalSum = added.reduce(function(a, r){ return a + (r.addedKcal || 0); }, 0);
+  let html = card(
+    '<div style="display:flex;justify-content:space-between;align-items:center">' +
+      '<div><h3 class="cardTitle" style="margin:0">\u{1F4DD} Review &amp; Add</h3>' +
+      '<div style="color:' + C.textMut + ';font-size:12px;margin-top:4px">' + total + ' item' + (total === 1 ? "" : "s") + ' · ' + added.length + ' added (' + Math.round(kcalSum).toLocaleString() + ' kcal)' + (pending > 0 ? ' · ' + pending + ' to review' : '') + '</div></div>' +
+      btn({ label: "Start over", action: "batchStartOver", small: true, outline: true }) +
+    '</div>'
+  );
+  be.items.forEach(function(row, i) { html += renderBatchRow(row, i, be); });
+  html += '<div style="margin-top:4px">' + btn({ label: pending > 0 ? "Done (leave the rest)" : "Done", action: "closeBatchEntry", full: true }) + '</div>';
+  return html;
+}
 
 // ---- Manual entry ----
 function renderManualEntryScreen(fu) {
@@ -7562,6 +8119,7 @@ function renderAISection() {
     html += '</div></div>';
 
     const isClaudePrimary = set.aiProvider === "claude-haiku" || set.aiProvider === "claude-sonnet";
+    const batchIsClaude = (set.batchAiProvider || "gemini") === "claude";
 
     if (isClaudePrimary) {
       html += '<div style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:' + C.inputBg + ';border-radius:10px;border:1px solid ' + C.border + '">' +
@@ -7570,11 +8128,22 @@ function renderAISection() {
       '</div>';
     }
 
-    if (isClaudePrimary) {
+    html += '<div style="margin-bottom:16px"><label class="label" style="margin-bottom:8px">“Describe a Meal” Provider</label>' +
+      '<div class="row">' +
+      [["gemini", "Gemini"], ["claude", "Claude"]].map(function(o) {
+        const active = (set.batchAiProvider || "gemini") === o[0];
+        return '<button class="chip' + (active ? ' active' : '') + '" data-action="setBatchAiProvider" data-arg="' + o[0] + '" style="flex:1;text-align:center">' + o[1] + '</button>';
+      }).join('') +
+      '</div>' +
+      '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">Which model identifies the items when you describe a whole meal in words on the Food tab.</div></div>';
+
+    // A key field renders whenever ANY enabled feature needs that key -- the estimator's
+    // provider choice, the Gemini comparison, or the describe-a-meal provider above.
+    if (isClaudePrimary || batchIsClaude) {
       html += '<div style="margin-bottom:16px"><label class="label">Claude API Key</label>' + textInput({ value: set.claudeApiKey || "", type: "password", bind: "claudeApiKey", placeholder: "sk-ant-..." }) +
         '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">Get a key at console.anthropic.com. Stored only on this device.</div></div>';
     }
-    if (set.aiProvider === "gemini" || (isClaudePrimary && set.compareWithGemini)) {
+    if (set.aiProvider === "gemini" || (isClaudePrimary && set.compareWithGemini) || !batchIsClaude) {
       html += '<div><label class="label">Gemini API Key</label>' + textInput({ value: set.geminiApiKey || "", type: "password", bind: "geminiApiKey", placeholder: "Enter your Google AI Studio API key" }) +
         '<div style="color:' + C.textMut + ';font-size:11px;margin-top:4px">Get a free key at ai.google.dev' + (isClaudePrimary && set.compareWithGemini ? " — needed for the Gemini comparison" : "") + '</div></div>';
     }
@@ -7589,6 +8158,7 @@ function renderAISection() {
 actions.toggleAiEnabled = function() { state.settings.aiEnabled = !state.settings.aiEnabled; saveSettings(); rerender(); };
 actions.toggleCompareGemini = function() { state.settings.compareWithGemini = !state.settings.compareWithGemini; saveSettings(); rerender(); };
 actions.setAiProvider = function(p) { state.settings.aiProvider = p; saveSettings(); rerender(); };
+actions.setBatchAiProvider = function(p) { state.settings.batchAiProvider = p === "claude" ? "claude" : "gemini"; saveSettings(); rerender(); };
 inputActions.claudeApiKey = function(v) { state.settings.claudeApiKey = v; saveSettings(); };
 inputActions.geminiApiKey = function(v) { state.settings.geminiApiKey = v; saveSettings(); };
 inputActions.usdaApiKey = function(v) { state.settings.usdaApiKey = v.trim(); saveSettings(); };

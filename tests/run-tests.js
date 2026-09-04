@@ -166,6 +166,11 @@ const exportLine =
   "paceVsPlan: paceVsPlan, weightMilestones: weightMilestones, monthlyComparison: monthlyComparison, " +
   "plateauStatus: plateauStatus, maintenanceTrend: maintenanceTrend, proteinConsistency: proteinConsistency, " +
   "overDayMacroDriver: overDayMacroDriver, dayOfWeekIntakeProfile: dayOfWeekIntakeProfile, " +
+  "batchFoodIndex: batchFoodIndex, buildBatchIdentifyPrompt: buildBatchIdentifyPrompt, " +
+  "normalizeBatchIdentifyResponse: normalizeBatchIdentifyResponse, batchLocalCandidates: batchLocalCandidates, " +
+  "buildBatchRows: buildBatchRows, applyBatchAmount: applyBatchAmount, batchAdoptCandidate: batchAdoptCandidate, " +
+  "renderBatchEntryScreen: renderBatchEntryScreen, renderBatchRow: renderBatchRow, renderFoodTab: renderFoodTab, " +
+  "BATCH_IDENTIFY_PROMPT: BATCH_IDENTIFY_PROMPT, renderAISection: renderAISection, " +
   "phaseCoach: phaseCoach, renderPhaseCoachCard: renderPhaseCoachCard, " +
   "phaseDeltaColor: phaseDeltaColor, phaseRateColor: phaseRateColor, " +
   "wizardSearchTerm: wizardSearchTerm, wizardSearchQuery: wizardSearchQuery, " +
@@ -2252,6 +2257,25 @@ const FOOD_CREATION_PATHS = [
       M.actions.confirmAddFood();
     },
   },
+  {
+    name: "Describe-a-meal review row (batchAddItem)",
+    covers: ["batchAddItem"],
+    run: function (fu) {
+      fu.batchEntry = {
+        text: "leftover chili, 250 g", loading: false, error: null, search: null,
+        items: [{
+          phrase: "leftover chili, 250 g", name: "leftover chili", count: null,
+          grams: "250", gramsSource: "stated",
+          // Deliberately the legacy record shape (no servingSizes, no baseGrams) --
+          // anchorFoodBase inside batchAddItem is what has to save it, same as confirmAddFood.
+          candidates: [{ id: "ai_batch_fix", name: "Leftover Chili", source: "AI Estimate", per100g: false,
+            calories: 500, protein: 30, carbs: 40, fat: 22, fiber: 5, loggedWeight: 400 }],
+          selectedIdx: 0, status: "pending", addedEntryId: null, addedLabel: null, addedKcal: 0, ai: null,
+        }],
+      };
+      M.actions.batchAddItem("0");
+    },
+  },
 ];
 
 FOOD_CREATION_PATHS.forEach(function (path) {
@@ -4271,7 +4295,7 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
   await atest("generateInsights: refuses without an API key, sets the error state, sends nothing", async function () {
     const prevUi = M.state.ui;
     let fetched = false;
-    sandbox.fetch = function () { fetched = true; return Promise.reject(new Error("should not be called")); };
+    sandbox.fetch = function (url) { fetched = true; console.error("STRAY FETCH: " + url); return Promise.reject(new Error("should not be called")); };
     M.state.ui = {};
     M.state.settings.claudeApiKey = "";
     await M.actions.generateInsights();
@@ -4633,6 +4657,188 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     assertEqual(full.indexOf("Intake Patterns") > -1, true, "intake patterns card renders");
     assertEqual(full.indexOf("Plateau check"), -1, "a falling trend triggers no plateau warning");
     M.state.ui = prevUi; M.state.foodLogs = prevLogs; M.state.weights = prevWeights; M.state.date = prevDate; M.state.targetHistory = prevTargets; M.state.settings = prevSet;
+  });
+
+  // ==== batch entry: describe a meal in words ====
+  test("normalizeBatchIdentifyResponse: maps index numbers to foods, drops hallucinated ones", function () {
+    const index = [
+      { kind: "food", name: "Oikos Greek Yogurt", brand: "Danone", food: { id: "a", name: "Oikos Greek Yogurt" } },
+      { kind: "food", name: "Kirstens Sourdough", brand: "", food: { id: "b", name: "Kirstens Sourdough" } },
+    ];
+    const out = M.normalizeBatchIdentifyResponse({ items: [
+      { text: "oikos yogurt, 250 grams", name: "oikos yogurt", grams: "250", count: null, matches: [1, 99, 1] },
+      { text: "2 eggs", name: "eggs", grams: null, count: 2, matches: [] },
+      null,
+      { text: "", name: "" },
+    ] }, index);
+    assertEqual(out.length, 2, "junk items dropped, real ones kept");
+    assertEqual(out[0].grams, 250, "string grams parsed to a number");
+    assertEqual(out[0].candidates.map(function (f) { return f.id; }), ["a"], "99 is hallucinated and the repeat of 1 deduped");
+    assertEqual(out[1].count, 2, "piece count carried when no grams were stated");
+    assertEqual(M.normalizeBatchIdentifyResponse({ nope: true }, index), null, "a garbage envelope is null, not a blank screen");
+    assertEqual(M.normalizeBatchIdentifyResponse([{ text: "sourdough", name: "sourdough", grams: 100, matches: [2] }], index)[0].candidates[0].id, "b",
+      "a bare array (no items envelope) is accepted -- small models get the envelope wrong");
+  });
+  test("buildBatchRows: local backfill finds 'Oikos Greek Yogurt' from 'oikos yogurt' via its longest word", function () {
+    resetForPathTest();
+    M.state.recentFoods = [{ id: "yog", name: "Oikos Greek Yogurt", brand: "Danone", per100g: true, calories: 61, protein: 10, carbs: 3, fat: 0 }];
+    const rows = M.buildBatchRows([{ phrase: "oikos yogurt, 250 g", name: "oikos yogurt", grams: 250, count: null, candidates: [] }]);
+    assertEqual(rows[0].candidates.map(function (f) { return f.id; }), ["yog"],
+      "full-phrase substring fails ('oikos yogurt' is not inside 'Oikos Greek Yogurt'), the longest-word fallback finds it");
+    assertEqual([rows[0].grams, rows[0].gramsSource], ["250", "stated"], "a stated gram amount always wins");
+  });
+  test("buildBatchRows: piece counts use the serving size; no amount at all is assumed and flagged", function () {
+    resetForPathTest();
+    const rows = M.buildBatchRows([
+      { phrase: "2 eggs", name: "eggs", grams: null, count: 2,
+        candidates: [{ id: "egg", name: "Egg", per100g: false, calories: 78, protein: 6, carbs: 0.6, fat: 5, servingSizes: [{ label: "1 egg", grams: 50 }] }] },
+      { phrase: "butter", name: "butter", grams: null, count: null,
+        candidates: [{ id: "but", name: "Butter", per100g: true, calories: 717, protein: 0.9, carbs: 0.1, fat: 81 }] },
+    ]);
+    assertEqual([rows[0].grams, rows[0].gramsSource], ["100", "count"], "2 x the 50g serving");
+    assertEqual([rows[1].grams, rows[1].gramsSource], ["100", "assumed"], "no amount: the food's own base, flagged for attention");
+  });
+  test("batchFoodIndex: recipes lead and dedupe their frozen History snapshot", function () {
+    resetForPathTest();
+    M.state.recipes = [{ id: "rc", name: "Chili", ingredients: [{ id: "i", name: "Beef", weight: 100, calories: 250, protein: 20, carbs: 0, fat: 18, fiber: 0 }] }];
+    M.state.recentFoods = [
+      { id: "recipe_food_rc", name: "Chili", source: "Recipe", per100g: false, calories: 999, loggedWeight: 100 }, // stale snapshot from an old log
+      { id: "x", name: "Rice", per100g: true, calories: 130, protein: 2.7, carbs: 28, fat: 0.3 },
+    ];
+    const idx = M.batchFoodIndex();
+    assertEqual(idx.length, 2, "the snapshot deduped against the live recipe");
+    assertEqual([idx[0].kind, idx[0].food.calories], ["recipe", 250], "the LIVE recipe wins, not the stale 999-kcal snapshot");
+    assertEqual(idx[1].food.id, "x", "plain history food follows");
+    const prompt = M.buildBatchIdentifyPrompt("chili, 300 g", idx);
+    assertEqual(prompt.indexOf("1. Chili (your recipe)") > -1, true, "the numbered list marks recipes");
+    assertEqual(prompt.indexOf("TEXT:\nchili, 300 g") > -1, true, "the paragraph rides at the end");
+  });
+  test("batch actions: candidate switch, add, and undo behave", function () {
+    const fu = resetForPathTest();
+    const a = { id: "fa", name: "Yogurt A", per100g: true, calories: 60, protein: 10, carbs: 3, fat: 0 };
+    const b = { id: "fb", name: "Yogurt B", per100g: false, calories: 100, protein: 8, carbs: 5, fat: 3, servingSizes: [{ label: "1 pot", grams: 175 }] };
+    const row = function (grams, source) {
+      return { phrase: "yogurt", name: "yogurt", count: null, grams: grams, gramsSource: source,
+        candidates: [a, b], selectedIdx: 0, status: "pending", addedEntryId: null, addedLabel: null, addedKcal: 0, ai: null };
+    };
+    fu.batchEntry = { text: "", loading: false, error: null, search: null, items: [row("250", "stated"), row("100", "assumed")] };
+    M.actions.batchSelectCandidate("0", "1");
+    assertEqual([fu.batchEntry.items[0].selectedIdx, fu.batchEntry.items[0].grams], [1, "250"], "a stated amount survives switching foods");
+    M.actions.batchSelectCandidate("1", "1");
+    assertEqual(fu.batchEntry.items[1].grams, "175", "an assumed amount re-derives from the new food's own base");
+    M.actions.batchAddItem("0");
+    const entries = M.state.foodLogs[M.state.date] || [];
+    assertEqual(entries.length, 1, "Add logged exactly one entry");
+    assertEqual(entries[0].macros.calories, 143, "250g of Yogurt B: 100 kcal per 175g pot -> 143");
+    assertEqual(fu.batchEntry.items[0].status, "added", "row marked added");
+    M.actions.batchUndoItem("0");
+    assertEqual((M.state.foodLogs[M.state.date] || []).length, 0, "undo removed the logged entry");
+    assertEqual(fu.batchEntry.items[0].status, "pending", "and the row is reviewable again");
+    fu.batchEntry.items[1].grams = "";
+    M.actions.batchAddItem("1");
+    assertEqual((M.state.foodLogs[M.state.date] || []).length, 0, "a blank weight refuses to log rather than logging 0g");
+    assertEqual(fu.batchEntry.items[1].status, "pending", "and the row stays pending");
+  });
+  await atest("batchIdentify: refuses without a key for the CHOSEN provider, sends nothing", async function () {
+    M.state.ui = {}; M.state.tab = "food";
+    const fu = M.foodUi();
+    M.state.settings.batchAiProvider = "gemini";
+    M.state.settings.geminiApiKey = "";
+    // Collect URLs rather than a boolean: an unrelated background request (e.g. the pending
+    // cloud DELETE from an earlier test's undo) can legitimately land while this spy is armed.
+    // The claim under test is only that no AI request went out.
+    const fetchedUrls = [];
+    sandbox.fetch = function (url) { fetchedUrls.push(String(url)); return Promise.reject(new Error("should not be called")); };
+    M.actions.openBatchEntry();
+    fu.batchEntry.text = "rice, 100 g";
+    await M.actions.batchIdentify();
+    assertEqual(typeof fu.batchEntry.error, "string", "a visible error, not a silent no-op");
+    assertEqual(fu.batchEntry.error.indexOf("Gemini") > -1, true, "naming the provider whose key is missing");
+    assertEqual(fetchedUrls.filter(function (u) { return u.indexOf("generativelanguage") > -1 || u.indexOf("anthropic") > -1; }), [],
+      "and no AI request went out");
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+  });
+  await atest("batchIdentify: happy path builds review rows from the model's numbered matches", async function () {
+    M.state.ui = {}; M.state.tab = "food";
+    const fu = M.foodUi();
+    resetForPathTest();
+    M.state.tab = "food";
+    const fu2 = M.foodUi();
+    M.state.settings.batchAiProvider = "gemini";
+    M.state.settings.geminiApiKey = "k";
+    M.state.recentFoods = [{ id: "yog", name: "Oikos Greek Yogurt", brand: "Danone", per100g: true, calories: 61, protein: 10, carbs: 3, fat: 0 }];
+    sandbox.fetch = function () {
+      return Promise.resolve({ json: function () { return Promise.resolve({ candidates: [{ content: { parts: [{
+        text: '```json\n{"items":[{"text":"oikos yogurt, 250 grams","name":"oikos yogurt","grams":250,"count":null,"matches":[1]}]}\n```' }] } }] }); } });
+    };
+    M.actions.openBatchEntry();
+    fu2.batchEntry.text = "oikos yogurt, 250 grams";
+    await M.actions.batchIdentify();
+    assertEqual(fu2.batchEntry.items.length, 1, "one review row");
+    assertEqual(fu2.batchEntry.items[0].candidates[0].id, "yog", "matched by index number against his own foods");
+    assertEqual(fu2.batchEntry.items[0].grams, "250", "amount prefilled from the stated grams");
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+  });
+  await atest("batchIdentify: a response that lands after the screen was left is dropped", async function () {
+    M.state.ui = {}; M.state.tab = "food";
+    const fu = M.foodUi();
+    M.state.settings.batchAiProvider = "gemini";
+    M.state.settings.geminiApiKey = "k";
+    let resolveFetch;
+    sandbox.fetch = function () { return new Promise(function (res) { resolveFetch = res; }); };
+    M.actions.openBatchEntry();
+    const be = fu.batchEntry;
+    be.text = "rice, 100 g";
+    const p = M.actions.batchIdentify();
+    M.collapseOneNavLevel(); // the user backs out while the request is still in flight
+    assertEqual(fu.batchEntry, null, "screen state cleared by the collapse");
+    resolveFetch({ json: function () { return Promise.resolve({ candidates: [{ content: { parts: [{
+      text: '{"items":[{"text":"rice, 100 g","name":"rice","grams":100,"matches":[]}]}' }] } }] }); } });
+    await p;
+    assertEqual(fu.batchEntry, null, "the late response resurrected nothing");
+    assertEqual(be.items, null, "and wrote no rows into the abandoned object");
+    sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
+  });
+  test("renderBatchEntryScreen: textarea phase, review phase, and food-tab routing", function () {
+    const fu = resetForPathTest();
+    M.state.tab = "food";
+    M.state.settings.aiEnabled = true;
+    const tab = M.renderFoodTab();
+    assertEqual(tab.indexOf("openBatchEntry") > -1, true, "the describe-a-meal button sits on the search screen");
+    fu.batchEntry = { text: "", loading: false, error: null, items: null, search: null };
+    const phase1 = M.renderFoodTab();
+    assertEqual(phase1.indexOf('data-bind="batchText"') > -1, true, "the flag routes the whole tab to the batch screen");
+    assertEqual(phase1.indexOf("batchIdentify") > -1, true, "identify button wired");
+    fu.batchEntry.items = [
+      { phrase: "yogurt, 250 g", name: "yogurt", count: null, grams: "250", gramsSource: "stated",
+        candidates: [{ id: "y", name: "Oikos Greek Yogurt", per100g: true, calories: 61, protein: 10, carbs: 3, fat: 0 },
+                     { id: "y2", name: "Other Yogurt", per100g: true, calories: 80, protein: 5, carbs: 8, fat: 2 }],
+        selectedIdx: 0, status: "pending", addedEntryId: null, addedLabel: null, addedKcal: 0, ai: null },
+      { phrase: "mystery food", name: "mystery food", count: null, grams: "", gramsSource: null,
+        candidates: [], selectedIdx: 0, status: "pending", addedEntryId: null, addedLabel: null, addedKcal: 0, ai: null },
+    ];
+    const review = M.renderFoodTab();
+    assertEqual(review.indexOf("Oikos Greek Yogurt") > -1, true, "the top match renders");
+    assertEqual(review.indexOf("153") > -1, true, "macros preview scaled to the stated 250g (61 x 2.5 = 152.5 -> 153)");
+    assertEqual(review.indexOf("Other Yogurt") > -1, true, "the alternate renders as a switch chip");
+    assertEqual(review.indexOf("batchAddItem") > -1, true, "per-row Add wired");
+    assertEqual(review.indexOf("No match found in your foods") > -1, true, "an unmatched row says so and offers ways out, never a dead end");
+    assertEqual(review.indexOf("batchRowSearch") > -1, true, "inline search chip");
+    assertEqual(review.indexOf("batchRowAi") > -1, true, "inline estimate chip");
+  });
+  test("renderAISection: the describe-a-meal provider toggle, with the key field following it", function () {
+    const prevSet = JSON.parse(JSON.stringify(M.state.settings));
+    M.state.settings.aiEnabled = true;
+    M.state.settings.aiProvider = "gemini";
+    M.state.settings.compareWithGemini = false;
+    M.state.settings.batchAiProvider = "gemini";
+    let html = M.renderAISection();
+    assertEqual(html.indexOf("setBatchAiProvider") > -1, true, "the Gemini/Claude toggle renders");
+    assertEqual(html.indexOf('data-bind="claudeApiKey"') === -1, true, "no Claude key field while nothing uses Claude");
+    M.state.settings.batchAiProvider = "claude";
+    html = M.renderAISection();
+    assertEqual(html.indexOf('data-bind="claudeApiKey"') > -1, true, "choosing Claude for describe-a-meal surfaces its key field");
+    M.state.settings = prevSet;
   });
 
   // ==== food wizard: query building and the no-dead-end guarantee ====
