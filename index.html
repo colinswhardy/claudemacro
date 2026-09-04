@@ -192,7 +192,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.31";
+const APP_VERSION = "1.32";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -7588,13 +7588,249 @@ inputActions.claudeApiKey = function(v) { state.settings.claudeApiKey = v; saveS
 inputActions.geminiApiKey = function(v) { state.settings.geminiApiKey = v; saveSettings(); };
 inputActions.usdaApiKey = function(v) { state.settings.usdaApiKey = v.trim(); saveSettings(); };
 
-// ---- Insights (Claude-powered) ----
-// One button: build a compact structured summary of the last 4 weeks CLIENT-SIDE, send it to
-// Claude with the user's own API key (the same key/plumbing the AI food estimator uses), and
-// render the reply. Nothing runs automatically and nothing is sent until the button is
-// tapped; the summary is aggregates only -- day totals, weigh-ins, top foods -- never keys,
-// never the raw entry list. The reply is display text, NOT data: it never writes into the
-// log, targets, or any collection ("what Colin logs is the truth" stays intact).
+// ---- Insights ----
+// Two layers (the computed layer added 2026-09-04 -- "this type of insight is not good
+// enough"; the AI paragraph alone was too shallow and needed a key + a tap to say anything).
+//
+// The COMPUTED layer renders first: deterministic local statistics -- weekly weight averages
+// with direction and amounts, day-of-week scale patterns with the intake facts behind them,
+// the morning-after effect, the weekend split. Instant, offline, no API key, always current.
+//
+// The CLAUDE layer stays as the last card, unchanged in mechanics: build a compact structured
+// summary CLIENT-SIDE, send it to Claude with the user's own API key on an explicit tap, and
+// render the reply. The summary is aggregates only -- day totals, weigh-ins, top foods, and
+// now the computed statistics -- never keys, never the raw entry list. The reply is display
+// text, NOT data: it never writes into the log, targets, or any collection.
+//
+// Both layers are strictly descriptive of what was logged. Nothing here adjusts, reweights or
+// second-guesses an entry ("what Colin logs is the truth"), and no copy may imply the log
+// runs high or low -- a "reason" line reports what WAS logged (a surplus, a carb spike) or
+// calls the move water/noise; it never speculates that something went unlogged.
+
+const INSIGHT_WEEKS = 4;          // the weekly-averages table's window
+const INSIGHT_PATTERN_DAYS = 84;  // 12 weeks of history behind the pattern/intake statistics
+const DOW_FULL = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const DOW_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+// Signed weight formatting, mirroring signedKcal (real minus sign, explicit plus).
+function signedWeight(n) {
+  return (n > 0 ? "+" : n < 0 ? "−" : "") + Math.abs(n);
+}
+function shortDate(ds) {
+  return parseDateStr(ds).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+// Trailing 7-day blocks ending on endDateStr, OLDEST FIRST: {start, end, avg, count, sum}.
+// A week with no weigh-ins keeps avg null -- missing data, never zero. Calendar-day stepping
+// via parseDateStr/setDate (the standard rule; raw ms subtraction is DST-unsafe).
+function weeklyWeightBlocks(endDateStr, nWeeks) {
+  const out = [];
+  for (let w = nWeeks - 1; w >= 0; w--) {
+    const d = parseDateStr(endDateStr);
+    d.setDate(d.getDate() - w * 7 - 6);
+    const start = fmtDate(d);
+    let sum = 0, count = 0, end = start;
+    for (let i = 0; i < 7; i++) {
+      const ds = fmtDate(d);
+      if (state.weights[ds]) { sum += state.weights[ds].weight; count++; }
+      end = ds;
+      d.setDate(d.getDate() + 1);
+    }
+    out.push({ start: start, end: end, avg: count > 0 ? round1(sum / count) : null, count: count, sum: sum });
+  }
+  return out;
+}
+
+// The rollup under the weekly table: the average of EVERY weigh-in across the window, plus
+// the direction and size of the move between the earliest and latest week that actually have
+// data. perWeek divides by the number of week-steps between those two blocks, so two weighed
+// weeks separated by an unweighed gap don't read as a one-week move. Under 0.3 total is
+// called "flat" -- comfortably inside a single day's water noise.
+function weeklyWeightSummary(blocks) {
+  const withData = [];
+  blocks.forEach(function(b, i) { if (b.avg != null) withData.push({ b: b, i: i }); });
+  if (withData.length === 0) return null;
+  let sum = 0, n = 0;
+  withData.forEach(function(x) { sum += x.b.sum; n += x.b.count; });
+  const avg = round1(sum / n);
+  if (withData.length < 2) return { avg: avg, weighIns: n, change: null, perWeek: null, direction: null };
+  const first = withData[0], last = withData[withData.length - 1];
+  const change = round1(last.b.avg - first.b.avg);
+  const perWeek = round1(change / (last.i - first.i));
+  return { avg: avg, weighIns: n, change: change, perWeek: perWeek,
+    direction: Math.abs(change) < 0.3 ? "flat" : (change < 0 ? "down" : "up") };
+}
+
+// Back-to-back weigh-ins (consecutive calendar days) in the trailing `days` window ending on
+// endDateStr. Each pair is filed under the LATER day -- the morning the scale showed the move
+// -- and prevDate is the day whose eating most plausibly drove it (Saturday's food is Sunday
+// morning's scale). dow is the later day's Date.getDay() (0 = Sunday). Pairs that would reach
+// back past the window's first day are excluded, so `days` bounds everything read.
+function consecutiveWeighInPairs(endDateStr, days) {
+  const out = [];
+  const d = parseDateStr(endDateStr);
+  d.setDate(d.getDate() - (days - 1));
+  let prevDs = null;
+  for (let i = 0; i < days; i++) {
+    const ds = fmtDate(d);
+    if (prevDs && state.weights[ds] && state.weights[prevDs]) {
+      out.push({ date: ds, prevDate: prevDs, dow: parseDateStr(ds).getDay(),
+        change: round1(state.weights[ds].weight - state.weights[prevDs].weight) });
+    }
+    prevDs = ds;
+    d.setDate(d.getDate() + 1);
+  }
+  return out;
+}
+
+// "When my weight goes up, what day is it usually on?" -- the up/down record per weekday over
+// those pairs, plus the headline picks. gainDow/dropDow are the weekdays holding the most ups
+// (downs), and stay null until there's a real sample behind them (>= 10 pairs overall AND
+// >= 3 moves on the winning day) so one odd week can't name a scapegoat day. Ties keep the
+// earlier Date.getDay() index, deterministically. upAvg/downAvg are the typical size of that
+// weekday's rises and falls separately -- avgChange nets them against each other, which
+// understates both.
+function dayOfWeekScalePattern(pairs) {
+  const byDow = [];
+  for (let i = 0; i < 7; i++) byDow.push({ dow: i, ups: 0, downs: 0, total: 0, sum: 0, upSum: 0, downSum: 0 });
+  pairs.forEach(function(p) {
+    const b = byDow[p.dow];
+    b.total++; b.sum += p.change;
+    if (p.change > 0) { b.ups++; b.upSum += p.change; }
+    else if (p.change < 0) { b.downs++; b.downSum += p.change; }
+  });
+  byDow.forEach(function(b) {
+    b.avgChange = b.total > 0 ? round1(b.sum / b.total) : null;
+    b.upAvg = b.ups > 0 ? round1(b.upSum / b.ups) : null;
+    b.downAvg = b.downs > 0 ? round1(b.downSum / b.downs) : null;
+    delete b.sum; delete b.upSum; delete b.downSum;
+  });
+  let gainDow = null, dropDow = null;
+  if (pairs.length >= 10) {
+    byDow.forEach(function(b) {
+      if (b.ups >= 3 && (gainDow === null || b.ups > byDow[gainDow].ups)) gainDow = b.dow;
+      if (b.downs >= 3 && (dropDow === null || b.downs > byDow[dropDow].downs)) dropDow = b.dow;
+    });
+  }
+  return { byDow: byDow, gainDow: gainDow, dropDow: dropDow };
+}
+
+// Median absolute day-over-day change -- the size of "normal noise" on this person's scale.
+// Null under 5 pairs (a median of 3 numbers isn't a norm).
+function typicalDailySwing(pairs) {
+  if (pairs.length < 5) return null;
+  const mags = pairs.map(function(p) { return Math.abs(p.change); }).sort(function(a, b) { return a - b; });
+  const mid = Math.floor(mags.length / 2);
+  return round1(mags.length % 2 ? mags[mid] : (mags[mid - 1] + mags[mid]) / 2);
+}
+
+// What was eaten on the days FEEDING a set of scale moves: averages over each pair's prevDate
+// food log. Unlogged days are skipped (missing data, not zero); null when none were logged.
+// Targets use getDayTargets -- the goal actually set for each of those days, boost included,
+// since that's what the day was eaten against.
+function precedingIntakeStats(pairs) {
+  let n = 0, kcal = 0, target = 0, carbs = 0;
+  pairs.forEach(function(p) {
+    if ((state.foodLogs[p.prevDate] || []).length === 0) return;
+    const t = getDayTotals(p.prevDate);
+    n++; kcal += t.calories; carbs += t.carbs;
+    target += getDayTargets(p.prevDate).calorieTarget;
+  });
+  if (n === 0) return null;
+  return { days: n, avgKcal: Math.round(kcal / n), avgTarget: Math.round(target / n), avgCarbs: Math.round(carbs / n) };
+}
+
+// The baseline those preceding-day numbers are compared against: average intake across ALL
+// logged days in the window.
+function windowIntakeAverages(endDateStr, days) {
+  let n = 0, kcal = 0, carbs = 0;
+  const d = parseDateStr(endDateStr);
+  d.setDate(d.getDate() - (days - 1));
+  for (let i = 0; i < days; i++) {
+    const ds = fmtDate(d);
+    if ((state.foodLogs[ds] || []).length > 0) {
+      const t = getDayTotals(ds);
+      n++; kcal += t.calories; carbs += t.carbs;
+    }
+    d.setDate(d.getDate() + 1);
+  }
+  if (n === 0) return null;
+  return { days: n, avgKcal: Math.round(kcal / n), avgCarbs: Math.round(carbs / n) };
+}
+
+// "...and what could be the reason": the line under the gain-day headline. Strictly
+// descriptive of what was logged on the days before those rises -- an over-target average is
+// named in kcal; near-target but carb-heavy is explained as water (glycogen stores ~3g of
+// water per gram of carb, a real rise with no surplus behind it); near-target with normal
+// carbs is called what it is, noise. It never speculates that something went unlogged.
+function gainDayReason(gainPairs, baseline) {
+  const stats = precedingIntakeStats(gainPairs);
+  if (!stats) return { stats: null, text: "No food log exists for the days before these rises, so there’s no intake to compare." };
+  const over = stats.avgKcal - stats.avgTarget;
+  const carbDelta = baseline ? stats.avgCarbs - baseline.avgCarbs : 0;
+  let text;
+  if (over >= 150) {
+    text = "Likely reason: the day before, you averaged " + stats.avgKcal.toLocaleString() + " kcal — about " + over.toLocaleString() + " over that day’s target" +
+      (carbDelta >= 40 ? ", with carbs ~" + carbDelta + "g above your usual (extra water on top of the surplus)" : "") + ".";
+  } else if (carbDelta >= 40) {
+    text = "Likely reason: calories the day before were near target (" + stats.avgKcal.toLocaleString() + " kcal avg), but carbs ran " + stats.avgCarbs + "g vs your usual " + baseline.avgCarbs + "g — extra carbs hold water, so rises like this are mostly water, not fat.";
+  } else {
+    text = "The day before averaged " + stats.avgKcal.toLocaleString() + " kcal, close to target — these rises look like normal water fluctuation rather than fat.";
+  }
+  return { stats: stats, text: text };
+}
+
+// The morning-after effect: how the scale moves after over-target days vs at-or-under days.
+// Classification is against getDayTargets (the goal set for that day, boost included). A side
+// with fewer than 3 mornings stays null rather than averaging noise.
+function intakeScaleLink(pairs) {
+  const over = { n: 0, sum: 0 }, under = { n: 0, sum: 0 };
+  pairs.forEach(function(p) {
+    if ((state.foodLogs[p.prevDate] || []).length === 0) return;
+    const side = getDayTotals(p.prevDate).calories > getDayTargets(p.prevDate).calorieTarget ? over : under;
+    side.n++; side.sum += p.change;
+  });
+  return {
+    afterOver: over.n >= 3 ? { days: over.n, avgChange: round1(over.sum / over.n) } : null,
+    afterUnder: under.n >= 3 ? { days: under.n, avgChange: round1(under.sum / under.n) } : null,
+  };
+}
+
+// Weekend (Fri-Sun) vs weekday (Mon-Thu) average intake over the window's logged days. Null
+// until both sides have 3+ logged days.
+function weekendIntakeSplit(endDateStr, days) {
+  const wd = { n: 0, kcal: 0 }, we = { n: 0, kcal: 0 };
+  const d = parseDateStr(endDateStr);
+  d.setDate(d.getDate() - (days - 1));
+  for (let i = 0; i < days; i++) {
+    const ds = fmtDate(d);
+    if ((state.foodLogs[ds] || []).length > 0) {
+      const dow = parseDateStr(ds).getDay();
+      const side = (dow === 5 || dow === 6 || dow === 0) ? we : wd;
+      side.n++; side.kcal += getDayTotals(ds).calories;
+    }
+    d.setDate(d.getDate() + 1);
+  }
+  if (wd.n < 3 || we.n < 3) return null;
+  const wdAvg = Math.round(wd.kcal / wd.n), weAvg = Math.round(we.kcal / we.n);
+  return { weekdayAvg: wdAvg, weekendAvg: weAvg, weekdayDays: wd.n, weekendDays: we.n, delta: weAvg - wdAvg };
+}
+
+// One bundle of every computed statistic, keyed for the Claude summary -- the narrative
+// builds on the same numbers the section displays instead of re-deriving (and disagreeing).
+function buildComputedInsightStats() {
+  const blocks = weeklyWeightBlocks(state.date, INSIGHT_WEEKS);
+  const pairs = consecutiveWeighInPairs(state.date, INSIGHT_PATTERN_DAYS);
+  return {
+    weeklyAverages: blocks.map(function(b) { return { start: b.start, end: b.end, avg: b.avg, weighIns: b.count }; }),
+    fourWeek: weeklyWeightSummary(blocks),
+    dayOfWeek: dayOfWeekScalePattern(pairs),
+    typicalDailySwing: typicalDailySwing(pairs),
+    morningAfter: intakeScaleLink(pairs),
+    weekendVsWeekday: weekendIntakeSplit(state.date, INSIGHT_PATTERN_DAYS),
+  };
+}
+
 function buildInsightsSummary() {
   const set = state.settings;
   const days = [];
@@ -7640,27 +7876,131 @@ function buildInsightsSummary() {
       targets: { kcal: tt.calorieTarget, protein: tt.proteinTarget, carbs: tt.carbsTarget, fat: tt.fatTarget },
       remaining: { kcal: Math.round(tt.calorieTarget - today.calories), protein: Math.round(tt.proteinTarget - today.protein), carbs: Math.round(tt.carbsTarget - today.carbs), fat: Math.round(tt.fatTarget - today.fat) },
     },
+    computed: buildComputedInsightStats(),
   };
 }
 
-const INSIGHTS_PROMPT = 'You are analyzing one person’s real, self-logged nutrition and body-weight data from their macro-tracking app. Their logged intake is ground truth — never suggest their logging is inaccurate. Analyze the attached JSON and reply in plain text (no markdown symbols) with exactly these four short sections, each under ~90 words, titled on its own line:\n\nWEIGHT MOVEMENT\nExplain the recent scale movements using the actual dates and numbers — separate real trend from water/glycogen effects (carb intake shifts, weekend patterns, big food-mass days). Be specific, cite days.\n\nPATTERNS\nThe most useful adherence or behavior pattern you can see (weekday vs weekend, timing, macro mix). One insight, evidenced.\n\nTO HIT TODAY’S TARGETS\nUsing today.remaining macros and their mostLoggedFoods list, suggest 2-3 concrete portions (with gram amounts and estimated macros) of foods they demonstrably already eat that would close today’s gaps, protein first.\n\nWATCH\nOne forward-looking, non-moralizing thing worth keeping an eye on given their goal and pace.\n\nBe direct and numerate. No praise padding, no disclaimers.';
+const INSIGHTS_PROMPT = 'You are analyzing one person’s real, self-logged nutrition and body-weight data from their macro-tracking app. Their logged intake is ground truth — never suggest their logging is inaccurate. The JSON includes a `computed` block of pre-derived statistics (4-week weekly weight averages, day-of-week scale pattern, morning-after effect, weekend split — dow 0 is Sunday); treat those numbers as correct and interpret them rather than re-deriving. The app already displays them, so do not merely restate them — add the story they don’t tell on their own. Analyze the attached JSON and reply in plain text (no markdown symbols) with exactly these four short sections, each under ~90 words, titled on its own line:\n\nWEIGHT MOVEMENT\nExplain the recent scale movements using the actual dates and numbers — separate real trend from water/glycogen effects (carb intake shifts, weekend patterns, big food-mass days). Be specific, cite days.\n\nPATTERNS\nThe most useful adherence or behavior pattern you can see (weekday vs weekend, timing, macro mix). One insight, evidenced.\n\nTO HIT TODAY’S TARGETS\nUsing today.remaining macros and their mostLoggedFoods list, suggest 2-3 concrete portions (with gram amounts and estimated macros) of foods they demonstrably already eat that would close today’s gaps, protein first.\n\nWATCH\nOne forward-looking, non-moralizing thing worth keeping an eye on given their goal and pace.\n\nBe direct and numerate. No praise padding, no disclaimers.';
 
 function renderInsightsSection() {
   const su = strategyUi();
+  const unit = state.settings.weightUnit || "lbs";
+  let html = "";
+
+  // -- Last 4 weeks: weekly averages, direction, amounts --
+  const blocks = weeklyWeightBlocks(state.date, INSIGHT_WEEKS);
+  const wk = weeklyWeightSummary(blocks);
+  let w = '<h3 class="cardTitle" style="margin-bottom:4px">Last 4 Weeks</h3>' +
+    '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:10px">Weekly averages smooth out daily water swings — compare weeks, not days.</div>';
+  if (!wk) {
+    w += '<div style="color:' + C.textMut + ';font-size:13px;text-align:center;padding:8px 0">No weigh-ins in the last 4 weeks yet.</div>';
+  } else {
+    let prevAvg = null;
+    blocks.forEach(function(b) {
+      const change = (b.avg != null && prevAvg != null) ? round1(b.avg - prevAvg) : null;
+      w += '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0">' +
+        '<span style="color:' + C.textSec + ';font-size:13px">' + esc(shortDate(b.start)) + ' – ' + esc(shortDate(b.end)) + '</span>' +
+        (b.avg != null
+          ? '<span style="font-size:13px"><span style="color:' + C.text + ';font-weight:700">' + b.avg + '</span><span style="color:' + C.textMut + '"> ' + esc(unit) + ' ×' + b.count + '</span>' +
+            ' <span style="color:' + (change == null ? C.textMut : phaseRateColor(change)) + ';font-weight:700;display:inline-block;min-width:48px;text-align:right">' + (change == null ? "—" : signedWeight(change)) + '</span></span>'
+          : '<span style="color:' + C.textMut + ';font-size:12px">no weigh-ins</span>') +
+      '</div>';
+      if (b.avg != null) prevAvg = b.avg;
+    });
+    w += '<div style="display:flex;justify-content:space-between;border-top:1px solid ' + C.border + ';margin-top:8px;padding-top:10px">' +
+      '<span style="color:' + C.textSec + ';font-size:13px;font-weight:600">4-week average</span>' +
+      '<span style="color:' + C.text + ';font-size:14px;font-weight:800">' + wk.avg + ' ' + esc(unit) + '</span></div>';
+    if (wk.change != null) {
+      const dirWord = wk.direction === "flat" ? "Holding steady" : (wk.direction === "down" ? "Trending down" : "Trending up");
+      w += '<div style="color:' + C.textMut + ';font-size:12px;margin-top:6px">' +
+        '<span style="color:' + phaseRateColor(wk.perWeek) + ';font-weight:700">' + dirWord + '</span> — ' +
+        (wk.direction === "flat"
+          ? "net " + signedWeight(wk.change) + " " + esc(unit) + " between your first and last weighed week."
+          : signedWeight(wk.change) + " " + esc(unit) + " between your first and last weighed week (" + signedWeight(wk.perWeek) + " " + esc(unit) + "/week).") +
+      '</div>';
+    } else {
+      w += '<div style="color:' + C.textMut + ';font-size:12px;margin-top:6px">Only one week has weigh-ins so far — direction needs two.</div>';
+    }
+  }
+  html += card(w);
+
+  // -- Scale patterns: the day-of-week story --
+  const pairs = consecutiveWeighInPairs(state.date, INSIGHT_PATTERN_DAYS);
+  const pat = dayOfWeekScalePattern(pairs);
+  const swing = typicalDailySwing(pairs);
+  let p = '<h3 class="cardTitle" style="margin-bottom:4px">Scale Patterns</h3>' +
+    '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:10px">From back-to-back weigh-ins over the last 12 weeks (' + pairs.length + ' day-over-day changes).</div>';
+  if (pat.gainDow == null && pat.dropDow == null) {
+    p += '<div style="color:' + C.textMut + ';font-size:13px;padding:4px 0">Not enough back-to-back weigh-ins yet to call a weekly pattern — it unlocks around 10 day-over-day changes (you have ' + pairs.length + '). Weighing in daily gets there fastest.</div>';
+  } else {
+    if (pat.gainDow != null) {
+      const g = pat.byDow[pat.gainDow];
+      const reason = gainDayReason(pairs.filter(function(x) { return x.dow === pat.gainDow && x.change > 0; }),
+        windowIntakeAverages(state.date, INSIGHT_PATTERN_DAYS));
+      p += '<div style="font-size:13px;color:' + C.text + ';margin-bottom:4px">📈 <b>' + DOW_FULL[pat.gainDow] + 's</b> are your most common up day — the scale rose on ' + g.ups + ' of the ' + g.total + ' measured' + (g.upAvg != null ? ', typically +' + g.upAvg + ' ' + esc(unit) : '') + '.</div>' +
+        '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:10px">' + esc(reason.text) + '</div>';
+    }
+    if (pat.dropDow != null) {
+      const dr = pat.byDow[pat.dropDow];
+      p += '<div style="font-size:13px;color:' + C.text + ';margin-bottom:10px">📉 <b>' + DOW_FULL[pat.dropDow] + 's</b> are your most common down day — it fell on ' + dr.downs + ' of the ' + dr.total + ' measured' + (dr.downAvg != null ? ', typically ' + signedWeight(dr.downAvg) + ' ' + esc(unit) : '') + '.</div>';
+    }
+    // The full week, Monday-first, only weekdays that have at least one measured change.
+    p += '<div style="border-top:1px solid ' + C.border + ';padding-top:8px">';
+    [1, 2, 3, 4, 5, 6, 0].forEach(function(dow) {
+      const b = pat.byDow[dow];
+      if (b.total === 0) return;
+      p += '<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:12px">' +
+        '<span style="color:' + C.textSec + '">' + DOW_SHORT[dow] + '</span>' +
+        '<span style="color:' + C.textMut + '">↑' + b.ups + ' ↓' + b.downs + '</span>' +
+        '<span style="color:' + C.textMut + ';min-width:88px;text-align:right">avg ' + (b.avgChange == null ? "—" : signedWeight(b.avgChange) + " " + esc(unit)) + '</span>' +
+      '</div>';
+    });
+    p += '</div>';
+  }
+  if (swing != null) {
+    p += '<div style="color:' + C.textMut + ';font-size:12px;margin-top:10px">⚖️ Typical day-to-day swing: ±' + swing + ' ' + esc(unit) + ' (median). A single morning inside that band is noise, not a trend.</div>';
+  }
+  html += card(p);
+
+  // -- Intake <-> scale: what the food log says about the moves --
+  const link = intakeScaleLink(pairs);
+  const wkSplit = weekendIntakeSplit(state.date, INSIGHT_PATTERN_DAYS);
+  let f = '<h3 class="cardTitle" style="margin-bottom:4px">Intake ↔ Scale</h3>' +
+    '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:10px">Your food log lined up against next-morning weigh-ins, last 12 weeks.</div>';
+  let anyLink = false;
+  if (link.afterOver || link.afterUnder) {
+    anyLink = true;
+    if (link.afterOver) f += '<div style="font-size:13px;color:' + C.textSec + ';margin-bottom:6px">Morning after an <b>over-target</b> day: <span style="color:' + C.text + ';font-weight:700">' + signedWeight(link.afterOver.avgChange) + ' ' + esc(unit) + '</span> on average (' + link.afterOver.days + ' mornings).</div>';
+    if (link.afterUnder) f += '<div style="font-size:13px;color:' + C.textSec + ';margin-bottom:6px">Morning after an <b>at-or-under target</b> day: <span style="color:' + C.text + ';font-weight:700">' + signedWeight(link.afterUnder.avgChange) + ' ' + esc(unit) + '</span> on average (' + link.afterUnder.days + ' mornings).</div>';
+    if (link.afterOver && link.afterUnder) f += '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:10px">The gap between those two numbers is your eating showing up on the scale — though any single morning is still mostly water.</div>';
+  }
+  if (wkSplit) {
+    anyLink = true;
+    f += '<div style="font-size:13px;color:' + C.textSec + '">' +
+      (Math.abs(wkSplit.delta) < 75
+        ? 'Weekends and weekdays average nearly the same: ' + wkSplit.weekendAvg.toLocaleString() + ' kcal Fri–Sun vs ' + wkSplit.weekdayAvg.toLocaleString() + ' Mon–Thu.'
+        : 'Fri–Sun you average <b>' + wkSplit.weekendAvg.toLocaleString() + ' kcal</b> vs ' + wkSplit.weekdayAvg.toLocaleString() + ' Mon–Thu — <b style="color:' + phaseDeltaColor(wkSplit.delta) + '">' + signedKcal(wkSplit.delta) + ' kcal/day</b> on weekends.') +
+      '</div>';
+  }
+  if (!anyLink) f += '<div style="color:' + C.textMut + ';font-size:13px;padding:4px 0">Log food on the days before your weigh-ins and this section links what you ate to what the scale did next morning.</div>';
+  html += card(f);
+
+  // -- The Claude narrative (mechanics unchanged; it now also receives the computed stats) --
   const hasKey = !!(state.settings.claudeApiKey || "").trim();
   const last = db.get("lastInsights", null);
-  let html = '<h3 class="cardTitle" style="margin-bottom:4px">✨ Insights</h3>' +
-    '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:12px">Sends a compact summary of your last 4 weeks — day totals, weigh-ins, trend, goal, most-logged foods — to Claude with your own API key, and asks what it sees: what moved your weight, your patterns, and what to eat today to hit your targets. Nothing is sent until you tap.</div>' +
+  let ai = '<h3 class="cardTitle" style="margin-bottom:4px">✨ Ask Claude</h3>' +
+    '<div style="color:' + C.textMut + ';font-size:12px;margin-bottom:12px">Sends a compact summary of your last 4 weeks — day totals, weigh-ins, trend, goal, most-logged foods, plus the statistics above — to Claude with your own API key, and asks for the story behind them: what moved your weight, your patterns, and what to eat today to hit your targets. Nothing is sent until you tap.</div>' +
     (hasKey ? '' : '<div style="color:' + C.warning + ';font-size:12px;margin-bottom:12px">Add your Claude API key under AI Settings to use this.</div>') +
     btn({ label: su.insightsLoading ? "Thinking…" : "✨ Generate Insights", action: "generateInsights", full: true, disabled: su.insightsLoading || !hasKey }) +
     (su.insightsError ? '<div style="margin-top:10px;padding:10px 12px;background:' + C.danger + '15;border-radius:8px;color:' + C.danger + ';font-size:12px">' + esc(su.insightsError) + '</div>' : '');
   if (last && last.text) {
-    html += '<div style="margin-top:14px;padding-top:12px;border-top:1px solid ' + C.border + '">' +
+    ai += '<div style="margin-top:14px;padding-top:12px;border-top:1px solid ' + C.border + '">' +
       '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:8px">Generated ' + esc(dayLabel(last.date)) + '</div>' +
       '<div style="font-size:13px;color:' + C.textSec + ';white-space:pre-wrap;line-height:1.55">' + esc(last.text) + '</div>' +
     '</div>';
   }
-  return card(html);
+  html += card(ai);
+  return html;
 }
 
 actions.generateInsights = async function() {

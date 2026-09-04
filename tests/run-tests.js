@@ -156,6 +156,13 @@ const exportLine =
   "dataHealthBasisFindings: dataHealthBasisFindings, dataHealthAtwaterFindings: dataHealthAtwaterFindings, " +
   "dataHealthRecordFindings: dataHealthRecordFindings, runDataHealthCheck: runDataHealthCheck, " +
   "buildInsightsSummary: buildInsightsSummary, renderInsightsSection: renderInsightsSection, " +
+  "weeklyWeightBlocks: weeklyWeightBlocks, weeklyWeightSummary: weeklyWeightSummary, " +
+  "consecutiveWeighInPairs: consecutiveWeighInPairs, dayOfWeekScalePattern: dayOfWeekScalePattern, " +
+  "typicalDailySwing: typicalDailySwing, precedingIntakeStats: precedingIntakeStats, " +
+  "windowIntakeAverages: windowIntakeAverages, gainDayReason: gainDayReason, " +
+  "intakeScaleLink: intakeScaleLink, weekendIntakeSplit: weekendIntakeSplit, " +
+  "buildComputedInsightStats: buildComputedInsightStats, " +
+  "INSIGHT_WEEKS: INSIGHT_WEEKS, INSIGHT_PATTERN_DAYS: INSIGHT_PATTERN_DAYS, " +
   "phaseCoach: phaseCoach, renderPhaseCoachCard: renderPhaseCoachCard, " +
   "phaseDeltaColor: phaseDeltaColor, phaseRateColor: phaseRateColor, " +
   "wizardSearchTerm: wizardSearchTerm, wizardSearchQuery: wizardSearchQuery, " +
@@ -4282,6 +4289,169 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     assertEqual(withKey.indexOf("AI Settings to use this"), -1, "no key warning once a key exists");
     M.state.settings.claudeApiKey = "";
     M.state.ui = prevUi;
+  });
+
+  // ==== computed insights ====
+  test("weeklyWeightBlocks: four trailing weeks oldest-first, empty week stays null (not zero)", function () {
+    const prev = M.state.weights;
+    M.state.weights = {
+      "2026-08-03": { weight: 200, unit: "lbs" }, "2026-08-05": { weight: 202, unit: "lbs" }, // wk 1
+      "2026-08-18": { weight: 199, unit: "lbs" },                                             // wk 3
+      "2026-08-24": { weight: 198, unit: "lbs" }, "2026-08-26": { weight: 197, unit: "lbs" }, // wk 4
+    };
+    const blocks = M.weeklyWeightBlocks("2026-08-28", 4);
+    assertEqual(blocks.length, 4, "four blocks");
+    assertEqual([blocks[0].start, blocks[0].end], ["2026-08-01", "2026-08-07"], "oldest block spans the window's first week");
+    assertEqual([blocks[3].start, blocks[3].end], ["2026-08-22", "2026-08-28"], "newest block ends on the anchor");
+    assertEqual([blocks[0].avg, blocks[0].count], [201, 2], "week average over its weigh-ins");
+    assertEqual([blocks[1].avg, blocks[1].count], [null, 0], "an unweighed week is null, never 0");
+    assertEqual(blocks[3].avg, 197.5, "newest week's average");
+    M.state.weights = prev;
+  });
+  test("weeklyWeightSummary: overall average, direction, and a per-week rate that respects gaps", function () {
+    const prev = M.state.weights;
+    M.state.weights = {
+      "2026-08-03": { weight: 200, unit: "lbs" }, "2026-08-05": { weight: 202, unit: "lbs" },
+      "2026-08-18": { weight: 199, unit: "lbs" },
+      "2026-08-24": { weight: 198, unit: "lbs" }, "2026-08-26": { weight: 197, unit: "lbs" },
+    };
+    const s = M.weeklyWeightSummary(M.weeklyWeightBlocks("2026-08-28", 4));
+    assertEqual(s.avg, 199.2, "mean of every weigh-in in the window, not of week averages");
+    assertEqual(s.weighIns, 5, "counts weigh-ins");
+    assertEqual(s.change, -3.5, "latest weighed week vs earliest weighed week");
+    assertEqual(s.perWeek, -1.2, "-3.5 over THREE week-steps (wk1 to wk4), not one");
+    assertEqual(s.direction, "down", "direction");
+    M.state.weights = { "2026-08-24": { weight: 198, unit: "lbs" } };
+    const one = M.weeklyWeightSummary(M.weeklyWeightBlocks("2026-08-28", 4));
+    assertEqual([one.avg, one.change, one.direction], [198, null, null], "one weighed week has no direction yet");
+    M.state.weights = {};
+    assertEqual(M.weeklyWeightSummary(M.weeklyWeightBlocks("2026-08-28", 4)), null, "no weigh-ins at all -> null");
+    M.state.weights = prev;
+  });
+  test("consecutiveWeighInPairs: back-to-back days only, filed under the later day, window-bounded", function () {
+    const prev = M.state.weights;
+    M.state.weights = {
+      "2026-08-23": { weight: 200, unit: "lbs" },
+      "2026-08-24": { weight: 201.2, unit: "lbs" },
+      "2026-08-26": { weight: 200.5, unit: "lbs" }, // gap after the 24th -> no pair with it
+    };
+    const pairs = M.consecutiveWeighInPairs("2026-08-28", 84);
+    assertEqual(pairs.length, 1, "only the consecutive pair counts");
+    assertEqual([pairs[0].date, pairs[0].prevDate, pairs[0].change, pairs[0].dow],
+      ["2026-08-24", "2026-08-23", 1.2, 1], "later day owns the change; Aug 24 2026 is a Monday");
+    assertEqual(M.consecutiveWeighInPairs("2026-08-28", 5).length, 0,
+      "a pair reaching back past the window's first day is excluded");
+    M.state.weights = prev;
+  });
+  test("dayOfWeekScalePattern: names the most-common up and down days, with separate up/down sizes", function () {
+    const pairs = [
+      { dow: 0, change: 1 }, { dow: 0, change: 1 }, { dow: 0, change: 0.6 }, { dow: 0, change: 0.8 }, { dow: 0, change: -0.4 },
+      { dow: 3, change: -0.5 }, { dow: 3, change: -0.5 }, { dow: 3, change: -0.5 }, { dow: 3, change: -0.5 }, { dow: 3, change: 0.2 },
+      { dow: 2, change: 0.3 }, { dow: 2, change: -0.3 },
+    ];
+    const pat = M.dayOfWeekScalePattern(pairs);
+    assertEqual(pat.gainDow, 0, "Sunday holds the most ups");
+    assertEqual(pat.dropDow, 3, "Wednesday holds the most downs");
+    assertEqual([pat.byDow[0].ups, pat.byDow[0].total], [4, 5], "per-day record");
+    assertEqual(pat.byDow[0].upAvg, 0.9, "typical size of the ups alone (3.4/4), not netted against the down");
+    assertEqual(pat.byDow[0].avgChange, 0.6, "net average still available");
+    assertEqual(pat.byDow[3].downAvg, -0.5, "typical drop size");
+    assertEqual(M.dayOfWeekScalePattern(pairs.slice(0, 9)).gainDow, null, "under 10 pairs, no day is named");
+    const weak = [
+      { dow: 0, change: 1 }, { dow: 1, change: 1 }, { dow: 2, change: 1 }, { dow: 3, change: 1 }, { dow: 4, change: 1 },
+      { dow: 5, change: 1 }, { dow: 6, change: 1 }, { dow: 0, change: -1 }, { dow: 1, change: -1 }, { dow: 2, change: -1 },
+    ];
+    assertEqual(M.dayOfWeekScalePattern(weak).gainDow, null, "no day with 3+ ups -> no day is named");
+  });
+  test("typicalDailySwing: median absolute change, null under 5 pairs", function () {
+    const P = function (arr) { return arr.map(function (c) { return { change: c }; }); };
+    assertEqual(M.typicalDailySwing(P([0.2, -0.4, 1.0, -0.6, 0.8])), 0.6, "odd count median");
+    assertEqual(M.typicalDailySwing(P([0.2, -0.4, 1.0, -0.6, 0.8, 1.2])), 0.7, "even count averages the middle two");
+    assertEqual(M.typicalDailySwing(P([0.2, -0.4, 1.0, -0.6])), null, "too few pairs");
+  });
+  test("gainDayReason: names the surplus when there was one, calls carbs water, admits missing data", function () {
+    const prevLogs = M.state.foodLogs, prevTargets = M.state.targetHistory, prevBoosts = M.state.dayBoosts;
+    M.state.targetHistory = {}; M.state.dayBoosts = {};
+    M.state.settings.calorieTarget = 2000;
+    M.state.foodLogs = {
+      "2026-08-22": [{ id: "a", name: "Pizza", macros: { calories: 2600, protein: 100, carbs: 200, fat: 90, fiber: 10 } }],
+      "2026-08-15": [{ id: "b", name: "Rice", macros: { calories: 2050, protein: 100, carbs: 300, fat: 40, fiber: 10 } }],
+    };
+    const baseline = { days: 20, avgKcal: 2000, avgCarbs: 200 };
+    const over = M.gainDayReason([{ prevDate: "2026-08-22", change: 1 }], baseline);
+    assertEqual(over.text.indexOf("over that day’s target") > -1, true, "an over-target day is named as the reason");
+    assertEqual(over.stats.avgKcal, 2600, "with the actual logged average");
+    const carby = M.gainDayReason([{ prevDate: "2026-08-15", change: 1 }], baseline);
+    assertEqual(carby.text.indexOf("water") > -1, true, "near-target but carb-heavy reads as water, not fat");
+    const nodata = M.gainDayReason([{ prevDate: "2026-08-10", change: 1 }], baseline);
+    assertEqual(nodata.stats, null, "no logs on the preceding days");
+    assertEqual(nodata.text.indexOf("No food log") === 0, true, "and the copy says so instead of guessing");
+    M.state.foodLogs = prevLogs; M.state.targetHistory = prevTargets; M.state.dayBoosts = prevBoosts;
+  });
+  test("intakeScaleLink: morning-after averages split by over/under target, unlogged days excluded", function () {
+    const prevLogs = M.state.foodLogs, prevTargets = M.state.targetHistory, prevBoosts = M.state.dayBoosts;
+    M.state.targetHistory = {}; M.state.dayBoosts = {};
+    M.state.settings.calorieTarget = 2000;
+    const day = function (kcal) { return [{ id: "x", name: "Meal", macros: { calories: kcal, protein: 50, carbs: 100, fat: 30, fiber: 5 } }]; };
+    M.state.foodLogs = {
+      "2026-08-01": day(2500), "2026-08-03": day(2500), "2026-08-05": day(2500),
+      "2026-08-02": day(1800), "2026-08-04": day(1800), "2026-08-06": day(1800),
+    };
+    const pairs = [
+      { prevDate: "2026-08-01", change: 0.5 }, { prevDate: "2026-08-03", change: 0.7 }, { prevDate: "2026-08-05", change: 0.3 },
+      { prevDate: "2026-08-02", change: -0.4 }, { prevDate: "2026-08-04", change: -0.2 }, { prevDate: "2026-08-06", change: -0.6 },
+      { prevDate: "2026-08-07", change: 5 }, // no log that day -> must not poison either side
+    ];
+    const link = M.intakeScaleLink(pairs);
+    assertEqual(link.afterOver, { days: 3, avgChange: 0.5 }, "average morning-after move following over-target days");
+    assertEqual(link.afterUnder, { days: 3, avgChange: -0.4 }, "and following at-or-under days");
+    assertEqual(M.intakeScaleLink(pairs.slice(0, 2)).afterOver, null, "fewer than 3 mornings on a side stays null");
+    M.state.foodLogs = prevLogs; M.state.targetHistory = prevTargets; M.state.dayBoosts = prevBoosts;
+  });
+  test("weekendIntakeSplit: Fri-Sun vs Mon-Thu averages over logged days only", function () {
+    const prevLogs = M.state.foodLogs, prevTargets = M.state.targetHistory, prevBoosts = M.state.dayBoosts;
+    M.state.targetHistory = {}; M.state.dayBoosts = {};
+    const day = function (kcal) { return [{ id: "x", name: "Meal", macros: { calories: kcal, protein: 50, carbs: 100, fat: 30, fiber: 5 } }]; };
+    M.state.foodLogs = {
+      "2026-08-07": day(2600), "2026-08-14": day(2600), "2026-08-21": day(2600), // Fridays
+      "2026-08-03": day(2000), "2026-08-10": day(2000), "2026-08-17": day(2000), // Mondays
+    };
+    const split = M.weekendIntakeSplit("2026-08-28", 28);
+    assertEqual([split.weekendAvg, split.weekdayAvg, split.delta], [2600, 2000, 600], "the split and its delta");
+    assertEqual([split.weekendDays, split.weekdayDays], [3, 3], "day counts carried for the copy");
+    M.state.foodLogs = { "2026-08-07": day(2600), "2026-08-03": day(2000), "2026-08-10": day(2000), "2026-08-17": day(2000) };
+    assertEqual(M.weekendIntakeSplit("2026-08-28", 28), null, "a side with under 3 logged days keeps the whole split null");
+    M.state.foodLogs = prevLogs; M.state.targetHistory = prevTargets; M.state.dayBoosts = prevBoosts;
+  });
+  test("buildInsightsSummary: carries the computed statistics block for the Claude narrative", function () {
+    const prevLogs = M.state.foodLogs, prevWeights = M.state.weights, prevDate = M.state.date, prevTargets = M.state.targetHistory;
+    M.state.date = "2026-08-28"; M.state.targetHistory = {}; M.state.foodLogs = {};
+    M.state.weights = { "2026-08-24": { weight: 198, unit: "lbs" }, "2026-08-25": { weight: 198.6, unit: "lbs" } };
+    const s = M.buildInsightsSummary();
+    assertEqual(s.computed.weeklyAverages.length, M.INSIGHT_WEEKS, "one entry per week window");
+    assertEqual(s.computed.fourWeek.avg, 198.3, "the same rollup the section displays");
+    assertEqual(s.computed.dayOfWeek.gainDow, null, "pattern gates carry through unchanged");
+    M.state.foodLogs = prevLogs; M.state.weights = prevWeights; M.state.date = prevDate; M.state.targetHistory = prevTargets;
+  });
+  test("renderInsightsSection: computed cards render with data, and degrade to friendly empties", function () {
+    const prevUi = M.state.ui, prevLogs = M.state.foodLogs, prevWeights = M.state.weights, prevDate = M.state.date, prevTargets = M.state.targetHistory;
+    M.state.ui = {}; M.state.date = "2026-08-28"; M.state.targetHistory = {};
+    M.state.settings.claudeApiKey = "";
+    M.state.weights = {}; M.state.foodLogs = {};
+    const empty = M.renderInsightsSection();
+    assertEqual(empty.indexOf("Last 4 Weeks") > -1, true, "weekly card renders");
+    assertEqual(empty.indexOf("No weigh-ins in the last 4 weeks") > -1, true, "with its empty state");
+    assertEqual(empty.indexOf("Scale Patterns") > -1, true, "patterns card renders");
+    assertEqual(empty.indexOf("Intake ↔ Scale") > -1, true, "intake card renders");
+    assertEqual(empty.indexOf('data-action="generateInsights"') > -1, true, "the Claude button is still there");
+    const w = {};
+    for (let i = 1; i <= 28; i++) w["2026-08-" + String(i).padStart(2, "0")] = { weight: 200 - i * 0.1, unit: "lbs" };
+    M.state.weights = w;
+    const full = M.renderInsightsSection();
+    assertEqual(full.indexOf("4-week average") > -1, true, "the rollup line appears with data");
+    assertEqual(full.indexOf("Trending down") > -1, true, "and calls the direction");
+    assertEqual(full.indexOf("most common up day") === -1, true, "an all-down month names no up day");
+    M.state.ui = prevUi; M.state.foodLogs = prevLogs; M.state.weights = prevWeights; M.state.date = prevDate; M.state.targetHistory = prevTargets;
   });
 
   // ==== food wizard: query building and the no-dead-end guarantee ====
