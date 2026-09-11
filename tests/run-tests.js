@@ -120,6 +120,10 @@ const exportLine =
   "targetsForDate: targetsForDate, recordTargetChange: recordTargetChange, syncTargetBaseline: syncTargetBaseline, " +
   "targetSnapshotOf: targetSnapshotOf, sameTargets: sameTargets, earliestLoggedDate: earliestLoggedDate, " +
   "mergeTargetHistoryFromCloud: mergeTargetHistoryFromCloud, renderTargetHistoryBlock: renderTargetHistoryBlock, " +
+  "liveTargetHistoryDates: liveTargetHistoryDates, targetPeriodStats: targetPeriodStats, " +
+  "redistributeMacrosForCalories: redistributeMacrosForCalories, writeTargetPeriod: writeTargetPeriod, " +
+  "parseTargetPeriodForm: parseTargetPeriodForm, mergeFoodsAndRecipesByRecency: mergeFoodsAndRecipesByRecency, " +
+  "renderDashboard: renderDashboard, renderTargetsSection: renderTargetsSection, " +
   "addFoodToLog: addFoodToLog, updateFoodEntry: updateFoodEntry, " +
   "flattenFoodLogsForSync: flattenFoodLogsForSync, " +
   "weightRangeStats: weightRangeStats, weightStatsRangeLabel: weightStatsRangeLabel, weightChartCutoff: weightChartCutoff, " +
@@ -1557,7 +1561,7 @@ test("renderIngredientResultsBlock: labels both groups and wires rows to the pic
     results: [{ id: "usda_2", name: "Brown Rice", source: "USDA", calories: 112, protein: 2.6, carbs: 24, fat: 0.9 }],
   };
   const html = M.renderIngredientResultsBlock(pk);
-  assertEqual(html.indexOf("Eaten before") >= 0, true, "local group header rendered");
+  assertEqual(html.indexOf("Your foods") >= 0, true, "local group header rendered");
   assertEqual(html.indexOf("Food databases") >= 0, true, "database group header rendered");
   assertEqual(html.indexOf('data-action="selectIngredientFood"') >= 0, true, "rows target the picker, not the Food tab");
   assertEqual(html.indexOf('data-action="selectFoodForAdd"') >= 0, false, "no leakage of the Food tab's action into the picker");
@@ -1650,17 +1654,34 @@ test("selectIngredientRecipe: a recipe cannot be added to itself", function () {
   M.inputActions.ingredientQuery("ch");
   assertEqual(rb.picker.recipeResults.length, 0, "and it is not even offered while being edited");
 });
-test("renderFoodResultGroups: the recipes group leads and uses the caller's recipe action", function () {
+// Colin, 2026-09-11: one list in the order things were last added to the log, with a recipe
+// flagged on its card instead of living in a separate section above.
+test("mergeFoodsAndRecipesByRecency: a recipe takes its logged snapshot's slot; unlogged things trail", function () {
+  const A = { id: "a", name: "Oats" }, B = { id: "b", name: "Chili Powder" }, FAV = { id: "fav", name: "Cache-only chili" };
+  M.state.recentFoods = [A, { id: "recipe_food_r_chili", name: "Beef Chili", source: "Recipe" }, B];
+  const R2 = recipeFixture("r_never", "Never Logged Chili", []);
+  const out = M.mergeFoodsAndRecipesByRecency([CHILI, R2], [B, A, FAV]);
+  assertEqual(out.map(function (it) { return it.kind === "recipe" ? "R:" + it.recipe.id : it.food.id; }),
+    ["a", "R:r_chili", "b", "fav", "R:r_never"],
+    "log recency wins (A, then the chili recipe where its snapshot sits, then B); no-position food next; never-logged recipe last");
+});
+test("renderFoodResultGroups: recipes render inline in recency order with the Recipe badge, under one header", function () {
   M.state.recipes = [CHILI];
+  M.state.recentFoods = [
+    { id: "h3", name: "Chili Powder", source: "Manual Entry" },
+    { id: "recipe_food_r_chili", name: "Beef Chili", source: "Recipe" },
+  ];
   const html = M.renderFoodResultGroups({
     recipes: [CHILI],
     history: [{ id: "h3", name: "Chili Powder", source: "Manual Entry", calories: 10, protein: 0, carbs: 2, fat: 0 }],
     dbResults: [], searching: false, query: "chili",
     action: "selectFoodForAdd", recipeAction: "logRecipe", emptyText: "none",
   });
-  assertEqual(html.indexOf("Your recipes") >= 0, true, "recipes group header rendered");
-  assertEqual(html.indexOf("Your recipes") < html.indexOf("Eaten before"), true, "recipes listed above eaten-before");
-  assertEqual(html.indexOf('data-action="logRecipe"') >= 0, true, "recipe rows open the log-recipe screen");
+  assertEqual(html.indexOf("Your recipes"), -1, "no separate recipes section any more");
+  assertEqual(html.indexOf("Your foods") >= 0, true, "one own-foods header");
+  assertEqual(html.indexOf("Chili Powder") < html.indexOf("Beef Chili"), true, "the more recently logged food comes first, the recipe after it");
+  assertEqual(html.indexOf('data-action="logRecipe"') >= 0, true, "recipe rows still open the log-recipe screen");
+  assertEqual(html.indexOf(">Recipe<") >= 0, true, "and carry the Recipe badge on the card");
 });
 test("renderIngredientResultsBlock: recipe rows target the picker's nesting action instead", function () {
   const html = M.renderIngredientResultsBlock({
@@ -3056,18 +3077,159 @@ test("exportSnapshot: carries targetHistory, or a restored backup rescores every
   assertEqual(M.exportSnapshot().targetHistory["2026-03-01"].calorieTarget, 1900, "included in the backup");
   resetTargetHistory();
 });
-test("renderTargetHistoryBlock: hidden until there is something to show", function () {
+test("renderTargetHistoryBlock: always offers Add, lists live periods with their span and weight change", function () {
   resetTargetHistory();
-  assertEqual(M.renderTargetHistoryBlock(), "", "nothing rendered on an untouched install");
+  M.state.ui = {};
+  const empty = M.renderTargetHistoryBlock();
+  assertEqual(empty.indexOf("addTargetPeriod") >= 0, true, "an untouched install can still add a period by hand");
+  assertEqual(empty.indexOf("No changes recorded yet") >= 0, true, "and says the current targets apply everywhere");
   M.state.targetHistory = {
     "2026-03-01": { calorieTarget: 1900, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-03-01T00:00:00.000Z" },
     "2026-07-26": { calorieTarget: 2800, proteinTarget: 1, carbsTarget: 1, fatTarget: 1, updatedAt: "2026-07-26T00:00:00.000Z" },
+    "2026-05-01": { deleted: true, updatedAt: "2026-09-01T00:00:00.000Z" },
   };
   const html = M.renderTargetHistoryBlock();
   assertEqual(html.indexOf("Target History") >= 0, true, "section heading");
-  assertEqual(html.indexOf("1,900 kcal") >= 0 && html.indexOf("2,800 kcal") >= 0, true, "both periods listed");
+  assertEqual(html.indexOf("1,900 kcal") >= 0 && html.indexOf("2,800 kcal") >= 0, true, "both live periods listed");
   assertEqual(html.indexOf("now") >= 0, true, "the current period runs to now");
+  assertEqual(html.indexOf("147 days") >= 0, true, "Mar 1 -> Jul 26 is 147 days");
+  assertEqual(html.indexOf("no weigh-ins to compare") >= 0, true, "with no weigh-ins the weight column says so rather than inventing a number");
+  assertEqual(html.indexOf('data-action="editTargetPeriod"') >= 0 && html.indexOf('data-action="askDeleteTargetPeriod"') >= 0, true, "edit and (two-step) delete controls per row");
+  assertEqual((html.match(/data-action="editTargetPeriod"/g) || []).length, 2, "the tombstoned period is not listed");
   resetTargetHistory();
+});
+
+// ==== target history: manual editing (2026-09-11) ====
+function seedPeriods() {
+  resetTargetHistory();
+  M.state.ui = {};
+  M.state.weights = {};
+  M.state.settings.calorieTarget = 2200; M.state.settings.proteinTarget = 150; M.state.settings.carbsTarget = 200; M.state.settings.fatTarget = 70;
+  M.state.settings.macroLocks = {};
+  M.state.targetHistory = {
+    "2026-08-01": { calorieTarget: 2000, proteinTarget: 150, carbsTarget: 175, fatTarget: 55, updatedAt: "2026-08-01T00:00:00.000Z" },
+    "2026-09-01": { calorieTarget: 2200, proteinTarget: 150, carbsTarget: 200, fatTarget: 70, updatedAt: "2026-09-01T00:00:00.000Z" },
+  };
+  M.syncTargetBaseline();
+  return M.state.ui.strategy || (M.state.ui.strategy = null);
+}
+test("liveTargetHistoryDates / targetsForDate: tombstones never score a day", function () {
+  seedPeriods();
+  M.state.targetHistory["2026-08-15"] = { deleted: true, updatedAt: "2026-09-10T00:00:00.000Z" };
+  assertEqual(M.liveTargetHistoryDates(), ["2026-08-01", "2026-09-01"], "the tombstone is not a live date");
+  assertEqual(M.targetsForDate("2026-08-20").calorieTarget, 2000, "a day inside the tombstoned slot falls to the real preceding period");
+  assertEqual(M.targetsForDate("2026-07-01").calorieTarget, 2000, "before everything: the oldest LIVE entry extends backwards");
+  resetTargetHistory();
+});
+test("editing the CURRENT period's calories updates Daily Targets, re-splits macros, and adds no entry dated today", function () {
+  seedPeriods();
+  M.actions.editTargetPeriod("2026-09-01");
+  const su = M.state.ui.strategy;
+  assertEqual(su.targetEdit.date, "2026-09-01", "editor opened on the period");
+  su.targetEdit.calInput = "2400";
+  M.actions.saveTargetPeriod();
+  assertEqual(M.state.targetHistory["2026-09-01"].calorieTarget, 2400, "the period's calories changed in place");
+  assertEqual(M.state.settings.calorieTarget, 2400, "Daily Targets follow the standing period");
+  assertEqual(M.state.settings.proteinTarget, 177, "macros re-split in their current proportions (lock-aware), same as a hand edit of the calorie field");
+  assertEqual(M.state.targetHistory["2026-09-01"].proteinTarget, 177, "and the period carries the same macros");
+  assertEqual(M.liveTargetHistoryDates(), ["2026-08-01", "2026-09-01"], "no new entry dated today split the period");
+  assertEqual(su.targetEdit, null, "editor closed");
+  resetTargetHistory();
+});
+test("editing a PAST period scales its macros proportionally and leaves Daily Targets alone", function () {
+  seedPeriods();
+  M.actions.editTargetPeriod("2026-08-01");
+  M.state.ui.strategy.targetEdit.calInput = "1000"; // half of 2000
+  M.actions.saveTargetPeriod();
+  const t = M.state.targetHistory["2026-08-01"];
+  assertEqual([t.calorieTarget, t.proteinTarget, t.carbsTarget, t.fatTarget], [1000, 75, 88, 28], "halved in proportion");
+  assertEqual(M.state.settings.calorieTarget, 2200, "the standing target is untouched");
+  resetTargetHistory();
+});
+test("moving a period's start date tombstones the old date (so the cloud can't resurrect it) and refuses a collision", function () {
+  seedPeriods();
+  M.actions.editTargetPeriod("2026-08-01");
+  M.state.ui.strategy.targetEdit.dateInput = "2026-07-25";
+  M.actions.saveTargetPeriod();
+  assertEqual(M.state.targetHistory["2026-08-01"].deleted, true, "old date left as a tombstone, not deleted");
+  assertEqual(M.state.targetHistory["2026-08-01"].updatedAt > "2026-08-01T00:00:00.000Z", true, "with a fresh stamp so the deletion wins the merge");
+  assertEqual(M.liveTargetHistoryDates(), ["2026-07-25", "2026-09-01"], "live dates reflect the move");
+  assertEqual(M.state.targetHistory["2026-07-25"].calorieTarget, 2000, "the period's numbers travelled with it");
+  assertEqual(M.targetsForDate("2026-07-28").calorieTarget, 2000, "days in the new span score against it");
+  M.actions.editTargetPeriod("2026-07-25");
+  M.state.ui.strategy.targetEdit.dateInput = "2026-09-01";
+  M.actions.saveTargetPeriod();
+  assertEqual(typeof M.state.ui.strategy.targetEdit.error, "string", "moving onto a date that already starts a period is refused");
+  assertEqual(M.state.targetHistory["2026-09-01"].calorieTarget, 2200, "and nothing was overwritten");
+  resetTargetHistory();
+});
+test("deleting a period is two-step, tombstones it, and deleting the current one reverts Daily Targets", function () {
+  seedPeriods();
+  M.actions.deleteTargetPeriod("2026-09-01");
+  assertEqual(M.state.targetHistory["2026-09-01"].deleted, undefined, "a single tap deletes nothing");
+  M.actions.askDeleteTargetPeriod("2026-09-01");
+  M.actions.deleteTargetPeriod("2026-09-01");
+  assertEqual(M.state.targetHistory["2026-09-01"].deleted, true, "armed + confirmed: tombstoned");
+  assertEqual(M.state.settings.calorieTarget, 2000, "the previous period is the standing target again");
+  assertEqual(M.state.settings.carbsTarget, 175, "macros too");
+  assertEqual(M.liveTargetHistoryDates(), ["2026-08-01"], "one live period left");
+  resetTargetHistory();
+});
+test("adding a period: a past date splits history without touching settings; a current date becomes the standing target", function () {
+  seedPeriods();
+  M.actions.addTargetPeriod();
+  const su = M.state.ui.strategy;
+  su.targetAdd.dateInput = "2026-08-15"; su.targetAdd.calInput = "1800";
+  M.actions.saveNewTargetPeriod();
+  assertEqual(M.liveTargetHistoryDates(), ["2026-08-01", "2026-08-15", "2026-09-01"], "inserted between the existing periods");
+  assertEqual(M.targetsForDate("2026-08-20").calorieTarget, 1800, "and it scores its span");
+  assertEqual(M.state.settings.calorieTarget, 2200, "not the latest, so Daily Targets are untouched");
+  M.actions.addTargetPeriod();
+  su.targetAdd.calInput = "1900"; // dateInput defaults to today
+  M.actions.saveNewTargetPeriod();
+  assertEqual(M.state.settings.calorieTarget, 1900, "a period starting today is the standing target");
+  M.actions.addTargetPeriod();
+  su.targetAdd.dateInput = "nope"; su.targetAdd.calInput = "1900";
+  M.actions.saveNewTargetPeriod();
+  assertEqual(typeof su.targetAdd.error, "string", "a bad date is refused with a message, not written");
+  resetTargetHistory();
+});
+test("recordTargetChange: a history holding only tombstones still back-fills the baseline on the first real change", function () {
+  resetTargetHistory();
+  M.state.foodLogs = { "2026-06-01": [{ id: "x", macros: { calories: 500 } }] };
+  M.state.settings.calorieTarget = 2000;
+  M.syncTargetBaseline();
+  M.state.targetHistory = { "2026-07-01": { deleted: true, updatedAt: "2026-09-01T00:00:00.000Z" } };
+  M.state.settings.calorieTarget = 2100;
+  assertEqual(M.recordTargetChange(), true, "recorded");
+  assertEqual(M.state.targetHistory["2026-06-01"].calorieTarget, 2000, "the OLD target is back-filled to the first logged day -- a tombstone is not evidence of a recorded change");
+  resetTargetHistory();
+});
+test("targetPeriodStats: 7-day trend at each end, span in days, rate per week", function () {
+  resetTargetHistory();
+  M.state.weights = {};
+  for (let i = 1; i <= 28; i++) M.state.weights["2026-08-" + String(i).padStart(2, "0")] = { weight: 202.7 - (i - 1) * 0.1, unit: "lbs" };
+  const st = M.targetPeriodStats("2026-08-08", "2026-08-22");
+  assertEqual([st.days, st.change, st.perWeek], [14, -1.4, -0.7], "trend 202.3 -> 200.9 over two weeks");
+  assertEqual(M.targetPeriodStats("2026-08-08", "2026-08-11").perWeek, null, "under a week: no rate (noise)");
+  M.state.weights = {};
+  assertEqual(M.targetPeriodStats("2026-08-08", "2026-08-22").change, null, "no weigh-ins: no number invented");
+  resetTargetHistory();
+});
+test("dashboard: the standalone Add Food button is gone and the targets card is the tightened layout", function () {
+  resetTargetHistory();
+  M.state.ui = {}; M.state.date = "2026-07-22"; M.state.foodLogs = {};
+  const html = M.renderDashboard();
+  assertEqual(html.indexOf("＋ Add Food"), -1, "no duplicate of the bottom bar's button");
+  assertEqual(html.indexOf("% done") >= 0, true, "the readout still renders");
+  resetTargetHistory();
+});
+test("targets section: the Macro Split Presets chips are gone", function () {
+  M.state.ui = {};
+  const html = M.renderTargetsSection();
+  assertEqual(html.indexOf("Macro Split Presets"), -1, "no presets label");
+  assertEqual(html.indexOf("applyPreset"), -1, "no preset action wired");
+  assertEqual(html.indexOf("By Grams") >= 0, true, "the grams/percent editors remain");
 });
 
 test("logoSvg: emits a well-formed mark with the gradient and both paths", function () {

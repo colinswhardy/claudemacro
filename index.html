@@ -81,8 +81,8 @@ a{color:inherit;}
 .statCard{flex:1;background:#0F1220;border:1px solid #1E2640;border-radius:12px;padding:16px;min-width:0;}
 .statLabel{color:#64748B;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;}
 .statValue{font-size:22px;font-weight:700;}
-.pbWrap{margin-bottom:16px;}
-.pbTop{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;}
+.pbWrap{margin-bottom:10px;}
+.pbTop{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;}
 .pbLeft{display:flex;align-items:center;gap:8px;}
 .pbDot{width:8px;height:8px;border-radius:50%;}
 .pbLabel{color:#E2E8F0;font-size:15px;font-weight:500;}
@@ -140,14 +140,6 @@ const C = {
   textSec: "#94A3B8", textMut: "#64748B", inputBg: "#0F1220", barBg: "#1E2640",
 };
 
-const MACRO_PRESETS = [
-  { name: "Balanced", protein: 30, carbs: 40, fat: 30 },
-  { name: "High Protein", protein: 40, carbs: 35, fat: 25 },
-  { name: "Low Carb", protein: 35, carbs: 25, fat: 40 },
-  { name: "High Carb", protein: 25, carbs: 50, fat: 25 },
-  { name: "Keto", protein: 25, carbs: 5, fat: 70 },
-];
-
 const WIZARD_CONFIGS = {
   steak: { label: "Steak", icon: "\u{1F969}", steps: [
     { key: "prep", label: "Preparation", options: ["Raw", "Cooked"] },
@@ -192,7 +184,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.34";
+const APP_VERSION = "1.35";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -2196,14 +2188,20 @@ function sameTargets(a, b) {
 // The targets in effect on a given day: the most recent recorded change dated on or before it.
 // With nothing recorded it falls back to current settings, which is exactly the pre-feature
 // behaviour -- an install that has never changed a target behaves identically.
+// The dates of the LIVE entries, ascending. An entry with `deleted: true` is a TOMBSTONE
+// (added 2026-09-11 with manual period editing): it stays under its date with a fresh
+// updatedAt so the per-date newer-wins merge carries the deletion to other devices --
+// dayBoosts' all-zero trick -- and every reader comes through here so it never scores a day.
+function liveTargetHistoryDates() {
+  const hist = state.targetHistory || {};
+  return Object.keys(hist).filter(function(d) { return hist[d] && !hist[d].deleted; }).sort();
+}
 function targetsForDate(dateStr) {
   const hist = state.targetHistory || {};
+  const dates = liveTargetHistoryDates();
   let best = null;    // newest change dated on or before the day
-  let earliest = null; // oldest change on record, whatever its date
-  Object.keys(hist).forEach(function(d) {
-    if (d <= dateStr && (best === null || d > best)) best = d;
-    if (earliest === null || d < earliest) earliest = d;
-  });
+  const earliest = dates.length > 0 ? dates[0] : null; // oldest change on record, whatever its date
+  dates.forEach(function(d) { if (d <= dateStr) best = d; }); // ascending, so the last hit wins
   if (best !== null) return targetSnapshotOf(hist[best]);
   // Nothing recorded on or before this day. If anything is recorded at all, the oldest entry is
   // the best evidence available and is extended backwards -- falling through to CURRENT settings
@@ -2233,7 +2231,7 @@ function recordTargetChange() {
   // there's a food log for. Without it every past day falls through to the NEW targets and
   // shows the exact distortion this exists to prevent. This is the one and only moment the old
   // value is still knowable -- after this write it's gone for good.
-  if (Object.keys(state.targetHistory).length === 0) {
+  if (liveTargetHistoryDates().length === 0) {
     const firstDay = earliestLoggedDate();
     if (firstDay && firstDay < today) {
       state.targetHistory[firstDay] = Object.assign({}, lastKnownTargets, { updatedAt: new Date().toISOString() });
@@ -2538,16 +2536,19 @@ function renderDashboard() {
   const remaining = t.calorieTarget - totals.calories;
   const entries = state.foodLogs[state.date] || [];
 
+  // Tightened 2026-09-11 (Colin: "the card doesn't need to be that tall"): smaller hero
+  // numbers, the remaining/over/percent readout on one line, and less air between rows
+  // (.pbWrap/.pbTop in the stylesheet went down with it).
   let html = card(
-    '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px">' +
-      '<div>' +
-        '<div style="font-size:42px;font-weight:800;line-height:1;letter-spacing:-1px">' + Math.round(totals.calories).toLocaleString() + '</div>' +
-        '<div style="color:' + C.textMut + ';font-size:14px;margin-top:4px">of ' + t.calorieTarget.toLocaleString() + ' kcal' + (t.boost ? ' <span style="color:' + C.warning + '">⚡</span>' : '') + '</div>' +
+    '<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:10px">' +
+      '<div style="display:flex;align-items:baseline;gap:8px">' +
+        '<div style="font-size:34px;font-weight:800;line-height:1;letter-spacing:-1px">' + Math.round(totals.calories).toLocaleString() + '</div>' +
+        '<div style="color:' + C.textMut + ';font-size:13px">of ' + t.calorieTarget.toLocaleString() + ' kcal' + (t.boost ? ' <span style="color:' + C.warning + '">⚡</span>' : '') + '</div>' +
       '</div>' +
-      '<div style="text-align:right">' +
-        '<div style="font-size:28px;font-weight:700;color:' + (remaining >= 0 ? C.success : C.danger) + '">' + Math.abs(Math.round(remaining)) + '</div>' +
-        '<div style="color:' + C.textMut + ';font-size:12px;text-transform:uppercase">' + (remaining >= 0 ? "Remaining" : "Over") + '</div>' +
-        '<div style="color:' + C.textMut + ';font-size:13px;margin-top:2px">' + calPct + '% done</div>' +
+      '<div style="text-align:right;line-height:1.15">' +
+        '<span style="font-size:22px;font-weight:700;color:' + (remaining >= 0 ? C.success : C.danger) + '">' + Math.abs(Math.round(remaining)) + '</span>' +
+        ' <span style="color:' + C.textMut + ';font-size:11px;text-transform:uppercase">' + (remaining >= 0 ? "left" : "over") + '</span>' +
+        '<div style="color:' + C.textMut + ';font-size:11px">' + calPct + '% done</div>' +
       '</div>' +
     '</div>' +
     progressBar(totals.calories, t.calorieTarget, C.calories, "Calories", t.boost ? "(" + signedKcal(boostCalories(t.boost)) + " boost)" : "", " kcal") +
@@ -2558,8 +2559,8 @@ function renderDashboard() {
     renderDashboardFeedBlock(state.date, t)
   );
 
-  html += '<div class="row" style="margin-bottom:16px">' + btn({ label: "\uFF0B Add Food", action: "setTab", arg: "food", full: true }) + '</div>';
-
+  // No standalone "Add Food" button here any more (2026-09-11): the bottom bar carries a
+  // persistent one on every screen, so this was a second copy of the same tap.
   if (entries.length > 0) {
     const groups = groupEntriesByHourNewestFirst(entries);
     let logHtml = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">' +
@@ -3630,36 +3631,60 @@ function resultsSectionHeader(label, color) {
   '</div>';
 }
 
-// Two deliberately separate groups: foods already eaten before (instant, local, no network)
-// on top, then the online database hits underneath. They are NOT merged through
-// deduplicateFoods together -- doing that folded a history item into a database row and
-// stripped its "you've had this before" identity. Instead the database list simply drops
-// anything already shown in the history group (by id), so nothing appears twice.
-// The two-group body itself, shared verbatim by the Food tab's search and the recipe
-// ingredient picker's search -- the picker used to render database hits only, so a food Colin
-// had manually entered or eaten before was unreachable when building a recipe. Keeping one
-// renderer (rather than a parallel copy) is what stops the two screens drifting apart again.
-// Three groups, most-specific first: your own saved recipes, then foods you've eaten before,
-// then the online databases. Recipes lead because they're the thing you built deliberately --
-// and because they were previously unreachable from any search box at all.
+// Colin's own foods and recipes as ONE list in log-recency order (2026-09-11: "show them in
+// the order I most recently added them to my log ... and indicate on the card if it is a
+// recipe, rather than having a separate recipe section"). Position comes from
+// state.recentFoods -- the History list, unshifted on every log, so its index IS "how recently
+// I added this". A recipe takes the slot of its own "recipe_food_<id>" snapshot (the record
+// logging it leaves in History), so it sits exactly where it was last eaten while rendering
+// LIVE from its current ingredients with the Recipe badge -- the callers still strip that
+// frozen snapshot out of the history list via historyExcludingRecipes, which is why the slot
+// is looked up here rather than read off the list. Anything without a log position (a
+// favorites/cache-only food, a recipe never logged) follows, in its incoming order.
+// Pure over state, tested.
+function mergeFoodsAndRecipesByRecency(recipes, historyFoods) {
+  const pos = {};
+  (state.recentFoods || []).forEach(function(f, i) { if (f && f.id && pos[f.id] === undefined) pos[f.id] = i; });
+  const items = [];
+  (historyFoods || []).forEach(function(f, i) {
+    items.push({ kind: "food", food: f, pos: pos[f.id] !== undefined ? pos[f.id] : Infinity, tie: i });
+  });
+  (recipes || []).forEach(function(r, i) {
+    const p = pos[recipeSnapshotFoodId(r.id)];
+    items.push({ kind: "recipe", recipe: r, pos: p !== undefined ? p : Infinity, tie: 100000 + i });
+  });
+  items.sort(function(a, b) {
+    if (a.pos !== b.pos) return (a.pos === Infinity) ? 1 : (b.pos === Infinity ? -1 : a.pos - b.pos);
+    return a.tie - b.tie;
+  });
+  return items;
+}
+
+// Two deliberately separate groups: your own foods and recipes (instant, local, no network,
+// recency-ordered -- see mergeFoodsAndRecipesByRecency) on top, then the online database hits
+// underneath. They are NOT merged through deduplicateFoods together -- doing that folded a
+// history item into a database row and stripped its "you've had this before" identity.
+// Instead the database list simply drops anything already shown in the own group (by id), so
+// nothing appears twice. The body is shared verbatim by the Food tab's search, the recipe
+// ingredient picker's search and the describe-a-meal row search -- the picker used to render
+// database hits only, so a food Colin had manually entered or eaten before was unreachable
+// when building a recipe. Keeping one renderer (rather than a parallel copy) is what stops
+// the screens drifting apart again. Recipe rows use cfg.recipeAction; without one (a caller
+// that can't take a recipe) they are simply not offered.
 function renderFoodResultGroups(cfg) {
-  const recipes = cfg.recipes || [];
-  const history = cfg.history || [];
+  const own = mergeFoodsAndRecipesByRecency(cfg.recipeAction ? cfg.recipes : [], cfg.history);
   const dbResults = cfg.dbResults || [];
   let html = '';
   let groupsSoFar = 0;
   function separate() { if (groupsSoFar > 0) html += '<div style="height:6px"></div>'; groupsSoFar++; }
 
-  if (recipes.length > 0 && cfg.recipeAction) {
+  if (own.length > 0) {
     separate();
-    html += resultsSectionHeader("\u{1F372} Your recipes", C.primary);
-    recipes.forEach(function(recipe) { html += recipeResultRow(recipe, cfg.recipeAction); });
-  }
-
-  if (history.length > 0) {
-    separate();
-    html += resultsSectionHeader("★ Eaten before", C.warning);
-    history.forEach(function(food) { html += foodResultRow(food, "history", cfg.action); });
+    html += resultsSectionHeader("★ Your foods & recipes", C.warning);
+    own.forEach(function(it) {
+      if (it.kind === "recipe") html += recipeResultRow(it.recipe, cfg.recipeAction);
+      else html += foodResultRow(it.food, "history", cfg.action);
+    });
   }
 
   if (dbResults.length > 0) {
@@ -7159,7 +7184,10 @@ function strategyUi() {
     // save's photo uploads are in flight (doubles as the double-tap guard).
     waistDate: null, waistInput: "", waistNotes: "", waistPhotos: [], waistEditingDate: null, confirmDeleteWaistDate: null, viewingPhoto: null, waistSaving: false,
     // Data Health results (Data section) and the Insights section's in-flight state.
-    dataHealth: null, insightsLoading: false, insightsError: null };
+    dataHealth: null, insightsLoading: false, insightsError: null,
+    // Target History editing: the period being edited (keyed by its original date), the
+    // add-a-period form, and the armed two-step delete.
+    targetEdit: null, targetAdd: null, confirmDeleteTargetDate: null };
   return state.ui.strategy;
 }
 
@@ -7197,12 +7225,10 @@ function renderTargetsSection() {
   const set = state.settings;
   const su = strategyUi();
   let html = '<h3 class="cardTitle">Daily Targets</h3>' +
-    '<div style="margin-bottom:20px"><label class="label">Calorie Target (kcal)</label>' + textInput({ id: "calorieTargetInput", value: set.calorieTarget, type: "number", bind: "calorieTarget" }) + '</div>' +
-    '<div style="margin-bottom:16px"><label class="label" style="margin-bottom:8px">Macro Split Presets</label><div class="rowWrap">';
-  MACRO_PRESETS.forEach(function(p) {
-    html += '<button class="chip' + (set.macroPreset === p.name ? ' active' : '') + '" data-action="applyPreset" data-arg="' + esc_attr(p.name) + '">' + esc(p.name) + '</button>';
-  });
-  html += '</div></div>';
+    '<div style="margin-bottom:20px"><label class="label">Calorie Target (kcal)</label>' + textInput({ id: "calorieTargetInput", value: set.calorieTarget, type: "number", bind: "calorieTarget" }) + '</div>';
+  // The "Macro Split Presets" chips were removed 2026-09-11 at Colin's request; the By Grams /
+  // By % editors below are the whole interface now (settings.macroPreset lingers as a harmless
+  // "Custom" marker on old settings blobs).
   html += '<div class="row" style="margin-bottom:16px">' +
     '<button class="chip' + (su.inputMode === "grams" ? ' active' : '') + '" data-action="setInputMode" data-arg="grams">By Grams</button>' +
     '<button class="chip' + (su.inputMode === "percent" ? ' active' : '') + '" data-action="setInputMode" data-arg="percent">By %</button>' +
@@ -7234,40 +7260,221 @@ function renderTargetsSection() {
   return card(html);
 }
 
-// Read-only, and only once there's actually something to show. Without it the fact that past
-// days are scored against past targets is invisible magic -- this is what makes "why does an
-// old day say I hit my goal when my goal is 2,800?" answerable at a glance.
+// ---- Target History: editable periods with what the scale did across each ----
+// Was read-only; editable since 2026-09-11 (Colin: "allow me to manually change when the
+// different Target History dates started and ended, and the calorie amounts ... indicate my
+// weight loss/gain beside each, the length of time, and the rate per week"). A period runs
+// from its start date until the next period starts (the current one until today), so
+// "changing when one ended" is editing the next one's start.
+//
+// Data-safety rules, in order of how much they matter:
+//  - A date move or a delete writes a TOMBSTONE ({deleted:true, updatedAt}) under the old
+//    date instead of removing the key. The cloud merge is per-date newer-wins and additive,
+//    so a removed key would simply come back from the cloud on the next pull. Every reader
+//    goes through liveTargetHistoryDates().
+//  - Editing the CURRENT period (the standing target) also updates Daily Targets above,
+//    through the same lock-aware macro redistribution a hand edit of the calorie field uses,
+//    and re-syncs the change baseline BEFORE saveSettings -- otherwise recordTargetChange
+//    would see a moved target and split the period the user just set with a new entry dated
+//    today. A past period's macros scale proportionally to the new calories instead.
+//  - Deleting the current period reverts Daily Targets to the previous period (that change
+//    "never happened"); deleting the only period returns to the untouched-install rule.
+
+// What the scale did across one period: the 7-day trend average at each end (weightTrendSeries
+// -- average-vs-average, the chart readout's rule, so a water spike on a boundary can't fake a
+// result), the span in days, and the rate per week (null under a week: a rate over three days
+// is noise). Pure over state, tested.
+function targetPeriodStats(startDate, nextDate) {
+  const endDate = nextDate || todayStr();
+  const span = Math.round((parseDateStr(endDate) - parseDateStr(startDate)) / 86400000);
+  const days = Math.max(0, span);
+  let change = null, perWeek = null;
+  const allData = Object.keys(state.weights).sort().map(function(d) { return { date: d, weight: state.weights[d].weight }; });
+  if (allData.length > 0 && span >= 0) {
+    const ends = weightTrendSeries(allData, [startDate, endDate]);
+    if (ends[0] != null && ends[1] != null) {
+      change = round1(ends[1] - ends[0]);
+      perWeek = days >= 7 ? round1(change / (days / 7)) : null;
+    }
+  }
+  return { start: startDate, end: endDate, current: !nextDate, days: days, change: change, perWeek: perWeek };
+}
+
+function renderTargetPeriodForm(mode, f) {
+  const isAdd = mode === "add";
+  const saveAction = isAdd ? "saveNewTargetPeriod" : "saveTargetPeriod";
+  return '<div style="padding:10px 12px;background:' + C.inputBg + ';border-radius:10px;margin-bottom:8px">' +
+    '<div class="row" style="align-items:flex-end">' +
+      '<div style="flex:1"><label class="label">Starts</label>' + textInput({ value: f.dateInput, type: "date", bind: isAdd ? "targetAddDate" : "targetEditDate", enter: saveAction }) + '</div>' +
+      '<div style="width:110px"><label class="label">kcal / day</label>' + textInput({ value: f.calInput, type: "number", bind: isAdd ? "targetAddCal" : "targetEditCal", enter: saveAction }) + '</div>' +
+    '</div>' +
+    (f.error ? '<div style="color:' + C.danger + ';font-size:11px;margin-top:6px">' + esc(f.error) + '</div>' : '') +
+    '<div class="row" style="margin-top:8px">' +
+      btn({ label: "Cancel", action: isAdd ? "cancelAddTargetPeriod" : "cancelEditTargetPeriod", small: true, outline: true }) +
+      btn({ label: isAdd ? "Add period" : "Save", action: saveAction, small: true }) +
+    '</div>' +
+    '<div style="color:' + C.textMut + ';font-size:11px;margin-top:6px">A period ends where the next one starts. ' + (isAdd ? 'Adding one at today or later makes it your standing target.' : 'Editing the current period also updates your Daily Targets above.') + '</div>' +
+  '</div>';
+}
+
 function renderTargetHistoryBlock() {
-  const dates = Object.keys(state.targetHistory || {}).sort();
-  if (dates.length === 0) return '';
+  const su = strategyUi();
+  const dates = liveTargetHistoryDates();
+  const unit = state.settings.weightUnit || "lbs";
   let html = '<div style="margin-top:20px;padding-top:16px;border-top:1px solid ' + C.border + '">' +
-    '<label class="label" style="margin-bottom:8px">Target History</label>' +
-    '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:10px">Past days are scored against the goal that was standing on that day, so changing your target now doesn’t rewrite how those days read.</div>';
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">' +
+      '<label class="label" style="margin:0">Target History</label>' +
+      (su.targetAdd ? '' : btn({ label: "+ Add period", action: "addTargetPeriod", small: true, outline: true })) +
+    '</div>' +
+    '<div style="color:' + C.textMut + ';font-size:11px;margin-bottom:10px">Past days are scored against the goal standing on that day. Weight change is the 7-day trend at each end of the period.</div>';
+  if (su.targetAdd) html += renderTargetPeriodForm("add", su.targetAdd);
+  if (dates.length === 0) {
+    if (!su.targetAdd) html += '<div style="color:' + C.textMut + ';font-size:12px">No changes recorded yet — your current targets apply to every day.</div>';
+    return html + '</div>';
+  }
   // Newest first, each row covering "from this date until the next change".
   for (let i = dates.length - 1; i >= 0; i--) {
-    const t = state.targetHistory[dates[i]];
+    const d = dates[i];
+    const t = state.targetHistory[d];
     const isCurrent = i === dates.length - 1;
-    const until = isCurrent ? "now" : dayLabel(dates[i + 1]);
-    html += '<div style="display:flex;justify-content:space-between;align-items:baseline;padding:4px 0;font-size:12px">' +
-      '<span style="color:' + (isCurrent ? C.textSec : C.textMut) + '">' + esc(dayLabel(dates[i])) + ' → ' + esc(until) + '</span>' +
-      '<span style="color:' + (isCurrent ? C.calories : C.textMut) + ';font-weight:600">' + (t.calorieTarget || 0).toLocaleString() + ' kcal</span>' +
+    if (su.targetEdit && su.targetEdit.date === d) { html += renderTargetPeriodForm("edit", su.targetEdit); continue; }
+    const st = targetPeriodStats(d, isCurrent ? null : dates[i + 1]);
+    const armed = su.confirmDeleteTargetDate === d;
+    const changeColor = st.change == null ? C.textMut : (isCurrent ? phaseRateColor(st.perWeek == null ? st.change : st.perWeek) : C.textSec);
+    html += '<div style="padding:6px 0;border-bottom:1px solid ' + C.border + '">' +
+      '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12px">' +
+        '<span style="color:' + (isCurrent ? C.textSec : C.textMut) + '">' + esc(dayLabel(d)) + ' → ' + (isCurrent ? 'now' : esc(dayLabel(dates[i + 1]))) + '</span>' +
+        '<span style="color:' + (isCurrent ? C.calories : C.textMut) + ';font-weight:600">' + (t.calorieTarget || 0).toLocaleString() + ' kcal</span>' +
+      '</div>' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:2px">' +
+        '<span style="color:' + C.textMut + ';font-size:11px">' + st.days + ' day' + (st.days === 1 ? '' : 's') + ' · ' +
+          '<span style="color:' + changeColor + ';font-weight:600">' + (st.change == null ? 'no weigh-ins to compare' : signedWeight(st.change) + ' ' + esc(unit) + (st.perWeek != null ? ' (' + signedWeight(st.perWeek) + '/wk)' : '')) + '</span>' +
+        '</span>' +
+        (armed
+          ? '<span style="display:flex;gap:4px">' + btn({ label: "Cancel", action: "cancelDeleteTargetPeriod", small: true, outline: true }) + btn({ label: "Delete?", action: "deleteTargetPeriod", arg: d, small: true, color: "danger" }) + '</span>'
+          : '<span style="display:flex;gap:2px">' +
+              '<button data-action="editTargetPeriod" data-arg="' + d + '" title="Edit" style="background:none;border:none;color:' + C.textMut + ';font-size:14px;cursor:pointer;padding:2px 6px">✎</button>' +
+              '<button data-action="askDeleteTargetPeriod" data-arg="' + d + '" title="Delete" style="background:none;border:none;color:' + C.textMut + ';font-size:14px;cursor:pointer;padding:2px 6px">🗑</button>' +
+            '</span>') +
+      '</div>' +
     '</div>';
   }
   return html + '</div>';
 }
 
-actions.applyPreset = function(name) {
-  const preset = MACRO_PRESETS.find(function(p){ return p.name === name; });
-  if (!preset) return;
+// Validates a period form; a message string on failure, {date, cal} on success.
+function parseTargetPeriodForm(dateInput, calInput) {
+  const d = String(dateInput || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || isNaN(parseDateStr(d).getTime())) return "Enter a valid start date.";
+  const cal = parseInt(calInput, 10);
+  if (!(cal > 0)) return "Enter a calorie target above 0.";
+  return { date: d, cal: cal };
+}
+
+// Grams scaled to a new calorie total in their current proportions -- for a PAST period,
+// where the standing locks don't apply and the honest thing is to keep its macro split.
+function scaleTargetMacros(entry, newCal) {
+  const oldCal = entry.calorieTarget > 0 ? entry.calorieTarget : (entry.proteinTarget * 4 + entry.carbsTarget * 4 + entry.fatTarget * 9);
+  const k = oldCal > 0 ? newCal / oldCal : 1;
+  return { proteinTarget: Math.round((entry.proteinTarget || 0) * k), carbsTarget: Math.round((entry.carbsTarget || 0) * k), fatTarget: Math.round((entry.fatTarget || 0) * k) };
+}
+
+// Daily Targets follow a snapshot -- used when the current period is edited or deleted. The
+// baseline is re-synced BEFORE saveSettings so recordTargetChange does not file this as a new
+// change dated today.
+function adoptTargetsIntoSettings(snap) {
   const set = state.settings;
-  const cal = set.calorieTarget;
-  set.macroPreset = name;
-  set.proteinTarget = Math.round((cal * preset.protein / 100) / 4);
-  set.carbsTarget = Math.round((cal * preset.carbs / 100) / 4);
-  set.fatTarget = Math.round((cal * preset.fat / 100) / 9);
+  set.calorieTarget = snap.calorieTarget; set.proteinTarget = snap.proteinTarget; set.carbsTarget = snap.carbsTarget; set.fatTarget = snap.fatTarget;
+  set.macroPreset = "Custom";
+  syncTargetBaseline();
   saveSettings();
+}
+
+// Writes one period. `moveFrom` is the date the entry is leaving (tombstoned) on a date edit.
+// Returns a message string on refusal (a live period already starts on `date`), else null.
+function writeTargetPeriod(date, cal, moveFrom) {
+  const hist = state.targetHistory;
+  const live = liveTargetHistoryDates();
+  if (date !== moveFrom && live.indexOf(date) >= 0) return "A period already starts on " + dayLabel(date) + ".";
+  const stamp = new Date().toISOString();
+  // Macros: the period's own if it's being edited, else the ones standing on that date.
+  const source = moveFrom ? hist[moveFrom] : targetsForDate(date);
+  const becomesCurrent = live.every(function(d) { return d === moveFrom || d <= date; });
+  const macros = becomesCurrent ? redistributeMacrosForCalories(state.settings, cal) : scaleTargetMacros(source, cal);
+  if (moveFrom && moveFrom !== date) hist[moveFrom] = { deleted: true, updatedAt: stamp };
+  hist[date] = { calorieTarget: cal, proteinTarget: macros.proteinTarget, carbsTarget: macros.carbsTarget, fatTarget: macros.fatTarget, updatedAt: stamp };
+  saveTargetHistory();
+  if (becomesCurrent) adoptTargetsIntoSettings(targetSnapshotOf(hist[date]));
+  return null;
+}
+
+actions.addTargetPeriod = function() {
+  const su = strategyUi();
+  su.targetEdit = null; su.confirmDeleteTargetDate = null;
+  su.targetAdd = { dateInput: todayStr(), calInput: String(state.settings.calorieTarget || ""), error: null };
   rerender();
 };
+actions.cancelAddTargetPeriod = function() { strategyUi().targetAdd = null; rerender(); };
+inputActions.targetAddDate = function(v) { const su = strategyUi(); if (su.targetAdd) su.targetAdd.dateInput = v; };
+inputActions.targetAddCal = function(v) { const su = strategyUi(); if (su.targetAdd) su.targetAdd.calInput = v; };
+actions.saveNewTargetPeriod = function() {
+  const su = strategyUi();
+  if (!su.targetAdd) return;
+  const parsed = parseTargetPeriodForm(su.targetAdd.dateInput, su.targetAdd.calInput);
+  if (typeof parsed === "string") { su.targetAdd.error = parsed; rerender(); return; }
+  const refused = writeTargetPeriod(parsed.date, parsed.cal, null);
+  if (refused) { su.targetAdd.error = refused; rerender(); return; }
+  su.targetAdd = null;
+  rerender();
+};
+
+actions.editTargetPeriod = function(d) {
+  const su = strategyUi();
+  const t = state.targetHistory[d];
+  if (!t || t.deleted) return;
+  su.targetAdd = null; su.confirmDeleteTargetDate = null;
+  su.targetEdit = { date: d, dateInput: d, calInput: String(t.calorieTarget || ""), error: null };
+  rerender();
+};
+actions.cancelEditTargetPeriod = function() { strategyUi().targetEdit = null; rerender(); };
+inputActions.targetEditDate = function(v) { const su = strategyUi(); if (su.targetEdit) su.targetEdit.dateInput = v; };
+inputActions.targetEditCal = function(v) { const su = strategyUi(); if (su.targetEdit) su.targetEdit.calInput = v; };
+actions.saveTargetPeriod = function() {
+  const su = strategyUi();
+  const e = su.targetEdit;
+  if (!e || !state.targetHistory[e.date] || state.targetHistory[e.date].deleted) return;
+  const parsed = parseTargetPeriodForm(e.dateInput, e.calInput);
+  if (typeof parsed === "string") { e.error = parsed; rerender(); return; }
+  const refused = writeTargetPeriod(parsed.date, parsed.cal, e.date);
+  if (refused) { e.error = refused; rerender(); return; }
+  su.targetEdit = null;
+  rerender();
+};
+
+actions.askDeleteTargetPeriod = function(d) {
+  const su = strategyUi();
+  su.targetEdit = null; su.targetAdd = null;
+  su.confirmDeleteTargetDate = d;
+  rerender();
+};
+actions.cancelDeleteTargetPeriod = function() { strategyUi().confirmDeleteTargetDate = null; rerender(); };
+actions.deleteTargetPeriod = function(d) {
+  const su = strategyUi();
+  if (su.confirmDeleteTargetDate !== d) return; // never on a single tap
+  su.confirmDeleteTargetDate = null;
+  const hist = state.targetHistory;
+  if (!hist[d] || hist[d].deleted) { rerender(); return; }
+  const live = liveTargetHistoryDates();
+  const wasCurrent = live[live.length - 1] === d;
+  hist[d] = { deleted: true, updatedAt: new Date().toISOString() };
+  saveTargetHistory();
+  if (wasCurrent) {
+    const remaining = liveTargetHistoryDates();
+    if (remaining.length > 0) adoptTargetsIntoSettings(targetSnapshotOf(hist[remaining[remaining.length - 1]]));
+  }
+  rerender();
+};
+
 actions.setInputMode = function(m) { strategyUi().inputMode = m; rerender(); };
 
 const MACRO_CAL_PER_G = { protein: 4, carbs: 4, fat: 9 };
@@ -7289,11 +7496,15 @@ inputActions.fatTarget = function(v) { state.settings.fatTarget = parseInt(v,10)
 // relative proportion to each other; locked macros' grams are left untouched. Shared with
 // the coach's Apply button, so an applied suggestion respects macro locks exactly like
 // typing the number would (lock protein and every applied step flows into carbs/fat).
-function applyCalorieTargetWithLocks(newCal) {
-  const set = state.settings;
-  set.calorieTarget = newCal;
+// The lock-aware redistribution on its own (pure): given the current gram targets and locks,
+// the macro grams that go with a new calorie total. Locked macros hold; the unlocked ones
+// share the remainder in their current proportions. Split out of applyCalorieTargetWithLocks
+// (2026-09-11) so editing the CURRENT target-history period can reuse the exact same math
+// without the saveSettings() side effect that would record a second change dated today.
+function redistributeMacrosForCalories(set, newCal) {
   const locks = set.macroLocks || {};
   const keys = ["protein", "carbs", "fat"];
+  const out = { proteinTarget: set.proteinTarget, carbsTarget: set.carbsTarget, fatTarget: set.fatTarget };
   const lockedKeys = keys.filter(function(k){ return locks[k]; });
   const unlockedKeys = keys.filter(function(k){ return !locks[k]; });
   const lockedCal = lockedKeys.reduce(function(sum, k){ return sum + set[k + "Target"] * MACRO_CAL_PER_G[k]; }, 0);
@@ -7302,9 +7513,16 @@ function applyCalorieTargetWithLocks(newCal) {
     const unlockedCalTotal = unlockedKeys.reduce(function(sum, k){ return sum + set[k + "Target"] * MACRO_CAL_PER_G[k]; }, 0);
     unlockedKeys.forEach(function(k) {
       const share = unlockedCalTotal > 0 ? (set[k + "Target"] * MACRO_CAL_PER_G[k]) / unlockedCalTotal : 1 / unlockedKeys.length;
-      set[k + "Target"] = Math.round((remaining * share) / MACRO_CAL_PER_G[k]);
+      out[k + "Target"] = Math.round((remaining * share) / MACRO_CAL_PER_G[k]);
     });
   }
+  return out;
+}
+function applyCalorieTargetWithLocks(newCal) {
+  const set = state.settings;
+  const m = redistributeMacrosForCalories(set, newCal);
+  set.calorieTarget = newCal;
+  set.proteinTarget = m.proteinTarget; set.carbsTarget = m.carbsTarget; set.fatTarget = m.fatTarget;
   set.macroPreset = "Custom";
   saveSettings();
 }
