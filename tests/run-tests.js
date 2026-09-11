@@ -174,6 +174,7 @@ const exportLine =
   "normalizeBatchIdentifyResponse: normalizeBatchIdentifyResponse, batchLocalCandidates: batchLocalCandidates, " +
   "buildBatchRows: buildBatchRows, applyBatchAmount: applyBatchAmount, batchAdoptCandidate: batchAdoptCandidate, " +
   "renderBatchEntryScreen: renderBatchEntryScreen, renderBatchRow: renderBatchRow, renderFoodTab: renderFoodTab, " +
+  "stripPhotoFields: stripPhotoFields, stripStoredPhotos: stripStoredPhotos, cleanExpiredPhotos: cleanExpiredPhotos, " +
   "BATCH_IDENTIFY_PROMPT: BATCH_IDENTIFY_PROMPT, renderAISection: renderAISection, " +
   "phaseCoach: phaseCoach, renderPhaseCoachCard: renderPhaseCoachCard, " +
   "phaseDeltaColor: phaseDeltaColor, phaseRateColor: phaseRateColor, " +
@@ -5001,6 +5002,63 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     html = M.renderAISection();
     assertEqual(html.indexOf('data-bind="claudeApiKey"') > -1, true, "choosing Claude for describe-a-meal surfaces its key field");
     M.state.settings = prevSet;
+  });
+
+  // ==== photo bytes never in localStorage (the 2026-09-11 quota outage) ====
+  test("addFoodToLog: an AI-estimate photo never lands on the entry, History, favorites or the cache", function () {
+    resetForPathTest();
+    const big = "x".repeat(50000);
+    M.addFoodToLog({ id: "ai_photo1", name: "Cinnamon roll", source: "AI Estimate", per100g: false, calories: 300, protein: 4, carbs: 40, fat: 14, fiber: 1,
+      loggedWeight: 90, baseGrams: 90, loggedMacros: { calories: 300, protein: 4, carbs: 40, fat: 14, fiber: 1 }, photo: big, wizardUsed: true });
+    const entry = M.state.foodLogs[M.state.date][0];
+    assertEqual([entry.photo, entry.photoExpires], [undefined, undefined], "no photo (or expiry) on the log entry");
+    assertEqual(M.state.recentFoods[0].photo, undefined, "History record is slim");
+    assertEqual(M.state.favorites[0].photo, undefined, "favorites record is slim (wizardUsed path)");
+    assertEqual(M.state.foodCache.ai_photo1.photo, undefined, "cache record is slim");
+    assertEqual(M.state.recentFoods[0].calories, 300, "everything else intact");
+  });
+  test("stripStoredPhotos: sweeps photo bytes out of stored records and stamps them so the slim copy wins everywhere", function () {
+    resetForPathTest();
+    const big = "x".repeat(50000);
+    M.state.recentFoods = [
+      { id: "a", name: "Fat", photo: big, photoExpires: "2026-09-13T00:00:00.000Z", updatedAt: "2026-09-11T00:00:00.000Z" },
+      { id: "b", name: "Slim", updatedAt: "2026-09-01T00:00:00.000Z" },
+    ];
+    M.state.favorites = [{ id: "a", name: "Fat", photo: big, updatedAt: "2026-09-11T00:00:00.000Z" }];
+    M.state.foodCache = { a: { id: "a", name: "Fat", photo: big, updatedAt: "2026-09-11T00:00:00.000Z" } };
+    M.state.customBarcodes = { "123": { id: "bc", name: "Bar", photo: big, updatedAt: "2026-09-11T00:00:00.000Z" } };
+    const list = M.state.recentFoods;
+    assertEqual(M.stripStoredPhotos(), 4, "all four stores touched");
+    assertEqual(M.state.recentFoods === list, true, "History array mutated in place, never reassigned");
+    assertEqual([list[0].photo, list[0].photoExpires], [undefined, undefined], "photo gone from History");
+    assertEqual(list[0].updatedAt > "2026-09-11T00:00:00.000Z", true, "stamped newer than the fat copy, so it wins the merge");
+    assertEqual(list[1].updatedAt, "2026-09-01T00:00:00.000Z", "an already-slim record is left alone (no needless stamp)");
+    assertEqual(M.state.favorites[0].photo, undefined, "favorites swept");
+    assertEqual(M.state.foodCache.a.photo, undefined, "cache swept");
+    assertEqual(M.state.customBarcodes["123"].photo, undefined, "custom barcodes swept");
+    assertEqual(M.stripStoredPhotos(), 0, "a second sweep finds nothing to do");
+  });
+  test("merges strip photo bytes from an incoming cloud record (an old-version device can't re-fatten a store)", function () {
+    resetForPathTest();
+    const big = "x".repeat(50000);
+    const list = [];
+    M.mergeFoodListFromCloud(list, [{ id: "a", name: "Fat", photo: big, updatedAt: "2026-09-12T00:00:00.000Z" }]);
+    assertEqual([list.length, list[0].photo], [1, undefined], "list merge strips");
+    M.state.foodCache = {};
+    M.mergeFoodCacheFromCloud({ a: { id: "a", name: "Fat", photo: big, updatedAt: "2026-09-12T00:00:00.000Z" } });
+    assertEqual(M.state.foodCache.a.photo, undefined, "cache merge strips");
+  });
+  test("cleanExpiredPhotos strips an entry photo whether or not it has expired; a copied entry never carries one", function () {
+    resetForPathTest();
+    const big = "x".repeat(50000);
+    M.state.foodLogs = { "2026-07-22": [{ id: "e1", foodId: "f", name: "Roll", weight: 90, macros: { calories: 300, protein: 4, carbs: 40, fat: 14, fiber: 1 }, timestamp: "2026-07-22T10:00:00.000Z", photo: big, photoExpires: "2099-01-01T00:00:00.000Z" }] };
+    M.cleanExpiredPhotos();
+    const e = M.state.foodLogs["2026-07-22"][0];
+    assertEqual([e.photo, e.photoExpires], [undefined, undefined], "stripped despite a far-future expiry");
+    assertEqual(e.macros.calories, 300, "the entry itself is intact");
+    e.photo = big;
+    M.copyFoodEntryToDate("e1", "2026-07-23");
+    assertEqual(M.state.foodLogs["2026-07-23"][0].photo, undefined, "a copy never carries the photo");
   });
 
   // ==== food wizard: query building and the no-dead-end guarantee ====

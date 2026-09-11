@@ -184,7 +184,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.35";
+const APP_VERSION = "1.36";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -375,19 +375,57 @@ const NON_BACKED_UP_KEYS = [
   "lastInsights",
 ];
 
+// ---- Photo bytes never belong in localStorage (the 2026-09-11 "Couldn't save to this device"
+// outage) ----
+// One AI estimate was made from an UNCOMPRESSED 4.9MB camera photo. addFoodToLog copied the
+// whole food object -- photo included -- into History AND the food cache, and the log entry
+// kept its own copy for two days: three ~5MB blobs against a ~5MB localStorage quota shared
+// with everything, so every write after it failed and the banner fired on recentFoods. Nothing
+// ever READ a photo off a food record or an entry (the column doesn't even sync), so those
+// bytes were dead weight from the start. Three layers now: stripPhotoFields at every clone
+// site and in the merges (a fat record from an old-version device can't re-enter), the boot
+// sweep below for what's already stored, and the AI photo itself is compressed on capture.
+function stripPhotoFields(food) {
+  if (!food || (food.photo == null && food.photoExpires == null)) return food;
+  const out = Object.assign({}, food);
+  delete out.photo; delete out.photoExpires;
+  return out;
+}
+// Log entries: strip ANY photo, expired or not (used to wait out the 2-day expiry). No stamp
+// bump -- the photo never synced, so nothing needs to win a merge.
 function cleanExpiredPhotos() {
-  const now = new Date().toISOString();
   let changed = false;
   for (const d in state.foodLogs) {
     state.foodLogs[d] = state.foodLogs[d].map(function(e) {
-      if (e.photo && e.photoExpires && e.photoExpires < now) {
-        changed = true;
-        return Object.assign({}, e, { photo: null, photoExpires: null });
-      }
+      if (e && (e.photo != null || e.photoExpires != null)) { changed = true; return stripPhotoFields(e); }
       return e;
     });
   }
   if (changed) saveFoodLogs();
+}
+// Food records (History / Favorites / cache / custom barcodes): strip and STAMP, so the slim
+// copy is the newer one everywhere -- the cloud blob and every other device converge on it
+// through the ordinary newer-wins merge, and the next push shrinks the blob by megabytes.
+// In-place on the arrays (they must never be reassigned -- see mergeFoodListFromCloud).
+function stripStoredPhotos() {
+  const stamp = new Date().toISOString();
+  const fat = function(f) { return f && (f.photo != null || f.photoExpires != null); };
+  let touched = 0;
+  function sweepList(list) {
+    let n = 0;
+    list.forEach(function(f, i) { if (fat(f)) { list[i] = Object.assign(stripPhotoFields(f), { updatedAt: stamp }); n++; } });
+    return n;
+  }
+  function sweepMap(map) {
+    let n = 0;
+    Object.keys(map).forEach(function(k) { if (fat(map[k])) { map[k] = Object.assign(stripPhotoFields(map[k]), { updatedAt: stamp }); n++; } });
+    return n;
+  }
+  if (sweepList(state.recentFoods) > 0) { saveRecentFoods(); touched++; }
+  if (sweepList(state.favorites) > 0) { saveFavorites(); touched++; }
+  if (sweepMap(state.foodCache) > 0) { saveFoodCache(); touched++; }
+  if (sweepMap(state.customBarcodes) > 0) { saveCustomBarcodes(); touched++; }
+  return touched;
 }
 
 
@@ -953,9 +991,9 @@ function mergeFoodListFromCloud(localList, cloudArr) {
   let changed = 0;
   (cloudArr || []).forEach(function(f) {
     if (!f || !f.id) return;
-    if (!indexById.has(f.id)) { indexById.set(f.id, localList.length); localList.push(f); changed++; return; }
+    if (!indexById.has(f.id)) { indexById.set(f.id, localList.length); localList.push(stripPhotoFields(f)); changed++; return; }
     const i = indexById.get(f.id);
-    if (foodRecordIsNewer(f, localList[i])) { localList[i] = f; changed++; }
+    if (foodRecordIsNewer(f, localList[i])) { localList[i] = stripPhotoFields(f); changed++; }
   });
   return changed;
 }
@@ -1236,7 +1274,7 @@ function mergeFoodCacheFromCloud(cloudDict) {
   let changed = 0;
   Object.keys(cloudDict).forEach(function(id) {
     if (!state.foodCache[id] || foodRecordIsNewer(cloudDict[id], state.foodCache[id])) {
-      state.foodCache[id] = cloudDict[id];
+      state.foodCache[id] = stripPhotoFields(cloudDict[id]);
       changed++;
     }
   });
@@ -2406,8 +2444,9 @@ function addFoodToLog(food) {
     // half the weight must halve the items too, or the entry totals and its own components
     // would disagree. The quick-tap path logs at exactly the items' total, so this is a no-op there.
     mealItems: food.mealItems ? scaleMealItemsToWeight(food.mealItems, food.loggedWeight || sumRecipeIngredients(food.mealItems).weight) : null,
-    photo: food.photo || null,
-    photoExpires: food.photo ? new Date(Date.now() + 2*24*60*60*1000).toISOString() : null,
+    // Deliberately NO photo on the entry (removed 2026-09-11 -- see stripPhotoFields): an
+    // uncompressed camera photo here was a third ~5MB copy in localStorage of something no
+    // screen ever rendered.
     updatedAt: new Date().toISOString(),
   };
   if (!state.foodLogs[state.date]) state.foodLogs[state.date] = [];
@@ -2418,9 +2457,11 @@ function addFoodToLog(food) {
   // merges resolve conflicts on (see foodRecordIsNewer) -- without it a record already present
   // on another device can never be updated by this one, only added.
   const stampedAt = new Date().toISOString();
+  // The stored record is the food WITHOUT its photo bytes (see stripPhotoFields).
+  const record = stripPhotoFields(food);
 
   if (food.wizardUsed && !state.favorites.find(function(f){ return f.id === food.id; })) {
-    state.favorites.unshift(Object.assign({}, food, { addedAt: stampedAt, updatedAt: stampedAt }));
+    state.favorites.unshift(Object.assign({}, record, { addedAt: stampedAt, updatedAt: stampedAt }));
     state.favorites = state.favorites.slice(0, 100);
     saveFavorites();
   }
@@ -2429,13 +2470,13 @@ function addFoodToLog(food) {
   // deliberately high (was 50, which quietly dropped anything older). 500 distinct foods is
   // effectively "everything" for one person over years while keeping the synced JSON blob a
   // sane size; only the very oldest, least-recently-used items fall off past that.
-  state.recentFoods = [Object.assign({}, food, { lastUsed: stampedAt, updatedAt: stampedAt })]
+  state.recentFoods = [Object.assign({}, record, { lastUsed: stampedAt, updatedAt: stampedAt })]
     .concat(state.recentFoods.filter(function(r){ return r.id !== food.id; }))
     .slice(0, 500);
   saveRecentFoods();
 
   if (!state.foodCache[food.id]) {
-    state.foodCache[food.id] = Object.assign({}, food, { updatedAt: stampedAt });
+    state.foodCache[food.id] = Object.assign({}, record, { updatedAt: stampedAt });
     pruneFoodCache();
     saveFoodCache();
   }
@@ -3414,11 +3455,10 @@ function copyFoodEntryToDate(entryId, toDate) {
   const entry = list.find(function(e){ return e.id === entryId; });
   if (!entry) return false;
   const now = new Date().toISOString();
-  const copy = Object.assign({}, entry, {
+  const copy = stripPhotoFields(Object.assign({}, entry, {
     id: "log_" + Date.now() + "_" + Math.random().toString(36).slice(2,7),
     timestamp: now, updatedAt: now,
-    photoExpires: entry.photo ? new Date(Date.now() + 2*24*60*60*1000).toISOString() : null,
-  });
+  }));
   if (!state.foodLogs[toDate]) state.foodLogs[toDate] = [];
   state.foodLogs[toDate].push(copy);
   saveFoodLogs();
@@ -5178,7 +5218,7 @@ actions.toggleFavorite = function(foodId) {
   } else {
     const now = new Date().toISOString();
     let food = fu.addingFood && fu.addingFood.id === foodId ? fu.addingFood : ((fu.results || []).find(function(f){ return f.id === foodId; }) || state.foodCache[foodId]);
-    if (food) state.favorites.unshift(Object.assign({}, food, { addedAt: now, updatedAt: now }));
+    if (food) state.favorites.unshift(Object.assign({}, stripPhotoFields(food), { addedAt: now, updatedAt: now }));
   }
   saveFavorites();
   rerender();
@@ -5956,10 +5996,13 @@ actions.removeAiPhoto = function() { foodUi().aiPhoto = null; rerender(); };
 changeActions.aiPhoto = function(el) {
   const file = el.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = function(ev) {
+  // Compressed on-device exactly like a progress photo (1600px / q0.8, ~200-400KB) instead
+  // of the raw camera file (2026-09-11: a 4.9MB original was what overflowed localStorage).
+  // Also a smaller API upload, and comfortably inside Claude's 5MB image limit.
+  compressPhotoFile(file, function(dataUrl) {
+    if (!dataUrl) { showToast("Couldn’t read that photo"); return; }
     const fu = foodUi();
-    fu.aiPhoto = ev.target.result.split(",")[1];
+    fu.aiPhoto = dataUrl.split(",")[1];
     // Picking a photo from the main search screen (not already on the AI screen) jumps
     // straight into the AI flow with the photo -- and whatever was typed in search -- already
     // attached, so there's no separate trip through a blank AI screen just to find this button.
@@ -5968,8 +6011,7 @@ changeActions.aiPhoto = function(el) {
       fu.showAI = true;
     }
     rerender();
-  };
-  reader.readAsDataURL(file);
+  });
 };
 
 function aiProviderLabel(provider) {
@@ -9652,6 +9694,7 @@ actions.clearAllData = async function() {
 // INIT
 // ============================================================
 cleanExpiredPhotos();
+stripStoredPhotos();
 // Establish what the targets currently are BEFORE anything can call saveSettings, so the first
 // real edit has a true "previous value" to seed the target history's baseline from, and so
 // startup writes aren't mistaken for user edits.
