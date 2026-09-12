@@ -151,6 +151,7 @@ const exportLine =
   "hourGroupMacros: hourGroupMacros, barcodeScanConfirm: barcodeScanConfirm, " +
   "BARCODE_CONFIRM_MS: BARCODE_CONFIRM_MS, BARCODE_CONFIRM_MIN_READS: BARCODE_CONFIRM_MIN_READS, " +
   "BARCODE_CONFIRM_STALE_MS: BARCODE_CONFIRM_STALE_MS, " +
+  "searchBarcode: searchBarcode, pickBarcodeFrameValue: pickBarcodeFrameValue, " +
   "weightChartHitBands: weightChartHitBands, renderSelectedWeightSlot: renderSelectedWeightSlot, " +
   "weightRangeDays: weightRangeDays, weightChartWindowBounds: weightChartWindowBounds, " +
   "weightTrendSeries: weightTrendSeries, WEIGHT_TREND_DAYS: WEIGHT_TREND_DAYS, " +
@@ -3485,6 +3486,79 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
     assertEqual(M.dashboardFeedFor("2026-08-02").recommended, 2373, "the published row landed");
   });
 
+  // ==== Barcode lookup outcomes (the 2026-09-12 "scanner just hangs" fix) ====
+  // Two hang classes lived here: a lookup fetch with no timeout froze the screen at "Looking
+  // up product…" forever, and ANY lookup failure was reported as "Product Not Found" -- wrong,
+  // and an invitation to save a duplicate custom entry for a product OFF actually has.
+  const offProductResponse = function (payload) {
+    return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(payload); } });
+  };
+  await atest("searchBarcode: a hit comes back as { food }", async function () {
+    sandbox.fetch = function () {
+      return offProductResponse({ status: 1, product: { code: "123", product_name: "Test Milk", brands: "TestCo",
+        nutriments: { "energy-kcal_100g": 52, proteins_100g: 8, carbohydrates_100g: 4, fat_100g: 0.1, fiber_100g: 0 } } });
+    };
+    const res = await M.searchBarcode("123");
+    assertEqual(res.food.name, "Test Milk", "food payload");
+    assertEqual(res.food.calories, 52, "macros mapped");
+    assertEqual(res.error, undefined, "no error");
+  });
+  await atest("searchBarcode: OFF status 0 is { notFound }, not an error", async function () {
+    sandbox.fetch = function () { return offProductResponse({ status: 0, status_verbose: "product not found" }); };
+    const res = await M.searchBarcode("999");
+    assertEqual(res.notFound, true, "genuinely unknown code");
+    assertEqual(res.food, undefined, "no food");
+  });
+  await atest("searchBarcode: a network failure is { error }, never { notFound }", async function () {
+    sandbox.fetch = function () { return Promise.reject(new TypeError("Failed to fetch")); };
+    const res = await M.searchBarcode("123");
+    assertEqual(typeof res.error, "string", "failure surfaces as a message");
+    assertEqual(res.notFound, undefined, "and is not misreported as not-found");
+  });
+  await atest("searchBarcode: a timeout names OFF as slow, not unreachable", async function () {
+    sandbox.fetch = function () { const e = new Error("timed out"); e.name = "TimeoutError"; return Promise.reject(e); };
+    const res = await M.searchBarcode("123");
+    assertEqual(res.error.indexOf("too long") > -1, true, "timeout-specific message");
+  });
+  await atest("searchBarcode: an unreadable response body is { error }", async function () {
+    sandbox.fetch = function () { return Promise.resolve({ ok: false, status: 503, json: function () { return Promise.reject(new SyntaxError("not JSON")); } }); };
+    const res = await M.searchBarcode("123");
+    assertEqual(typeof res.error, "string", "an HTML error page from a proxy is a failure, not not-found");
+  });
+  await atest("handleBarcodeDetected: a failed lookup shows an error and does NOT open Product Not Found", async function () {
+    sandbox.fetch = function () { return Promise.reject(new TypeError("Failed to fetch")); };
+    M.state.tab = "food"; M.state.ui = {}; M.state.customBarcodes = {};
+    const fu = M.foodUi();
+    fu.scanningBarcode = true;
+    await M.handleBarcodeDetected("0068200465708");
+    assertEqual(fu.scanLoading, false, "loading state cleared -- the old code left it stuck forever");
+    assertEqual(fu.scanNotFoundCode, null, "the custom-entry form is not offered for a product OFF may have");
+    assertEqual(fu.scanError.indexOf("Couldn't reach Open Food Facts") > -1, true, "the failure is on screen");
+    assertEqual(fu.scanningBarcode, true, "the scan screen stays up to try again");
+    assertEqual(fu.addingFood, null, "nothing was logged");
+  });
+  await atest("handleBarcodeDetected: a genuine not-found still opens the custom-entry form", async function () {
+    sandbox.fetch = function () { return offProductResponse({ status: 0 }); };
+    M.state.tab = "food"; M.state.ui = {}; M.state.customBarcodes = {};
+    const fu = M.foodUi();
+    fu.scanningBarcode = true;
+    await M.handleBarcodeDetected("777");
+    assertEqual(fu.scanNotFoundCode, "777", "not-found form armed");
+    assertEqual(fu.scanError, null, "with no failure banner");
+  });
+  await atest("handleBarcodeDetected: a successful lookup still lands in Adding Food", async function () {
+    sandbox.fetch = function () {
+      return offProductResponse({ status: 1, product: { code: "321", product_name: "Scanned Yogurt",
+        nutriments: { "energy-kcal_100g": 97, proteins_100g: 9, carbohydrates_100g: 4, fat_100g: 5 } } });
+    };
+    M.state.tab = "food"; M.state.ui = {}; M.state.customBarcodes = {};
+    const fu = M.foodUi();
+    fu.scanningBarcode = true;
+    await M.handleBarcodeDetected("321");
+    assertEqual(fu.addingFood.name, "Scanned Yogurt", "delivered to Adding Food");
+    assertEqual(fu.scanningBarcode, false, "scan screen closed out");
+  });
+
   // Restore the default no-network stub for anything after us.
   sandbox.fetch = function () { return Promise.reject(new Error("network disabled in tests")); };
 
@@ -3754,6 +3828,23 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
   });
   test("barcodeScanConfirm: no code and no pending state is a no-op", function () {
     assertEqual(M.barcodeScanConfirm(null, null, 1000), { pending: null, accepted: null }, "idle frame");
+  });
+
+  // ==== pickBarcodeFrameValue (deterministic per-frame pick, 2026-09-12) ====
+  test("pickBarcodeFrameValue: no detections is null", function () {
+    assertEqual(M.pickBarcodeFrameValue([]), null, "empty frame");
+    assertEqual(M.pickBarcodeFrameValue(null), null, "no array at all");
+  });
+  test("pickBarcodeFrameValue: the pick is deterministic regardless of detector ordering", function () {
+    // A frame can report the same physical barcode twice (a UPC-A and an EAN-13 reading of the
+    // same bars). codes[] order isn't specified, so picking codes[0] meant an ordering flip
+    // between frames read as DISAGREEMENT to barcodeScanConfirm and reset the window forever.
+    assertEqual(M.pickBarcodeFrameValue([{ rawValue: "068200465708" }, { rawValue: "0068200465708" }]), "0068200465708", "one order");
+    assertEqual(M.pickBarcodeFrameValue([{ rawValue: "0068200465708" }, { rawValue: "068200465708" }]), "0068200465708", "same pick in the other order");
+  });
+  test("pickBarcodeFrameValue: entries without a rawValue are skipped", function () {
+    assertEqual(M.pickBarcodeFrameValue([{ rawValue: "" }, { rawValue: "123" }]), "123", "blank read ignored");
+    assertEqual(M.pickBarcodeFrameValue([{}, { rawValue: null }]), null, "all-blank frame reads as nothing");
   });
 
   // ==== weightChartHitBands (bigger tap targets on the weight chart) ====

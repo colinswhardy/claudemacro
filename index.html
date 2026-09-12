@@ -184,7 +184,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.36";
+const APP_VERSION = "1.37";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -1558,13 +1558,31 @@ async function searchOpenFoodFacts(query) {
   } catch (e) { return []; }
 }
 
+// A barcode lookup that stalls without erroring used to pin the scan screen at "Looking up
+// product\u2026" forever -- fetch has no timeout of its own (the 2026-09-12 "scanner just hangs"
+// report). AbortSignal.timeout is missing in older WebViews and in the test sandbox; without
+// it the lookup simply has no timeout, exactly as before.
+const BARCODE_LOOKUP_TIMEOUT_MS = 12000;
+function barcodeLookupTimeoutSignal() {
+  try { return AbortSignal.timeout(BARCODE_LOOKUP_TIMEOUT_MS); } catch (e) { return undefined; }
+}
+// One outcome object instead of food-or-null: { food } on a hit, { notFound: true } when Open
+// Food Facts genuinely has no such product, { error: message } when the lookup itself failed
+// (network down, OFF stalling past the timeout, an unreadable response). The distinction is
+// load-bearing -- a lookup FAILURE reported as "Product Not Found" walks the user into the
+// custom-entry form for a product OFF actually has.
 async function searchBarcode(code) {
+  let r;
   try {
-    const r = await fetch("https://world.openfoodfacts.org/api/v0/product/" + code + ".json");
+    r = await fetch("https://world.openfoodfacts.org/api/v0/product/" + code + ".json", { signal: barcodeLookupTimeoutSignal() });
+  } catch (e) {
+    return { error: (e && e.name === "TimeoutError") ? "Open Food Facts took too long to respond." : "Couldn't reach Open Food Facts." };
+  }
+  try {
     const d = await r.json();
-    if (d.status !== 1) return null;
+    if (d.status !== 1) return { notFound: true };
     const p = d.product, n = p.nutriments;
-    return {
+    return { food: {
       id: "off_" + p.code, name: p.product_name || "Unknown", brand: p.brands || "",
       source: "Open Food Facts (Barcode)", per100g: true,
       calories: Math.round(n["energy-kcal_100g"] || 0),
@@ -1574,8 +1592,8 @@ async function searchBarcode(code) {
       fiber: round1(n.fiber_100g || 0),
       state: "\u2014",
       servingSizes: offServingSizes(p),
-    };
-  } catch (e) { return null; }
+    } };
+  } catch (e) { return { error: "Open Food Facts sent back an unreadable response." }; }
 }
 
 async function estimateWithClaude(description, photoBase64, model, apiKey) {
@@ -4273,6 +4291,25 @@ const BARCODE_CONFIRM_MS = 200;
 const BARCODE_CONFIRM_MIN_READS = 2;
 // How long a partial confirmation survives without a fresh sighting.
 const BARCODE_CONFIRM_STALE_MS = 1500;
+// Consecutive detect() failures before the screen says the detector itself is broken
+// (~1s of frames). Android's BarcodeDetector delegates to a Play Services module that
+// updates independently of the app AND of Chrome, and it has shipped broken -- detect()
+// then rejects on every single frame, which the scan loop used to swallow in silence
+// forever: live camera, no hint, nothing ever read ("it just hangs and does nothing").
+const BARCODE_DETECT_FAIL_LIMIT = 60;
+// The rawValue to feed the confirm step for one frame, or null. Sorted so the pick is
+// deterministic when a frame reports the same physical barcode more than once (e.g. as
+// both a UPC-A and an EAN-13 reading): codes[] order isn't specified, and an A/B
+// alternation across frames would read as disagreement and reset the confirm window
+// on every frame -- a scanner that visibly reads but never fires.
+function pickBarcodeFrameValue(codes) {
+  if (!codes || codes.length === 0) return null;
+  const vals = [];
+  for (let i = 0; i < codes.length; i++) { if (codes[i] && codes[i].rawValue) vals.push(codes[i].rawValue); }
+  if (vals.length === 0) return null;
+  vals.sort();
+  return vals[0];
+}
 // Pure: (pending, codeSeenThisFrame|null, now) -> {pending, accepted}. Unit-tested directly.
 function barcodeScanConfirm(pending, code, now) {
   // A frame that reads nothing does NOT reset progress. A blurred or shaky frame between two
@@ -4296,7 +4333,18 @@ function barcodeScanConfirm(pending, code, now) {
 function patchBarcodeScanHint(pending) {
   const el = document.getElementById("barcodeScanHint");
   if (!el) return;
+  el.style.color = C.primary; el.style.height = "18px"; // undo a warning's styling (below)
   el.textContent = pending ? "Reading " + pending.code + " — hold steady…" : "";
+}
+// A persistent problem message in that same line (patched, same no-rerender rule -- the
+// <video> must survive). Unlike the toast it stays put: it's the state of the scanner,
+// not an event. Allowed to grow past the hint's fixed height -- it's longer than a hint
+// and being readable beats the layout not shifting when the scanner is already broken.
+function patchBarcodeScanWarning(message) {
+  const el = document.getElementById("barcodeScanHint");
+  if (!el) return;
+  el.style.color = C.warning; el.style.height = "auto";
+  el.textContent = message;
 }
 
 async function startBarcodeCamera() {
@@ -4318,19 +4366,37 @@ async function startBarcodeCamera() {
     // Confirmation progress for the current candidate code. Scoped to this closure, so opening
     // the scanner again always starts clean without needing an explicit reset.
     let pendingScan = null;
+    // Consecutive detect() failures -- see BARCODE_DETECT_FAIL_LIMIT. Reset on any frame that
+    // detects cleanly, so a transient failure (video still warming up) never trips the warning.
+    let detectFailures = 0;
     const tick = async function() {
       if (!foodUi().scanningBarcode) return;
+      let step = null;
       try {
         const codes = await detector.detect(video);
-        const step = barcodeScanConfirm(pendingScan, codes.length > 0 ? codes[0].rawValue : null, Date.now());
+        detectFailures = 0;
+        step = barcodeScanConfirm(pendingScan, pickBarcodeFrameValue(codes), Date.now());
+      } catch (e) {
+        // === (not >=) so the message is patched once, not re-patched at frame rate. The error
+        // name is on screen deliberately: this failure lives in the phone's own barcode module,
+        // and "NotSupportedError" vs "InvalidStateError" is the only diagnostic there will be.
+        detectFailures++;
+        if (detectFailures === BARCODE_DETECT_FAIL_LIMIT) {
+          patchBarcodeScanWarning("This device isn't reading barcodes right now (" + ((e && e.name) || "error") + "). Type the barcode number below instead.");
+        }
+      }
+      if (step) {
         pendingScan = step.pending;
         patchBarcodeScanHint(step.pending);
+        // Acceptance sits OUTSIDE the try above on purpose: a throw in the hand-off used to be
+        // caught there and treated as "keep trying next frame" -- i.e. swallowed, with the
+        // scanner looking alive and the accepted code going nowhere.
         if (step.accepted) {
           stopBarcodeCamera();
           handleBarcodeDetected(step.accepted);
           return;
         }
-      } catch (e) { /* keep trying next frame */ }
+      }
       barcodeDetectionRAF = requestAnimationFrame(tick);
     };
     barcodeDetectionRAF = requestAnimationFrame(tick);
@@ -4386,16 +4452,22 @@ async function handleBarcodeDetected(code) {
 
   fu.scanLoading = true; fu.scanError = null;
   rerender();
-  const food = await searchBarcode(code);
+  const result = await searchBarcode(code);
   fu.scanLoading = false;
   if (!fu.scanningBarcode) return; // backed out while the lookup was in flight
-  if (!food) {
+  if (result.food) { deliverScannedFood(result.food, ""); return; }
+  if (result.notFound) {
     fu.scanNotFoundCode = code;
     fu.customBarcodeManual = { name: "", weight: "100", calories: "", protein: "", carbs: "", fat: "", fiber: "" };
     rerender();
     return;
   }
-  deliverScannedFood(food, "");
+  // The lookup FAILED -- which is not "Product Not Found" (see searchBarcode). Say what
+  // happened and put the camera back to work: it was stopped when the code was accepted, and
+  // without a restart the screen is a dead video box whose only working control is Back.
+  fu.scanError = result.error + " Scan again, or type the barcode number below.";
+  rerender();
+  if ("BarcodeDetector" in window && !barcodeStream) startBarcodeCamera();
 }
 
 actions.openBarcodeScan = function() {
