@@ -3262,6 +3262,17 @@ test("index.html contains no stray control bytes", function () {
   assertEqual(offenders, [], "no control bytes outside tab/newline/carriage-return");
 });
 
+test("photo file inputs carry no `capture` attribute (camera-only picker, 2026-09-27)", function () {
+  // capture="environment" tells Android to open the camera directly and skip its own
+  // Camera / Gallery / Files chooser, so a photo already on the phone was unreachable from the
+  // AI estimate ("I can currently only take a photo"). The waist input never had it and always
+  // offered both. Every image input in the app must leave the choice to the OS.
+  const src = require("fs").readFileSync(indexPath, "utf8");
+  const imageInputs = src.match(/<input[^>]*accept="image\/\*"[^>]*>/g) || [];
+  assertEqual(imageInputs.length >= 3, true, "the AI photo inputs (x2) and the waist input are all found");
+  assertEqual(imageInputs.filter(function (tag) { return /\bcapture=/.test(tag); }), [], "none forces the camera");
+});
+
 // ============================================================
 // KEEPALIVE QUOTA -- the silent weight-sync outage
 // ============================================================

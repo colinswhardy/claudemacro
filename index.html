@@ -184,7 +184,7 @@ const WIZARD_TRIGGERS = {
 // Bump by 0.01 on every shipped change (see CLAUDE.md Deploy section) -- shown at the bottom of
 // Strategy > Data so Colin can glance at his phone and tell whether the latest push actually
 // landed there yet, rather than guessing from a possibly-stale service-worker cache.
-const APP_VERSION = "1.37";
+const APP_VERSION = "1.38";
 
 const SUPABASE_URL = "https://flwzhavwubgniepiwnqt.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_goCDpfYoolFIqfCVDUkXMw_10c2xGxb";
@@ -3567,7 +3567,11 @@ function renderFoodTab() {
       textInput({ id: "foodSearchInput", value: fu.query, placeholder: "Search foods...", bind: "foodQuery", enter: "doFoodSearch", enterHint: "search", style: "flex:1" }) +
       btn({ id: "foodSearchBtn", label: fu.searching ? "..." : "\u{1F50D}", action: "doFoodSearch", disabled: fu.searching }) +
       '</div>';
-    html += '<input type="file" accept="image/*" capture="environment" id="aiPhotoInput" data-change="aiPhoto" style="display:none">';
+    // No `capture` attribute on purpose (2026-09-27): capture="environment" tells the phone to
+    // open the camera directly and skip its chooser, so an existing photo from the gallery was
+    // unreachable. Without it the OS offers Camera / Gallery / Files -- same as the waist
+    // photo input, which has always worked both ways.
+    html += '<input type="file" accept="image/*" id="aiPhotoInput" data-change="aiPhoto" style="display:none">';
     // One row, no wrapping: labels are shortened (the icon already carries most of the meaning)
     // so all four still fit side by side on a phone-width screen. Each button flexes to an
     // equal share, so the row stays balanced when the two AI buttons are hidden.
@@ -5990,9 +5994,9 @@ function renderAIForm(fu) {
   let html = '<div style="margin-bottom:12px"><label class="label">Describe what you ate</label>' +
     textInput({ value: fu.aiDesc, placeholder: 'e.g. "large bowl of chicken pasta with cream sauce"', bind: "aiDesc", enter: "runAIEstimate" }) + '</div>';
   html += '<div style="margin-bottom:16px"><label class="label">Upload a photo (optional)</label>' +
-    '<input type="file" accept="image/*" capture="environment" id="aiPhotoInput" data-change="aiPhoto" style="display:none">' +
+    '<input type="file" accept="image/*" id="aiPhotoInput" data-change="aiPhoto" style="display:none">' + // no `capture` -- see the Food tab's copy
     '<div class="row">' +
-      btn({ label: (fu.aiPhoto ? "Photo Added \u2713" : "\u{1F4F7} Take/Upload Photo"), action: "clickPhotoInput", outline: true, small: true }) +
+      btn({ label: (fu.aiPhoto ? "Photo Added \u2713" : "\u{1F4F7} Take or Choose Photo"), action: "clickPhotoInput", outline: true, small: true }) +
       (fu.aiPhoto ? btn({ label: "Remove", action: "removeAiPhoto", outline: true, small: true, color: "danger" }) : '') +
     '</div>' +
     (fu.aiPhoto && state.settings.aiProvider === "gemini" ? '<div style="color:' + C.warning + ';font-size:11px;margin-top:6px">Gemini’s estimate is text-only — it won’t see this photo.</div>' : '') +
