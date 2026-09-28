@@ -151,7 +151,7 @@ const exportLine =
   "hourGroupMacros: hourGroupMacros, barcodeScanConfirm: barcodeScanConfirm, " +
   "BARCODE_CONFIRM_MS: BARCODE_CONFIRM_MS, BARCODE_CONFIRM_MIN_READS: BARCODE_CONFIRM_MIN_READS, " +
   "BARCODE_CONFIRM_STALE_MS: BARCODE_CONFIRM_STALE_MS, " +
-  "searchBarcode: searchBarcode, pickBarcodeFrameValue: pickBarcodeFrameValue, " +
+  "searchBarcode: searchBarcode, pickBarcodeFrameValue: pickBarcodeFrameValue, formatScanDiag: formatScanDiag, " +
   "weightChartHitBands: weightChartHitBands, renderSelectedWeightSlot: renderSelectedWeightSlot, " +
   "weightRangeDays: weightRangeDays, weightChartWindowBounds: weightChartWindowBounds, " +
   "weightTrendSeries: weightTrendSeries, WEIGHT_TREND_DAYS: WEIGHT_TREND_DAYS, " +
@@ -3856,6 +3856,27 @@ test("the feed is SHADOW MODE: it never moves the day's actual targets", functio
   test("pickBarcodeFrameValue: entries without a rawValue are skipped", function () {
     assertEqual(M.pickBarcodeFrameValue([{ rawValue: "" }, { rawValue: "123" }]), "123", "blank read ignored");
     assertEqual(M.pickBarcodeFrameValue([{}, { rawValue: null }]), null, "all-blank frame reads as nothing");
+  });
+
+  // ==== formatScanDiag (the Strategy > Data scanner line, 2026-09-28) ====
+  // The loop itself is exercised in a real browser by tests/e2e/scanner.js; this is the pure
+  // summary of what that loop records.
+  test("formatScanDiag: nothing to say before the first session", function () {
+    assertEqual(M.formatScanDiag(null), "", "no record");
+    assertEqual(M.formatScanDiag({}), "", "no timestamp");
+  });
+  test("formatScanDiag: a successful session reads as one line with the swap count in it", function () {
+    const line = M.formatScanDiag({ at: Date.parse("2026-09-28T13:14:00Z"), swaps: 1, reads: 3, errors: 0, lastError: null, accepted: "0068200465708", acceptMs: 1420, lookup: "ok", endedBy: "accepted" });
+    assertEqual(line.indexOf("3 reads") > -1, true, "reads");
+    assertEqual(line.indexOf("video swapped 1×") > -1, true, "the swap counter -- the one number that names the 2026-09 hang");
+    assertEqual(line.indexOf("accepted 0068200465708 after 1.4s") > -1, true, "acceptance");
+    assertEqual(line.indexOf("lookup ok") > -1, true, "lookup outcome");
+    assertEqual(line.indexOf("ended:") === -1, true, "an accepted session doesn't also print an end reason");
+  });
+  test("formatScanDiag: a session closed without a read says so, error name included", function () {
+    const line = M.formatScanDiag({ at: Date.now(), swaps: 0, reads: 0, errors: 12, lastError: "NotSupportedError", endedBy: "closed" });
+    assertEqual(line.indexOf("12 detect errors (NotSupportedError)") > -1, true, "error name is carried");
+    assertEqual(line.indexOf("ended: closed") > -1, true, "end reason");
   });
 
   // ==== weightChartHitBands (bigger tap targets on the weight chart) ====
